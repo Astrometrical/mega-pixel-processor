@@ -4,15 +4,14 @@
 //! PixInsight file-format worker and any GUI reuse it. See `docs/DESIGN.md`
 //! for the founding decisions and phase plan.
 //!
-//! Intended public API surface (nothing implemented yet — this crate is the
-//! project scaffold):
+//! Public API surface:
 //!
-//! - `formats` — image readers/writers: libvips-backed formats plus native
-//!   XISF (and possibly FITS) support, streaming at multi-GB scale.
-//! - `wcs` — astrometric solutions: native carriage where containers support
-//!   it, and the canonical JSON sidecar where they don't.
-//! - `dzi` — Deep Zoom pyramid export and emission of the static,
-//!   self-hostable HTML viewer.
+//! - [`formats`] — image readers/writers: native XISF reading and
+//!   strip-streaming BigTIFF writing today; libvips-backed formats and the
+//!   DZI pipeline arrive with later phase-1 plans.
+//! - [`wcs`] — astrometric solutions: the linear WCS model, extraction
+//!   from PixInsight XISF properties, and the canonical JSON sidecar.
+//! - [`convert`] — one-call conversion orchestration used by the CLI.
 
 #![warn(missing_docs)]
 
@@ -22,6 +21,8 @@ pub use error::{Error, Result};
 pub mod formats;
 
 pub mod wcs;
+
+pub mod convert;
 
 #[cfg(test)]
 mod testsupport;
