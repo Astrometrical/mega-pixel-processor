@@ -22,3 +22,6 @@ pub use error::{Error, Result};
 pub mod formats;
 
 pub mod wcs;
+
+#[cfg(test)]
+mod testsupport;

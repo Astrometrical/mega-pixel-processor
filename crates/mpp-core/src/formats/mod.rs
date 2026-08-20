@@ -4,6 +4,7 @@
 //! plus passthrough metadata (FITS keywords, XISF properties). Writers
 //! stream pixel data out in constant memory.
 
+pub mod tiff;
 pub mod xisf;
 
 /// A FITS header keyword carried through from input to output.
