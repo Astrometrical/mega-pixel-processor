@@ -117,15 +117,10 @@ impl PropertyValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)] // variants are the XISF sampleFormat names verbatim
 pub enum SampleFormat {
-    /// UInt8 sample format.
     UInt8,
-    /// UInt16 sample format.
     UInt16,
-    /// UInt32 sample format.
     UInt32,
-    /// Float32 sample format.
     Float32,
-    /// Float64 sample format.
     Float64,
 }
 
