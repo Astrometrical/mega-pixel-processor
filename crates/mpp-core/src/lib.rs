@@ -20,3 +20,5 @@ pub mod error;
 pub use error::{Error, Result};
 
 pub mod formats;
+
+pub mod wcs;
