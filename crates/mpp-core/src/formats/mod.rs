@@ -4,6 +4,8 @@
 //! plus passthrough metadata (FITS keywords, XISF properties). Writers
 //! stream pixel data out in constant memory.
 
+pub mod xisf;
+
 /// A FITS header keyword carried through from input to output.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FitsKeyword {
