@@ -44,6 +44,18 @@ fn to_u16(v: f32) -> u16 {
 /// strip in constant memory. Grayscale (1 channel) and RGB (3 channels)
 /// are supported; XISF planar planes are interleaved to TIFF chunky order.
 pub fn write_bigtiff(img: &XisfImage, path: &Path, opts: &TiffWriteOptions) -> Result<()> {
+    write_bigtiff_with_target(img, path, opts, TARGET_STRIP_BYTES)
+}
+
+/// [`write_bigtiff`], parameterized on the target strip size — split out so
+/// tests can force multi-strip (including a partial last strip) output
+/// without needing a multi-gigabyte image.
+fn write_bigtiff_with_target(
+    img: &XisfImage,
+    path: &Path,
+    opts: &TiffWriteOptions,
+    target_strip_bytes: u64,
+) -> Result<()> {
     let w = u32::try_from(img.width())
         .map_err(|_| Error::format(path, "image width exceeds TIFF limits"))?;
     let h = u32::try_from(img.height())
@@ -62,7 +74,7 @@ pub fn write_bigtiff(img: &XisfImage, path: &Path, opts: &TiffWriteOptions) -> R
         ($ct:ty, $sample:ty, $map:expr) => {{
             let mut image = enc.new_image::<$ct>(w, h).map_err(terr)?;
             let row_bytes = w as u64 * channels * std::mem::size_of::<$sample>() as u64;
-            let rows = (TARGET_STRIP_BYTES / row_bytes.max(1)).clamp(1, h.max(1) as u64) as u32;
+            let rows = (target_strip_bytes / row_bytes.max(1)).clamp(1, h.max(1) as u64) as u32;
             image.rows_per_strip(rows).map_err(terr)?;
             let mut strip: Vec<$sample> = Vec::new();
             let mut y: u64 = 0;
@@ -190,19 +202,22 @@ mod tests {
 
     #[test]
     fn strip_streaming_covers_multi_strip_images() {
-        // Small strip target is not configurable; instead verify a taller
-        // image (which will span multiple strips at any rows_per_strip)
-        // roundtrips exactly.
+        // 3x7 gray f32: row_bytes = 3*4 = 12; with a forced 64-byte target,
+        // rows_per_strip = 64/12 = 5, so a 7-row image spans two strips:
+        // 5 rows then a partial 2-row strip. Exercises `y` carrying across
+        // iterations, the partial last strip, and `strip` buffer reuse
+        // across multiple `write_strip` calls.
         let dir = tmpdir("strips");
         let src = dir.join("in.xisf");
-        synth_xisf(&src, 3, 64, 1, false);
+        synth_xisf(&src, 3, 7, 1, false);
         let img = XisfImage::open(&src).unwrap();
         let out = dir.join("out.tif");
-        write_bigtiff(&img, &out, &TiffWriteOptions::default()).unwrap();
+        write_bigtiff_with_target(&img, &out, &TiffWriteOptions::default(), 64).unwrap();
         let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
         match dec.read_image().unwrap() {
             DecodingResult::F32(data) => {
-                let total = (3 * 64) as f32;
+                let total = (3 * 7) as f32;
+                assert_eq!(data.len(), 21);
                 for (i, v) in data.iter().enumerate() {
                     assert!((v - i as f32 / total).abs() < 1e-7, "sample {i}");
                 }
