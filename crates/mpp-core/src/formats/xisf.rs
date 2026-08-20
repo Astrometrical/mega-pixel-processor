@@ -109,7 +109,7 @@ impl XisfImage {
         })
     }
 
-    /// The file this panel was opened from.
+    /// The file this image was opened from.
     pub fn path(&self) -> &Path {
         &self.path
     }

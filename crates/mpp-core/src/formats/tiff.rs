@@ -7,7 +7,7 @@
 //! is one strip (~`TARGET_STRIP_BYTES`), independent of image size.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use tiff::encoder::{TiffEncoder, colortype};
@@ -65,50 +65,53 @@ fn write_bigtiff_with_target(
 
     let file = File::create(path).map_err(|e| Error::io(path, e))?;
     let mut buf = BufWriter::new(file);
-    let mut enc = TiffEncoder::new_big(&mut buf).map_err(terr)?;
+    {
+        let mut enc = TiffEncoder::new_big(&mut buf).map_err(terr)?;
 
-    // One code path per (channels, depth) combination; the macro exists
-    // because each combination needs a different tiff colortype marker
-    // type, which cannot be chosen at runtime.
-    macro_rules! stream {
-        ($ct:ty, $sample:ty, $map:expr) => {{
-            let mut image = enc.new_image::<$ct>(w, h).map_err(terr)?;
-            let row_bytes = w as u64 * channels * std::mem::size_of::<$sample>() as u64;
-            let rows = (target_strip_bytes / row_bytes.max(1)).clamp(1, h.max(1) as u64) as u32;
-            image.rows_per_strip(rows).map_err(terr)?;
-            let mut strip: Vec<$sample> = Vec::new();
-            let mut y: u64 = 0;
-            while image.next_strip_sample_count() > 0 {
-                let n = image.next_strip_sample_count() as usize;
-                let rows_here = n / (w as usize * channels as usize);
-                strip.clear();
-                for yy in y..y + rows_here as u64 {
-                    let planes: Vec<&[f32]> = (0..channels).map(|c| img.row(c, yy)).collect();
-                    for x in 0..w as usize {
-                        for p in &planes {
-                            strip.push($map(p[x]));
+        // One code path per (channels, depth) combination; the macro exists
+        // because each combination needs a different tiff colortype marker
+        // type, which cannot be chosen at runtime.
+        macro_rules! stream {
+            ($ct:ty, $sample:ty, $map:expr) => {{
+                let mut image = enc.new_image::<$ct>(w, h).map_err(terr)?;
+                let row_bytes = w as u64 * channels * std::mem::size_of::<$sample>() as u64;
+                let rows = (target_strip_bytes / row_bytes.max(1)).clamp(1, h.max(1) as u64) as u32;
+                image.rows_per_strip(rows).map_err(terr)?;
+                let mut strip: Vec<$sample> = Vec::new();
+                let mut y: u64 = 0;
+                while image.next_strip_sample_count() > 0 {
+                    let n = image.next_strip_sample_count() as usize;
+                    let rows_here = n / (w as usize * channels as usize);
+                    strip.clear();
+                    for yy in y..y + rows_here as u64 {
+                        let planes: Vec<&[f32]> = (0..channels).map(|c| img.row(c, yy)).collect();
+                        for x in 0..w as usize {
+                            for p in &planes {
+                                strip.push($map(p[x]));
+                            }
                         }
                     }
+                    image.write_strip(&strip).map_err(terr)?;
+                    y += rows_here as u64;
                 }
-                image.write_strip(&strip).map_err(terr)?;
-                y += rows_here as u64;
-            }
-            image.finish().map_err(terr)?;
-        }};
-    }
+                image.finish().map_err(terr)?;
+            }};
+        }
 
-    match (channels, opts.bit_depth) {
-        (1, BitDepth::F32) => stream!(colortype::Gray32Float, f32, |v: f32| v),
-        (3, BitDepth::F32) => stream!(colortype::RGB32Float, f32, |v: f32| v),
-        (1, BitDepth::U16) => stream!(colortype::Gray16, u16, to_u16),
-        (3, BitDepth::U16) => stream!(colortype::RGB16, u16, to_u16),
-        (c, _) => {
-            return Err(Error::format(
-                path,
-                format!("unsupported channel count {c} (grayscale or RGB only)"),
-            ));
+        match (channels, opts.bit_depth) {
+            (1, BitDepth::F32) => stream!(colortype::Gray32Float, f32, |v: f32| v),
+            (3, BitDepth::F32) => stream!(colortype::RGB32Float, f32, |v: f32| v),
+            (1, BitDepth::U16) => stream!(colortype::Gray16, u16, to_u16),
+            (3, BitDepth::U16) => stream!(colortype::RGB16, u16, to_u16),
+            (c, _) => {
+                return Err(Error::format(
+                    path,
+                    format!("unsupported channel count {c} (grayscale or RGB only)"),
+                ));
+            }
         }
     }
+    buf.flush().map_err(|e| Error::io(path, e))?;
     Ok(())
 }
 

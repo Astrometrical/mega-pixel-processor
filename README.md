@@ -20,8 +20,9 @@ Part of the Astrometrical "Mega" tool family, alongside
 
 ## Status
 
-Early scaffold — the workspace builds, the roadmap lives in
-[docs/DESIGN.md](docs/DESIGN.md), and no conversion paths are implemented yet.
+First phase-1 slice implemented: XISF → BigTIFF conversion with the WCS JSON
+sidecar. Mainstream formats via libvips and DZI/HTML export are upcoming
+phase-1 work; see the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Smoke tests
 
