@@ -12,5 +12,6 @@ name = "mpp"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 mpp-core.workspace = true
 clap.workspace = true
