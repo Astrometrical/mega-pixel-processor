@@ -24,6 +24,8 @@
 
 use crate::formats::XisfProperty;
 
+pub mod sidecar;
+
 /// A linear FITS WCS: `sky = project(crval, cd · (pixel − crpix))`, with
 /// `pixel` in FITS convention (1-based, pixel centers at integers, rows in
 /// stored order — top-down for our inputs and outputs).

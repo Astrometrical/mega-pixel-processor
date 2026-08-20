@@ -72,6 +72,33 @@ being better, not on being the only place the files work.
   display formats, so the DZI path operates on stretched, display-ready
   input by design.
 
+## WCS sidecar schema (v1, decided 2026-08-20)
+
+Canonical JSON, written as `<output-stem>.wcs.json` beside any container
+that cannot carry the solution natively; consumed by the DZI viewer.
+
+```json
+{
+  "schema": "mpp-wcs/1",
+  "width": 16384,
+  "height": 12288,
+  "wcs": {
+    "crval": [84.199, -3.240],
+    "crpix": [8192.5, 6144.5],
+    "cd": [[-4.4368e-4, 0.0], [0.0, 4.4368e-4]],
+    "ctype": ["RA---TAN", "DEC--TAN"],
+    "radesys": "ICRS"
+  }
+}
+```
+
+Degrees everywhere; `crpix` is FITS-convention (1-based, pixel centers at
+integers) against the stored top-down rows; `width`/`height` pin the
+geometry so consumers can detect stale sidecars. `schema` is a major
+version — readers reject unknown majors; additive fields (future
+distortion grids) do not bump it. Source of truth:
+`mpp-core::wcs::sidecar` module docs.
+
 ## Phases
 
 1. **CLI** (this repo, now): convert + sidecar + DZI/HTML. Smoke test that
