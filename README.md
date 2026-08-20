@@ -23,6 +23,18 @@ Part of the Astrometrical "Mega" tool family, alongside
 Early scaffold — the workspace builds, the roadmap lives in
 [docs/DESIGN.md](docs/DESIGN.md), and no conversion paths are implemented yet.
 
+## Smoke tests
+
+The phase-1 acceptance criterion is a >4 GB BigTIFF that opens in
+Photoshop (PS ≥ 26.2 also saves BigTIFF; opening support is older).
+
+- Synthetic end-to-end: `cargo test -p mpp --release -- --ignored`
+  (writes ~9 GB of temporary data).
+- Real data (manual): `cargo build --release`, then
+  `target/release/mpp convert <big>.xisf <big>.tif` on a real mosaic and
+  open the result in Photoshop. A solved input also writes
+  `<big>.wcs.json` next to the output.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
