@@ -1,0 +1,16 @@
+[package]
+name = "mpp"
+description = "Mega Pixel Processor — big astro image conversion and DZI publishing CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mpp"
+path = "src/main.rs"
+
+[dependencies]
+mpp-core.workspace = true
+clap.workspace = true

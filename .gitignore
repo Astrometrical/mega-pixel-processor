@@ -1,0 +1,22 @@
+# Rust
+/target
+
+# Test data — multi-GB astro images, never committed
+/test_data/
+
+# Conversion/DZI outputs in the repo root (runs during development)
+/*.fits
+/*.tif
+/*.tiff
+/*.btf
+/*.tf8
+/*.png
+/*_dzi/
+/*.dzi
+
+# WSL / Windows artifacts
+*Zone.Identifier
+
+# Editor
+.vscode/
+.idea/

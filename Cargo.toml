@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/mpp-core", "crates/mpp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Astrometrical <https://github.com/Astrometrical>"]
+repository = "https://github.com/Astrometrical/mega-pixel-processor"
+
+[workspace.dependencies]
+mpp-core = { path = "crates/mpp-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Pixel transforms are hot-path; always optimize dependencies even in dev builds
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
