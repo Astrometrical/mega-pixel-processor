@@ -15,3 +15,6 @@
 //!   self-hostable HTML viewer.
 
 #![warn(missing_docs)]
+
+pub mod error;
+pub use error::{Error, Result};

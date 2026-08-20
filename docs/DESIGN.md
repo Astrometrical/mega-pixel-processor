@@ -48,14 +48,18 @@ being better, not on being the only place the files work.
   `mpp` (thin CLI). A PixInsight-facing worker crate comes with phase 2.
 - **libvips** is the image-processing backbone (LGPL-2.1+, dynamically
   linked): demand-driven/streaming, constant memory on multi-GB images,
-  `tiffsave` with `bigtiff` option, `dzsave` for DZI pyramids. Open question
-  for phase 1: Rust bindings vs. spawning the official `vips` binaries;
-  decide during implementation. The pure-Rust `tiff` crate
-  (`TiffEncoder::new_big()`) is the fallback if vips friction blocks the
-  converter leg.
-- **XISF is our code** — vips has no XISF. Initially depend on `mmm-core`
-  (git dependency) for reading; extract a shared formats crate only when the
-  layering hurts. FITS: vips has cfitsio support, but our own reader/writer
+  `tiffsave` with `bigtiff` option, `dzsave` for DZI pyramids.
+  **Decided (2026-08-20):** hybrid. The XISF→BigTIFF leg is pure Rust
+  (`tiff` crate, `TiffEncoder::new_big`, strip-streamed, constant memory);
+  vips is used by *spawning the official `vips` binaries* for `dzsave` and
+  mainstream-format conversion — no FFI bindings, no LGPL linking
+  obligations. Revisit bindings only if process spawning proves limiting.
+- **XISF is our code** — vips has no XISF.
+  **Decided (2026-08-20):** the XISF reader and linear-WCS extraction are
+  *ported* from `mmm-core` into `mpp-core` — `mpp-core` owns format code,
+  and the long-term dependency direction is the reverse of the original
+  idea: `mmm-core` will eventually depend on `mpp-core` for file-format
+  support. FITS: vips has cfitsio support, but our own reader/writer
   may serve WCS fidelity better — evaluate during phase 1.
 - **WCS sidecar**: one canonical JSON schema used by every container that
   can't carry the solution natively, and consumed by the DZI viewer. Design
