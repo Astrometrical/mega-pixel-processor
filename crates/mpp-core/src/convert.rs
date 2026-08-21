@@ -124,11 +124,32 @@ fn ext(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Deletes the wrapped path on drop — the temp interchange TIFF must not
+/// survive any exit path, success or error.
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The interchange path for a vips-backed output: same directory (same
+/// filesystem — multi-GB temp data must not land in a small /tmp), named
+/// after the output plus a pid suffix so concurrent runs cannot collide.
+fn interchange_path(output: &Path) -> PathBuf {
+    let stem = output.file_stem().unwrap_or_default().to_string_lossy();
+    let name = format!("{stem}.mpp-tmp-{}.tif", std::process::id());
+    output.with_file_name(name)
+}
+
 /// Convert `input` (XISF) to `output`, whose extension selects the
-/// [`OutputFormat`] (currently only [`OutputFormat::BigTiff`] is wired to a
-/// writer; the other vips-backed formats are routed and validated but write
-/// a "not wired yet" error), writing the WCS sidecar next to the output
-/// when the input carries an astrometric solution and `opts.sidecar` is on.
+/// [`OutputFormat`]: [`OutputFormat::BigTiff`] is written natively by
+/// [`write_bigtiff`], while png/jpg/webp/avif/jxl are produced by writing a
+/// temp BigTIFF interchange file next to the output and spawning `vips` to
+/// convert it to the final container, writing the WCS sidecar next to the
+/// output when the input carries an astrometric solution and `opts.sidecar`
+/// is on.
 pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<ConvertReport> {
     if ext(input) != "xisf" {
         return Err(Error::format(
@@ -163,19 +184,26 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
 
     let img = XisfImage::open(input)?;
     img.advise_sequential();
+    let tiff_opts = TiffWriteOptions { bit_depth: depth };
     match format {
-        OutputFormat::BigTiff => {
-            write_bigtiff(&img, output, &TiffWriteOptions { bit_depth: depth })?;
-        }
-        OutputFormat::Png
-        | OutputFormat::Jpeg
-        | OutputFormat::Webp
-        | OutputFormat::Avif
-        | OutputFormat::Jxl => {
-            return Err(Error::format(
-                output,
-                "vips-backed output is not wired yet (next commit)",
-            ));
+        OutputFormat::BigTiff => write_bigtiff(&img, output, &tiff_opts)?,
+        _ => {
+            let vips_bin = crate::vips::vips_available().ok_or_else(|| {
+                Error::format(
+                    output,
+                    "vips binary not found on PATH; install libvips-tools \
+                     (e.g. `sudo apt install libvips-tools`)",
+                )
+            })?;
+            let tmp = interchange_path(output);
+            let _guard = TempFileGuard(tmp.clone());
+            write_bigtiff(&img, &tmp, &tiff_opts)?;
+            let dest_spec = format!(
+                "{}{}",
+                output.display(),
+                format.saver_options(depth, opts.quality)
+            );
+            crate::vips::vips_copy(&vips_bin, &tmp, &dest_spec, output)?;
         }
     }
 
@@ -316,6 +344,81 @@ mod tests {
             OutputFormat::Avif.saver_options(BitDepth::U8, Some(50)),
             "[Q=50]"
         );
+    }
+
+    #[test]
+    fn png_via_vips_defaults_to_16bit() {
+        if crate::vips::vips_available().is_none() {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        }
+        let dir = tmpdir("png16");
+        let input = dir.join("in.xisf");
+        synth_xisf(&input, 6, 4, 1, true);
+        let output = dir.join("out.png");
+        let report = convert(&input, &output, &ConvertOptions::default()).unwrap();
+        assert_eq!((report.width, report.height), (6, 4));
+
+        // PNG signature.
+        let head = std::fs::read(&output).unwrap();
+        assert_eq!(&head[0..4], &[0x89, b'P', b'N', b'G']);
+        // 16-bit grayscale: PNG IHDR bit depth byte (offset 24) == 16.
+        assert_eq!(head[24], 16, "PNG bit depth");
+
+        // Sidecar rides along for vips-backed outputs too.
+        assert!(dir.join("out.wcs.json").exists());
+        // Temp interchange file cleaned up.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("mpp-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jpeg_via_vips_with_quality() {
+        if crate::vips::vips_available().is_none() {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        }
+        let dir = tmpdir("jpeg");
+        let input = dir.join("in.xisf");
+        synth_xisf(&input, 8, 8, 3, false);
+        let output = dir.join("out.jpg");
+        let opts = ConvertOptions {
+            quality: Some(90),
+            ..Default::default()
+        };
+        convert(&input, &output, &opts).unwrap();
+        let head = std::fs::read(&output).unwrap();
+        assert_eq!(&head[0..2], &[0xFF, 0xD8], "JPEG SOI marker");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vips_failure_cleans_up_temp_file() {
+        if crate::vips::vips_available().is_none() {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        }
+        let dir = tmpdir("vipsfail");
+        let input = dir.join("in.xisf");
+        synth_xisf(&input, 2, 2, 1, false);
+        // A directory where the output file should go makes vips fail.
+        let output = dir.join("blocked.png");
+        std::fs::create_dir(&output).unwrap();
+        assert!(convert(&input, &output, &ConvertOptions::default()).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("mpp-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -27,7 +27,6 @@ pub fn vips_available() -> Option<PathBuf> {
 /// `dest_spec` is the output path plus optional bracketed saver options
 /// (e.g. `out.png[bitdepth=16]`); `dest_path` is the plain path, used for
 /// error reporting. vips stderr is captured into the error message.
-#[allow(dead_code)]
 pub(crate) fn vips_copy(
     vips_bin: &Path,
     src: &Path,
