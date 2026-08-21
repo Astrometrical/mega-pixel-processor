@@ -243,6 +243,16 @@ impl PlanarRows for Staging {
         self.channels
     }
 
+    /// Returns row `y` of channel `c`. **Not coverage-aware**: an
+    /// uncovered row (one no [`write_band`](Staging::write_band) call has
+    /// touched yet) reads back as all-zero — the mmap'd staging file
+    /// starts zero-filled and this accessor does not consult `coverage` at
+    /// all — so a caller must only read through this trait impl once
+    /// [`Staging::is_complete`] is `true`. The worker's event loop (task 6)
+    /// enforces that shape directly: it only reaches the `write_bigtiff`
+    /// call after its `Finish` handler has confirmed
+    /// [`Staging::first_uncovered`] returns `None`, so a partially-covered
+    /// image is never streamed through the encoder.
     fn row(&self, c: u64, y: u64) -> &[f32] {
         assert!(c < self.channels, "channel {c} out of range");
         assert!(y < self.height, "row {y} out of range");

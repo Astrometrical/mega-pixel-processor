@@ -11,3 +11,10 @@
 pub mod link;
 pub mod protocol;
 pub mod shm;
+
+/// Reference host implementation (test-only). Behind the `testkit` feature:
+/// spawns a real `mpp-ipc-worker` child process and drives it through the
+/// full wire protocol, so it doubles as both e2e test plumbing and
+/// protocol-faithful reference documentation for the eventual C++ host.
+#[cfg(feature = "testkit")]
+pub mod testhost;

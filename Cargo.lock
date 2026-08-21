@@ -251,6 +251,7 @@ dependencies = [
 name = "mpp-ipc"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "libc",
  "nix",
  "serde",
