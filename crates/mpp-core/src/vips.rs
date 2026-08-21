@@ -10,9 +10,14 @@
 //! making its job a pure container conversion. `vips_dzsave` builds the
 //! Deep Zoom tile pyramid, `vips_msb` derives a deterministic 8-bit image
 //! from a 16-bit one, and `vipsheader_field` reads back individual header
-//! fields (width, height, format, …) for verification, normalizing
-//! libvips' verbose enum-value dump (`((VipsBandFormat)
-//! VIPS_FORMAT_UCHAR)` on 8.15.1) down to the plain nickname (`"uchar"`).
+//! fields (width, height, format, …) for verification. Numeric fields
+//! (width, height, …) come back bare; the `format` field's verbose
+//! enum-value dump (`((VipsBandFormat) VIPS_FORMAT_UCHAR)` on 8.15.1) is
+//! reduced to the plain nickname (`"uchar"`) — other enum-typed fields
+//! (`interpretation`, `coding`, …) are returned as that raw dump, since
+//! their C symbols can embed extra underscores inside a hyphenated
+//! nickname (e.g. `VIPS_INTERPRETATION_B_W` for `"b-w"`) that a generic
+//! reduction would garble.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -120,11 +125,13 @@ pub(crate) fn vips_msb(vips_bin: &Path, src: &Path, dest: &Path) -> Result<()> {
 /// package as `vips`, so its presence is implied by [`vips_available`].
 ///
 /// Plain scalar fields (`width`, `height`, …) print bare (e.g. `"16384"`).
-/// Enum-typed fields (`format`, `interpretation`, `coding`) print as
-/// GLib's verbose value dump — `((VipsBandFormat) VIPS_FORMAT_UCHAR)` on
-/// libvips 8.15.1 — rather than the plain nickname `vipsheader -a` shows
-/// for the same field; [`normalize_enum_field`] reduces that shape to the
-/// bare lowercase nickname (`"uchar"`) so callers see one consistent form.
+/// The `format` field prints as GLib's verbose value dump —
+/// `((VipsBandFormat) VIPS_FORMAT_UCHAR)` on libvips 8.15.1 — rather than
+/// the plain nickname `vipsheader -a` shows for the same field;
+/// [`normalize_format_field`] reduces that one shape to the bare lowercase
+/// nickname (`"uchar"`). Other enum-typed fields (`interpretation`,
+/// `coding`, …) are returned as that raw dump, unreduced — see
+/// [`normalize_format_field`]'s doc comment for why it doesn't generalize.
 // Only exercised by this module's gated tests today; the publish/dzsave
 // routing task in this plan wires it into non-test code.
 #[allow(dead_code)]
@@ -148,24 +155,35 @@ pub(crate) fn vipsheader_field(src: &Path, field: &str) -> Result<String> {
         ));
     }
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(normalize_enum_field(&raw))
+    Ok(normalize_format_field(&raw))
 }
 
-/// Reduce libvips' `((TypeName) ENUM_VALUE)` value-contents dump (as
-/// printed by `vipsheader -f` for enum-typed fields) to the bare lowercase
+/// Reduce libvips' `((VipsBandFormat) VIPS_FORMAT_xxx)` value-contents
+/// dump (as printed by `vipsheader -f format`) to the bare lowercase
 /// nickname, e.g. `((VipsBandFormat) VIPS_FORMAT_UCHAR)` -> `"uchar"`.
-/// Strings not in that shape (plain scalar fields) pass through unchanged.
+/// Every `VIPS_FORMAT_*` nickname is a single token, so this reduction is
+/// provably correct for that one enum.
+///
+/// Deliberately narrow: this does **not** generalize to other enum-typed
+/// header fields. Their C symbol can embed an extra underscore inside a
+/// hyphenated nickname — e.g. `interpretation` = `"b-w"` prints as
+/// `((VipsInterpretation) VIPS_INTERPRETATION_B_W)`, and a generic
+/// "last token after the last `_`" reduction would wrongly yield `"w"`.
+/// The parenthesized type name doesn't predict the value's prefix either
+/// (there's no general `VIPS_<TypeName>_` rule), so any input not
+/// exactly shaped as a `VipsBandFormat` dump — including other enum
+/// dumps and plain scalar fields — passes through unchanged, raw.
 // Reachable only through `vipsheader_field` above, which is itself
 // unreached from non-test code until a later task wires it in.
 #[allow(dead_code)]
-fn normalize_enum_field(raw: &str) -> String {
-    let Some(inner) = raw.strip_prefix("((").and_then(|s| s.strip_suffix(')')) else {
+fn normalize_format_field(raw: &str) -> String {
+    let Some(value) = raw
+        .strip_prefix("((VipsBandFormat) ")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
         return raw.to_string();
     };
-    let Some((_type_name, value)) = inner.split_once(") ") else {
-        return raw.to_string();
-    };
-    match value.rsplit('_').next() {
+    match value.strip_prefix("VIPS_FORMAT_") {
         Some(nick) if !nick.is_empty() => nick.to_lowercase(),
         _ => raw.to_string(),
     }
@@ -198,17 +216,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_enum_field_strips_glib_value_dump() {
+    fn normalize_format_field_reduces_format_only() {
         assert_eq!(
-            normalize_enum_field("((VipsBandFormat) VIPS_FORMAT_UCHAR)"),
+            normalize_format_field("((VipsBandFormat) VIPS_FORMAT_UCHAR)"),
             "uchar"
         );
+        // Other enum-typed fields are intentionally left raw: their C
+        // symbol can embed an extra underscore inside a hyphenated
+        // nickname (VIPS_INTERPRETATION_B_W -> "b-w"), which the
+        // format-only heuristic would garble ("w") if applied generically.
         assert_eq!(
-            normalize_enum_field("((VipsInterpretation) VIPS_INTERPRETATION_MULTIBAND)"),
-            "multiband"
+            normalize_format_field("((VipsInterpretation) VIPS_INTERPRETATION_B_W)"),
+            "((VipsInterpretation) VIPS_INTERPRETATION_B_W)"
         );
         // Plain scalar fields pass through untouched.
-        assert_eq!(normalize_enum_field("31"), "31");
+        assert_eq!(normalize_format_field("31"), "31");
     }
 
     #[test]
