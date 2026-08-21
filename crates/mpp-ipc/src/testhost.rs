@@ -100,6 +100,70 @@ pub fn run_cancel_after_first_band(cfg: &TestHostConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Sends only the first `bands_to_send` bands of the full in-order plan,
+/// then `Finish`es without ever sending the rest — exercising the worker's
+/// incomplete-coverage rejection (`docs/pi-protocol.md` §7.3, "the worker
+/// sends `Error` naming the first uncovered `(channel, row)` pair"). Returns
+/// the `Error` message on that expected path; `Err` for any other protocol
+/// deviation (e.g. the worker accepting the incomplete run and sending
+/// `Done` anyway).
+pub fn run_write_session_incomplete(
+    cfg: &TestHostConfig,
+    pixel: impl Fn(u64, u64, u64) -> f32,
+    bands_to_send: usize,
+) -> Result<String, String> {
+    let bands = band_plan(cfg.height, cfg.channels, cfg.band_rows);
+    let mut session = Session::start(cfg)?;
+    let mut buf: Vec<f32> = Vec::new();
+    for (i, (channel, start_row, rows)) in bands.into_iter().take(bands_to_send).enumerate() {
+        buf.clear();
+        for y in start_row..start_row + rows as u64 {
+            for x in 0..cfg.width {
+                buf.push(pixel(channel, y, x));
+            }
+        }
+        let slot_id = (i as u32) % session.slots;
+        session.send_band_and_await_ack(channel, start_row, rows, slot_id, &buf)?;
+    }
+    session.finish_and_await_error()
+}
+
+/// Drives one band through a worker whose advertised `Init.slot_bytes` is
+/// deliberately smaller than the band about to be sent — exercising the
+/// slot-size validation `docs/pi-protocol.md` §6 requires (`rows * width *
+/// 4 <= slot_bytes`) before the worker ever touches the shm slot. The
+/// host's own shm segment is still physically sized to hold a real band (so
+/// assembling and copying the band into it here is safe) — only the
+/// `Init.slot_bytes` field the worker is told lies. Returns the `Error`
+/// message on the expected rejection; `Err` for any other protocol
+/// deviation (e.g. the worker accepting the oversize band and acking it).
+pub fn run_oversize_band_session(
+    cfg: &TestHostConfig,
+    pixel: impl Fn(u64, u64, u64) -> f32,
+    advertised_slot_bytes: u64,
+) -> Result<String, String> {
+    let mut session = Session::start_with_slot_bytes_override(cfg, advertised_slot_bytes)?;
+    let rows = cfg.height.min(cfg.band_rows as u64) as u32;
+    let mut buf = Vec::with_capacity(rows as usize * cfg.width as usize);
+    for y in 0..rows as u64 {
+        for x in 0..cfg.width {
+            buf.push(pixel(0, y, x));
+        }
+    }
+    match session.send_band_and_await_ack(0, 0, rows, 0, &buf) {
+        // The worker is still alive, blocked waiting for the next frame
+        // (we never send Finish/Cancel on this path) — don't call
+        // `expect_exit` here, which would block on `child.wait()` forever.
+        // `Session::drop` kills and reaps it instead, so this returns
+        // promptly.
+        Ok(()) => Err("worker acked an oversize band instead of rejecting it".to_string()),
+        Err(msg) => {
+            session.expect_exit(false)?;
+            Ok(msg)
+        }
+    }
+}
+
 /// Fills every slot's worth of pixels via `pixel` and streams `bands` to
 /// the worker in the order given, then `Finish`es and returns
 /// `bytes_written` from `Done`. Shared by [`run_write_session`] and
@@ -172,8 +236,40 @@ impl Session {
     /// rejected).
     fn start(cfg: &TestHostConfig) -> Result<Self, String> {
         let slot_bytes = cfg.band_rows as u64 * cfg.width * 4;
+        Self::start_inner(cfg, slot_bytes, slot_bytes)
+    }
+
+    /// As [`start`](Self::start), but advertises `advertised_slot_bytes` to
+    /// the worker in `Init` instead of the real, band-sized `slot_bytes` —
+    /// used only by [`run_oversize_band_session`] to exercise the worker's
+    /// slot-size validation. The host's own shm segment is still physically
+    /// sized for a real band (`physical_slot_bytes`), so filling it stays
+    /// safe even though the worker is told a smaller size.
+    fn start_with_slot_bytes_override(
+        cfg: &TestHostConfig,
+        advertised_slot_bytes: u64,
+    ) -> Result<Self, String> {
+        let physical_slot_bytes = cfg.band_rows as u64 * cfg.width * 4;
+        Self::start_inner(cfg, physical_slot_bytes, advertised_slot_bytes)
+    }
+
+    /// Shared implementation of [`start`](Self::start) and
+    /// [`start_with_slot_bytes_override`](Self::start_with_slot_bytes_override):
+    /// creates a shm segment physically `physical_slot_bytes * cfg.slots`
+    /// bytes (always large enough for real band data), spawns
+    /// `cfg.worker_exe`, and writes the `Init` frame advertising
+    /// `advertised_slot_bytes` as `InitMessage::slot_bytes` (equal to
+    /// `physical_slot_bytes` in the normal case). [`Session::slot_bytes`]
+    /// tracks the *physical* stride, since that's what governs where this
+    /// host itself writes slot data — the advertised value only affects
+    /// what the worker is told to validate against.
+    fn start_inner(
+        cfg: &TestHostConfig,
+        physical_slot_bytes: u64,
+        advertised_slot_bytes: u64,
+    ) -> Result<Self, String> {
         let shm_name = format!("/mpp-th-{}-{}", std::process::id() % 100_000, unique_id());
-        let total_bytes = slot_bytes as usize * cfg.slots as usize;
+        let total_bytes = physical_slot_bytes as usize * cfg.slots as usize;
         let shm = ShmSegment::create(&shm_name, total_bytes)
             .map_err(|e| format!("creating shm segment {shm_name:?}: {e}"))?;
 
@@ -198,7 +294,7 @@ impl Session {
             channels: cfg.channels,
             bit_depth: cfg.bit_depth.clone(),
             shm_name: shm_name.clone(),
-            slot_bytes,
+            slot_bytes: advertised_slot_bytes,
             slots: cfg.slots,
         };
         let payload = serde_json::to_vec(&init).map_err(|e| format!("encoding Init: {e}"))?;
@@ -213,7 +309,7 @@ impl Session {
             stdin,
             stdout,
             shm,
-            slot_bytes,
+            slot_bytes: physical_slot_bytes,
             slots: cfg.slots,
         })
     }
@@ -296,6 +392,50 @@ impl Session {
         };
 
         self.expect_exit(outcome.is_ok())?;
+        outcome
+    }
+
+    /// Sends `Finish` and reads frames until `Error` (returns the error
+    /// message) — the expected outcome when the host stopped short of
+    /// covering the whole image, per `docs/pi-protocol.md` §7.3. `Err` is
+    /// returned instead for any other protocol deviation, including the
+    /// worker sending `Done` anyway. Checks the worker's exit code agrees
+    /// with the failure, like [`finish_and_await_done`](Self::finish_and_await_done).
+    fn finish_and_await_error(mut self) -> Result<String, String> {
+        write_frame(&mut self.stdin, tag::FINISH, &[])
+            .map_err(|e| format!("writing Finish frame: {e}"))?;
+        self.stdin
+            .flush()
+            .map_err(|e| format!("flushing Finish frame: {e}"))?;
+
+        let outcome: Result<String, String> = loop {
+            let (t, payload) = match read_frame(&mut self.stdout) {
+                Ok(f) => f,
+                Err(e) => break Err(format!("reading reply to Finish: {e}")),
+            };
+            match t {
+                tag::PROGRESS => continue,
+                tag::ERROR => {
+                    let msg: ErrorMessage = match serde_json::from_slice(&payload) {
+                        Ok(m) => m,
+                        Err(e) => break Err(format!("malformed Error payload: {e}")),
+                    };
+                    break Ok(msg.message);
+                }
+                tag::DONE => {
+                    break Err(
+                        "worker sent Done after an incomplete Finish, expected Error".to_string(),
+                    );
+                }
+                other => {
+                    break Err(format!(
+                        "unexpected tag {other} while waiting for Finish's Error reply"
+                    ));
+                }
+            }
+        };
+
+        self.expect_exit(false)?;
         outcome
     }
 

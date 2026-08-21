@@ -187,8 +187,8 @@ fn run<R: Read, W: Write>(link: &mut HostLink<R, W>) -> Result<(), WorkerError> 
                     return Err(fail(
                         link,
                         &format!(
-                            "incomplete coverage at Finish: channel {c} row {y} was never \
-                             received"
+                            "incomplete coverage at Finish: channel {c} row {y} is uncovered \
+                             (was never received)"
                         ),
                     ));
                 }

@@ -138,10 +138,11 @@ distortion grids) do not bump it. Source of truth:
    Remaining loose ends: FITS read/write evaluation, real-data Photoshop
    smoke test (manual). Smoke test that matters: a >4 GB BigTIFF opens in
    Photoshop (PS ≥ 26.2 saves BigTIFF; opening support is older).
-2. **PixInsight file-format module**: write-only "BigTIFF" format (`.btf`,
-   `.tf8`) as a thin PCL C++ shim streaming pixel bands over the shm
-   host/worker channel (pattern proven in MMM's integration/) to a Rust
-   worker that encodes. Write-only is legitimate (PI's RAW format is
+2. **PixInsight file-format module** (in progress — plan A's Rust worker +
+   IPC has landed; plan B's C++ PCL host is next): write-only "BigTIFF"
+   format (`.btf`, `.tf8`) as a thin PCL C++ shim streaming pixel bands over
+   the shm host/worker channel (pattern proven in MMM's integration/) to a
+   Rust worker that encodes. Write-only is legitimate (PI's RAW format is
    read-only); import can come later. Reuses MMM's CI build/sign/publish
    scripts; the Astrometrical update repo serves both packages.
 3. **DeepSky viewer components / platform hooks**: richer viewer (WCS
