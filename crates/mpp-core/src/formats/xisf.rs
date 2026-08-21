@@ -158,6 +158,24 @@ impl XisfImage {
     }
 }
 
+impl super::PlanarRows for XisfImage {
+    fn width(&self) -> u64 {
+        self.width()
+    }
+
+    fn height(&self) -> u64 {
+        self.height()
+    }
+
+    fn channels(&self) -> u64 {
+        self.channels()
+    }
+
+    fn row(&self, c: u64, y: u64) -> &[f32] {
+        self.row(c, y)
+    }
+}
+
 fn parse_header(path: &Path, mmap: &Mmap) -> Result<XisfHeader> {
     if mmap.len() < 16 || &mmap[0..8] != SIGNATURE {
         return Err(Error::format(

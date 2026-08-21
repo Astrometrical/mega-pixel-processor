@@ -1,0 +1,15 @@
+[package]
+name = "mpp-ipc-worker"
+description = "Mega Pixel Processor PixInsight-side worker — receives pixel bands over shared memory, stages them to a memory-mapped file, and streams output writers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+mpp-ipc.workspace = true
+mpp-core.workspace = true
+memmap2.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true

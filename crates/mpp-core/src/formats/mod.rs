@@ -7,6 +7,18 @@
 pub mod tiff;
 pub mod xisf;
 
+/// A planar f32 image source the streaming writers can drain row by row.
+pub trait PlanarRows {
+    /// Width in pixels.
+    fn width(&self) -> u64;
+    /// Height in pixels.
+    fn height(&self) -> u64;
+    /// Channel count.
+    fn channels(&self) -> u64;
+    /// One row of one channel (len == width), values nominally [0, 1].
+    fn row(&self, c: u64, y: u64) -> &[f32];
+}
+
 /// A FITS header keyword carried through from input to output.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FitsKeyword {

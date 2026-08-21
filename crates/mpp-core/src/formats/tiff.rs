@@ -12,7 +12,7 @@ use std::path::Path;
 
 use tiff::encoder::{TiffEncoder, colortype};
 
-use crate::formats::xisf::XisfImage;
+use crate::formats::PlanarRows;
 use crate::{Error, Result};
 
 /// Target uncompressed strip size; rows per strip is derived from this.
@@ -50,7 +50,7 @@ fn to_u8(v: f32) -> u8 {
 /// Write `img` to `path` as an uncompressed BigTIFF, streaming strip by
 /// strip in constant memory. Grayscale (1 channel) and RGB (3 channels)
 /// are supported; XISF planar planes are interleaved to TIFF chunky order.
-pub fn write_bigtiff(img: &XisfImage, path: &Path, opts: &TiffWriteOptions) -> Result<()> {
+pub fn write_bigtiff(img: &impl PlanarRows, path: &Path, opts: &TiffWriteOptions) -> Result<()> {
     write_bigtiff_with_target(img, path, opts, TARGET_STRIP_BYTES)
 }
 
@@ -58,7 +58,7 @@ pub fn write_bigtiff(img: &XisfImage, path: &Path, opts: &TiffWriteOptions) -> R
 /// tests can force multi-strip (including a partial last strip) output
 /// without needing a multi-gigabyte image.
 fn write_bigtiff_with_target(
-    img: &XisfImage,
+    img: &impl PlanarRows,
     path: &Path,
     opts: &TiffWriteOptions,
     target_strip_bytes: u64,
