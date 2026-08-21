@@ -18,6 +18,7 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+tracing.workspace = true
 
 [features]
 testkit = []
