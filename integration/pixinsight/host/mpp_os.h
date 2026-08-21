@@ -22,7 +22,15 @@
 // header (as inline functions, no new .cpp unit) because Task 2's golden
 // test needs to spawn the real worker before mpp_host.cpp exists (that
 // lands in Task 3); Task 3's WriteSession driver reuses these primitives
-// instead of re-implementing them.
+// instead of re-implementing them. `os_spawn`'s `parent_ends` parameter
+// ports MMM's `spawn_worker`'s `parent_ends` mechanism (closed via
+// `posix_spawn_file_actions_addclose` on POSIX, via `SetHandleInformation`
+// clearing `HANDLE_FLAG_INHERIT` on Windows) -- every caller MUST pass its
+// own parent-retained pipe ends there, or the child inherits live duplicate
+// handles to them and pi-protocol §7.5 host-gone EOF detection silently
+// breaks (see `os_spawn`'s doc comment on each platform for the full
+// mechanism; a task-2 review found this omitted on first pass and it was
+// fixed before Task 2 closed out -- see the task-2 report's fix addendum).
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -187,14 +195,27 @@ inline const os_pid os_invalid_pid = nullptr;
 /// Spawns `exe_path` (no extra args -- `mpp-ipc-worker` takes none in normal
 /// operation) with its stdin/stdout wired to the given (already child-side)
 /// pipe ends; stderr is inherited from this process. `bInheritHandles = TRUE`
-/// is required for `STARTF_USESTDHANDLES` to take effect; the caller must
-/// have already made its own parent-retained pipe ends non-inheritable via
-/// `SetHandleInformation` so the child does not keep them open (which would
-/// prevent EOF). Throws `std::runtime_error` on failure. `CREATE_NO_WINDOW`
-/// suppresses the console window Windows would otherwise pop for a console
-/// app spawned from a GUI host (PixInsight).
+/// is required for `STARTF_USESTDHANDLES` to take effect, which means the
+/// child inherits a duplicate of EVERY inheritable handle in this process,
+/// not just `child_stdin`/`child_stdout` -- so every parent-retained pipe
+/// end (the write end of the child's own stdin pipe, the read end of the
+/// child's own stdout pipe) must be marked non-inheritable first, or the
+/// child ends up holding a live handle to its own stdin's write side and
+/// that pipe never signals EOF to it even after this process closes its
+/// copy (breaking docs/pi-protocol.md §7.5 host-gone detection). Pass every
+/// such handle in `parent_ends`; this function clears
+/// `HANDLE_FLAG_INHERIT` on each before spawning, so callers no longer need
+/// to call `SetHandleInformation` themselves. Throws `std::runtime_error`
+/// on failure. `CREATE_NO_WINDOW` suppresses the console window Windows
+/// would otherwise pop for a console app spawned from a GUI host
+/// (PixInsight).
 inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
-                        os_handle child_stdout) {
+                        os_handle child_stdout,
+                        const std::vector<os_handle>& parent_ends = {}) {
+    for (os_handle fd : parent_ends) {
+        if (fd != os_invalid_handle) SetHandleInformation(fd, HANDLE_FLAG_INHERIT, 0);
+    }
+
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof si);
     si.cb = sizeof si;
@@ -332,11 +353,27 @@ inline void ignore_sigpipe_once() {
 /// operation) via `posix_spawn`, redirecting the child's stdin/stdout to the
 /// given (already child-side) pipe descriptors; stderr is inherited. The
 /// caller retains ownership of `child_stdin`/`child_stdout` (still open in
-/// this process after the call) and of every other open pipe descriptor --
-/// close them explicitly after spawning, same as `posix_spawn`'s usual
-/// contract. Throws `std::runtime_error` on failure.
+/// this process after the call) -- close them explicitly after spawning,
+/// same as `posix_spawn`'s usual contract.
+///
+/// `posix_spawn` does NOT close inherited descriptors by default (only ones
+/// explicitly marked `FD_CLOEXEC`, which this seam never sets), so a plain
+/// dup2-of-`child_stdin`-onto-stdin leaves every OTHER open descriptor --
+/// most importantly the parent's own retained pipe ends (the write end of
+/// the child's own stdin pipe, the read end of the child's own stdout pipe)
+/// -- inherited into the child as extra live copies. A child holding an
+/// open duplicate of its stdin's write end means that pipe never reaches
+/// EOF on the child's read side even after this process closes its own
+/// copy, silently breaking docs/pi-protocol.md §7.5's host-gone detection
+/// (the worker hangs waiting for a `Finish` that will never come, instead
+/// of observing EOF and cleaning up). Pass every such handle in
+/// `parent_ends`; each is closed in the child via
+/// `posix_spawn_file_actions_addclose` before `exec`. Ported from MMM's
+/// `spawn_worker`'s `parent_ends` parameter (`mmm_host.cpp`). Throws
+/// `std::runtime_error` on failure.
 inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
-                        os_handle child_stdout) {
+                        os_handle child_stdout,
+                        const std::vector<os_handle>& parent_ends = {}) {
     detail::ignore_sigpipe_once();
 
     posix_spawn_file_actions_t fa;
@@ -345,6 +382,9 @@ inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
     posix_spawn_file_actions_adddup2(&fa, child_stdout, STDOUT_FILENO);
     posix_spawn_file_actions_addclose(&fa, child_stdin);
     posix_spawn_file_actions_addclose(&fa, child_stdout);
+    for (os_handle fd : parent_ends) {
+        if (fd != os_invalid_handle) posix_spawn_file_actions_addclose(&fa, fd);
+    }
 
     std::string exe_copy = exe_path;
     char* argv[] = {exe_copy.data(), nullptr};

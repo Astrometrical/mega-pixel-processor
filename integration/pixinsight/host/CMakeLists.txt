@@ -59,3 +59,10 @@ add_custom_target(build_worker
 add_executable(test_roundtrip test/test_roundtrip.cpp)
 target_link_libraries(test_roundtrip PRIVATE mpp_host)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
+
+# Host-gone golden test: worker stdin EOF before Finish (docs/pi-protocol.md
+# §7.5) must be observed and cleaned up, not hung on forever -- see
+# test_host_gone.cpp's header comment for the fd-leak bug this pins.
+add_executable(test_host_gone test/test_host_gone.cpp)
+target_link_libraries(test_host_gone PRIVATE mpp_host)
+add_test(NAME test_host_gone COMMAND test_host_gone)

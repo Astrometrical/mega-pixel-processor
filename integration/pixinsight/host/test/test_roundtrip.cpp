@@ -127,11 +127,12 @@ int main() {
     // ---- spawn the real worker ---------------------------------------
     mpp::Pipe in_pipe;   // host writes -> worker stdin
     mpp::Pipe out_pipe;  // worker stdout -> host reads
-#ifdef _WIN32
-    SetHandleInformation(in_pipe.write_end, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(out_pipe.read_end, HANDLE_FLAG_INHERIT, 0);
-#endif
-    mpp::os_pid pid = mpp::os_spawn(worker_exe, in_pipe.read_end, out_pipe.write_end);
+    // in_pipe.write_end and out_pipe.read_end are OUR ends -- the child must
+    // never inherit them (see os_spawn's doc comment: an inherited copy of
+    // in_pipe.write_end in the child would mean the child's own stdin pipe
+    // never reaches EOF, even after we close our copy).
+    mpp::os_pid pid = mpp::os_spawn(worker_exe, in_pipe.read_end, out_pipe.write_end,
+                                     {in_pipe.write_end, out_pipe.read_end});
     in_pipe.close_read();
     out_pipe.close_write();
 
