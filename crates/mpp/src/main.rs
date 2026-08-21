@@ -24,9 +24,9 @@ enum Command {
         input: PathBuf,
         /// Output image (.tif/.tiff, written as BigTIFF).
         output: PathBuf,
-        /// Output sample format.
-        #[arg(long, value_enum, default_value_t = BitDepthArg::F32)]
-        bit_depth: BitDepthArg,
+        /// Output sample format; defaults to the output format's default.
+        #[arg(long, value_enum)]
+        bit_depth: Option<BitDepthArg>,
         /// Do not write the WCS sidecar even when the input is solved.
         #[arg(long)]
         no_sidecar: bool,
@@ -60,8 +60,9 @@ fn main() -> Result<()> {
             no_sidecar,
         } => {
             let opts = ConvertOptions {
-                bit_depth: bit_depth.into(),
+                bit_depth: bit_depth.map(Into::into),
                 sidecar: !no_sidecar,
+                quality: None,
             };
             let report = convert(&input, &output, &opts)?;
             println!(

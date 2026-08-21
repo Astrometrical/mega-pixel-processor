@@ -7,20 +7,97 @@ use crate::formats::xisf::XisfImage;
 use crate::wcs::sidecar::{WcsSidecar, sidecar_path};
 use crate::{Error, Result};
 
+/// Supported output containers, chosen by file extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// BigTIFF, written natively by [`crate::formats::tiff`].
+    BigTiff,
+    /// PNG via vips `pngsave` (8/16-bit).
+    Png,
+    /// JPEG via vips `jpegsave` (8-bit, lossy).
+    Jpeg,
+    /// WebP via vips `webpsave` (8-bit, lossy).
+    Webp,
+    /// AVIF via vips `heifsave` (8-bit, lossy).
+    Avif,
+    /// JPEG XL via vips `jxlsave` (8/16-bit).
+    Jxl,
+}
+
+impl OutputFormat {
+    /// Map a lowercase file extension to a format; `None` if unsupported.
+    pub fn from_ext(ext: &str) -> Option<Self> {
+        Some(match ext {
+            "tif" | "tiff" => Self::BigTiff,
+            "png" => Self::Png,
+            "jpg" | "jpeg" => Self::Jpeg,
+            "webp" => Self::Webp,
+            "avif" => Self::Avif,
+            "jxl" => Self::Jxl,
+            _ => return None,
+        })
+    }
+
+    /// The bit depth used when the caller does not choose one.
+    pub fn default_bit_depth(self) -> BitDepth {
+        match self {
+            Self::BigTiff => BitDepth::F32,
+            Self::Png | Self::Jxl => BitDepth::U16,
+            Self::Jpeg | Self::Webp | Self::Avif => BitDepth::U8,
+        }
+    }
+
+    /// Whether this container can hold samples of `depth`.
+    pub fn allows(self, depth: BitDepth) -> bool {
+        match self {
+            Self::BigTiff => true,
+            Self::Png | Self::Jxl => matches!(depth, BitDepth::U16 | BitDepth::U8),
+            Self::Jpeg | Self::Webp | Self::Avif => matches!(depth, BitDepth::U8),
+        }
+    }
+
+    /// Whether the format's vips saver takes a `Q` (quality) option.
+    pub fn lossy_quality(self) -> bool {
+        matches!(self, Self::Jpeg | Self::Webp | Self::Avif | Self::Jxl)
+    }
+
+    /// Bracketed vips saver options for this format/depth/quality, or "".
+    pub fn saver_options(self, depth: BitDepth, quality: Option<u8>) -> String {
+        let mut opts: Vec<String> = Vec::new();
+        if self == Self::Png && depth == BitDepth::U16 {
+            opts.push("bitdepth=16".to_string());
+        }
+        if self.lossy_quality()
+            && let Some(q) = quality
+        {
+            opts.push(format!("Q={q}"));
+        }
+        if opts.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", opts.join(","))
+        }
+    }
+}
+
 /// Options for [`convert`].
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
-    /// Output sample format.
-    pub bit_depth: BitDepth,
+    /// Output sample format; `None` uses the output format's default
+    /// ([`OutputFormat::default_bit_depth`]).
+    pub bit_depth: Option<BitDepth>,
     /// Write the WCS JSON sidecar when the input carries a solution.
     pub sidecar: bool,
+    /// Lossy-format quality 1–100 (vips `Q`); error on lossless formats.
+    pub quality: Option<u8>,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
-            bit_depth: BitDepth::F32,
+            bit_depth: None,
             sidecar: true,
+            quality: None,
         }
     }
 }
@@ -47,9 +124,11 @@ fn ext(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Convert `input` (XISF) to `output` (BigTIFF, chosen by `.tif`/`.tiff`
-/// extension), writing the WCS sidecar next to the output when the input
-/// carries an astrometric solution and `opts.sidecar` is on.
+/// Convert `input` (XISF) to `output`, whose extension selects the
+/// [`OutputFormat`] (currently only [`OutputFormat::BigTiff`] is wired to a
+/// writer; the other vips-backed formats are routed and validated but write
+/// a "not wired yet" error), writing the WCS sidecar next to the output
+/// when the input carries an astrometric solution and `opts.sidecar` is on.
 pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<ConvertReport> {
     if ext(input) != "xisf" {
         return Err(Error::format(
@@ -57,22 +136,48 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
             "unsupported input format (XISF only in this phase)",
         ));
     }
-    if !matches!(ext(output).as_str(), "tif" | "tiff") {
+    let format = OutputFormat::from_ext(&ext(output)).ok_or_else(|| {
+        Error::format(
+            output,
+            "unsupported output format (tif/tiff, png, jpg, webp, avif, jxl)",
+        )
+    })?;
+    let depth = match opts.bit_depth {
+        Some(d) => {
+            if !format.allows(d) {
+                return Err(Error::format(
+                    output,
+                    format!("{d:?} samples are not supported by {format:?} output"),
+                ));
+            }
+            d
+        }
+        None => format.default_bit_depth(),
+    };
+    if opts.quality.is_some() && !format.lossy_quality() {
         return Err(Error::format(
             output,
-            "unsupported output format (BigTIFF .tif/.tiff only in this phase)",
+            format!("--quality does not apply to {format:?} output"),
         ));
     }
 
     let img = XisfImage::open(input)?;
     img.advise_sequential();
-    write_bigtiff(
-        &img,
-        output,
-        &TiffWriteOptions {
-            bit_depth: opts.bit_depth,
-        },
-    )?;
+    match format {
+        OutputFormat::BigTiff => {
+            write_bigtiff(&img, output, &TiffWriteOptions { bit_depth: depth })?;
+        }
+        OutputFormat::Png
+        | OutputFormat::Jpeg
+        | OutputFormat::Webp
+        | OutputFormat::Avif
+        | OutputFormat::Jxl => {
+            return Err(Error::format(
+                output,
+                "vips-backed output is not wired yet (next commit)",
+            ));
+        }
+    }
 
     let wcs = crate::wcs::from_xisf_properties(&img.header().properties);
     let wcs_found = wcs.is_some();
@@ -163,7 +268,7 @@ mod tests {
         let dir = tmpdir("ext");
         let input = dir.join("in.xisf");
         synth_xisf(&input, 2, 2, 1, false);
-        assert!(convert(&input, &dir.join("out.png"), &ConvertOptions::default()).is_err());
+        assert!(convert(&input, &dir.join("out.exr"), &ConvertOptions::default()).is_err());
         assert!(
             convert(
                 &dir.join("in.fits"),
@@ -172,6 +277,64 @@ mod tests {
             )
             .is_err()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_format_routing_and_defaults() {
+        use crate::formats::tiff::BitDepth;
+        assert_eq!(OutputFormat::from_ext("tiff"), Some(OutputFormat::BigTiff));
+        assert_eq!(OutputFormat::from_ext("png"), Some(OutputFormat::Png));
+        assert_eq!(OutputFormat::from_ext("jpeg"), Some(OutputFormat::Jpeg));
+        assert_eq!(OutputFormat::from_ext("exr"), None);
+
+        assert_eq!(OutputFormat::BigTiff.default_bit_depth(), BitDepth::F32);
+        assert_eq!(OutputFormat::Png.default_bit_depth(), BitDepth::U16);
+        assert_eq!(OutputFormat::Jpeg.default_bit_depth(), BitDepth::U8);
+        assert_eq!(OutputFormat::Jxl.default_bit_depth(), BitDepth::U16);
+
+        assert!(OutputFormat::BigTiff.allows(BitDepth::U8));
+        assert!(OutputFormat::Png.allows(BitDepth::U8));
+        assert!(!OutputFormat::Png.allows(BitDepth::F32));
+        assert!(!OutputFormat::Jpeg.allows(BitDepth::U16));
+    }
+
+    #[test]
+    fn saver_options_strings() {
+        use crate::formats::tiff::BitDepth;
+        assert_eq!(
+            OutputFormat::Png.saver_options(BitDepth::U16, None),
+            "[bitdepth=16]"
+        );
+        assert_eq!(OutputFormat::Png.saver_options(BitDepth::U8, None), "");
+        assert_eq!(
+            OutputFormat::Jpeg.saver_options(BitDepth::U8, Some(85)),
+            "[Q=85]"
+        );
+        assert_eq!(OutputFormat::Webp.saver_options(BitDepth::U8, None), "");
+        assert_eq!(
+            OutputFormat::Avif.saver_options(BitDepth::U8, Some(50)),
+            "[Q=50]"
+        );
+    }
+
+    #[test]
+    fn incompatible_depth_and_quality_rejected() {
+        let dir = tmpdir("opts");
+        let input = dir.join("in.xisf");
+        synth_xisf(&input, 2, 2, 1, false);
+        // F32 PNG is impossible.
+        let opts = ConvertOptions {
+            bit_depth: Some(crate::formats::tiff::BitDepth::F32),
+            ..Default::default()
+        };
+        assert!(convert(&input, &dir.join("o.png"), &opts).is_err());
+        // Quality on a lossless format is a user error.
+        let opts = ConvertOptions {
+            quality: Some(80),
+            ..Default::default()
+        };
+        assert!(convert(&input, &dir.join("o.tif"), &opts).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
