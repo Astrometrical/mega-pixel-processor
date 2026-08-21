@@ -124,6 +124,29 @@ fn resolve_mode(requested: PublishMode, w: u64, h: u64) -> PublishMode {
     }
 }
 
+/// Whether `dest` — which need not exist yet — names the same file on disk
+/// as `input`, for the single-mode jpg fast path's self-copy guard.
+/// Canonicalizes `input` and `dest`'s parent directory (already created by
+/// the time this is called), then compares that resolved parent joined with
+/// `dest`'s file name against `input`'s canonical path — this works even
+/// though `dest` itself may not exist, since only its parent needs to.
+///
+/// A canonicalize failure on `input` is reported as an I/O error on
+/// `input` (it must already exist by this point in [`publish`]); a failure
+/// on `dest`'s parent is reported as an I/O error on that parent.
+fn same_file(input: &Path, dest: &Path) -> Result<bool> {
+    let input_canon = input.canonicalize().map_err(|e| Error::io(input, e))?;
+    let dest_parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let dest_parent_canon = dest_parent
+        .canonicalize()
+        .map_err(|e| Error::io(dest_parent, e))?;
+    let dest_canon = match dest.file_name() {
+        Some(name) => dest_parent_canon.join(name),
+        None => dest_parent_canon,
+    };
+    Ok(input_canon == dest_canon)
+}
+
 /// Publish `input` as a self-hostable web viewer under `outdir`: an 8-bit
 /// [`PublishMode::Dzi`] tile pyramid (built by vips `dzsave`) or a
 /// [`PublishMode::Single`] full-resolution `<stem>.jpg` — plus the branded
@@ -140,20 +163,27 @@ fn resolve_mode(requested: PublishMode, w: u64, h: u64) -> PublishMode {
 /// other sample formats are rejected with a message to stretch and export
 /// first. `outdir` is created if missing.
 ///
-/// In single mode, a `.jpg`/`.jpeg` input is copied byte-for-byte to
-/// `<stem>.jpg` rather than re-encoded; any other input is re-encoded via
-/// vips at `opts.tile_quality` (default 90).
+/// In single mode, a `.jpg`/`.jpeg` input is normally copied byte-for-byte to
+/// `<stem>.jpg`; any other input is re-encoded via vips at
+/// `opts.tile_quality` (default 90). If `input` and `outdir`'s `<stem>.jpg`
+/// name the *same file* on disk (e.g. publishing a jpg back into the
+/// directory it already lives in), the copy is skipped entirely when no
+/// explicit `opts.tile_quality` was requested — the file is already where it
+/// needs to be — and rejected with an error when a quality *was* requested,
+/// since honoring it would mean re-encoding the input onto itself mid-read.
+/// A different-file jpg input with an explicit quality is now re-encoded via
+/// vips rather than byte-copied, so the requested quality is actually
+/// honored (previously it was silently ignored for jpg input).
+///
+/// Validation order: the pure, I/O-free option checks (file-stem safety, and
+/// `tile_quality`+[`TileFormat::Png`] rejection) run first, then the `vips`
+/// binary's presence is checked, and only then is `outdir` created — so a
+/// call rejected on bad input or options leaves no trace on disk.
+///
+/// A `vips dzsave` that fails partway through can leave a partial
+/// `<stem>_files/` tile tree (and `<stem>.dzi`) behind in `outdir`; rerun
+/// after fixing the cause, or delete the directory first.
 pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<PublishReport> {
-    let vips_bin = vips_available().ok_or_else(|| {
-        Error::format(
-            outdir,
-            "vips binary not found on PATH; install libvips-tools \
-             (e.g. `sudo apt install libvips-tools`)",
-        )
-    })?;
-
-    std::fs::create_dir_all(outdir).map_err(|e| Error::io(outdir, e))?;
-
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -165,6 +195,23 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
              embedded in the viewer page; rename the file first",
         ));
     }
+
+    if opts.tile_quality.is_some() && opts.tile_format == TileFormat::Png {
+        return Err(Error::format(
+            outdir,
+            "--tile-quality does not apply to PNG tiles",
+        ));
+    }
+
+    let vips_bin = vips_available().ok_or_else(|| {
+        Error::format(
+            outdir,
+            "vips binary not found on PATH; install libvips-tools \
+             (e.g. `sudo apt install libvips-tools`)",
+        )
+    })?;
+
+    std::fs::create_dir_all(outdir).map_err(|e| Error::io(outdir, e))?;
 
     let in_ext = input
         .extension()
@@ -223,20 +270,31 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
         );
     }
 
-    if opts.tile_quality.is_some() && opts.tile_format == TileFormat::Png {
-        return Err(Error::format(
-            outdir,
-            "--tile-quality does not apply to PNG tiles",
-        ));
-    }
-
     let wcs_found = wcs.is_some();
 
     let tile_source = match mode_used {
         PublishMode::Single => {
             let dest = outdir.join(format!("{stem}.jpg"));
             if in_ext == "jpg" || in_ext == "jpeg" {
-                std::fs::copy(input, &dest).map_err(|e| Error::io(&dest, e))?;
+                match (same_file(input, &dest)?, opts.tile_quality) {
+                    (true, None) => {
+                        // Already in place; nothing to copy.
+                    }
+                    (true, Some(_)) => {
+                        return Err(Error::format(
+                            input,
+                            "refusing to re-encode the input onto itself; publish \
+                             to a different directory or drop --tile-quality",
+                        ));
+                    }
+                    (false, Some(quality)) => {
+                        let dest_spec = format!("{}[Q={quality}]", dest.display());
+                        crate::vips::vips_copy(&vips_bin, input, &dest_spec, &dest)?;
+                    }
+                    (false, None) => {
+                        std::fs::copy(input, &dest).map_err(|e| Error::io(&dest, e))?;
+                    }
+                }
             } else {
                 let quality = opts.tile_quality.unwrap_or(90);
                 let dest_spec = format!("{}[Q={quality}]", dest.display());
@@ -472,19 +530,90 @@ mod tests {
     }
 
     #[test]
-    fn rejects_png_tile_quality() {
-        let dir = tmpdir("reject");
+    fn jpg_input_already_in_outdir_is_not_destroyed() {
+        let Some(vips) = crate::vips::vips_available() else {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        };
+        let dir = tmpdir("selfcopy");
+        let v = dir.join("s.v");
+        crate::vips::run_vips(
+            &vips,
+            &[
+                "black".as_ref(),
+                v.as_os_str(),
+                "40".as_ref(),
+                "30".as_ref(),
+            ],
+            &v,
+        )
+        .unwrap();
+        let input = dir.join("photo.jpg");
+        crate::vips::vips_copy(&vips, &v, &input.display().to_string(), &input).unwrap();
+        let original = std::fs::read(&input).unwrap();
+        assert!(!original.is_empty());
+
+        // Publish INTO the directory that already contains the input.
+        let report = publish(&input, &dir, &PublishOptions::default()).unwrap();
+        assert_eq!(report.mode_used, PublishMode::Single);
+        let after = std::fs::read(&input).unwrap();
+        assert_eq!(original, after, "input must not be truncated or altered");
+        assert!(dir.join("index.html").is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jpg_input_single_mode_honors_explicit_quality() {
+        let Some(vips) = crate::vips::vips_available() else {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        };
+        let dir = tmpdir("jpgq");
+        let v = dir.join("s.v");
+        crate::vips::run_vips(
+            &vips,
+            &[
+                "black".as_ref(),
+                v.as_os_str(),
+                "40".as_ref(),
+                "30".as_ref(),
+            ],
+            &v,
+        )
+        .unwrap();
+        let input = dir.join("photo.jpg");
+        crate::vips::vips_copy(&vips, &v, &input.display().to_string(), &input).unwrap();
+        let out = dir.join("site");
+        let opts = PublishOptions {
+            tile_quality: Some(50),
+            ..Default::default()
+        };
+        publish(&input, &out, &opts).unwrap();
+        let dst = std::fs::read(out.join("photo.jpg")).unwrap();
+        let src = std::fs::read(&input).unwrap();
+        assert_ne!(
+            src, dst,
+            "explicit quality re-encodes rather than byte-copying"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn png_quality_rejected_before_any_disk_writes() {
+        let dir = tmpdir("valorder");
         let input = dir.join("in.xisf");
         synth_xisf(&input, 8, 8, 1, false);
+        let out = dir.join("never-created");
         let opts = PublishOptions {
             mode: PublishMode::Dzi,
             tile_format: TileFormat::Png,
             tile_quality: Some(80),
             ..Default::default()
         };
+        assert!(publish(&input, &out, &opts).is_err());
         assert!(
-            publish(&input, &dir.join("s"), &opts).is_err(),
-            "quality+png rejected"
+            !out.exists(),
+            "outdir must not be created for pure-options errors"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

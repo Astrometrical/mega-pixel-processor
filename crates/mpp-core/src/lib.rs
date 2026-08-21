@@ -8,18 +8,18 @@
 //!
 //! - [`formats`] — image readers/writers: native XISF reading and
 //!   strip-streaming BigTIFF writing; vips-backed mainstream-format export
-//!   (PNG/JPEG/WebP/AVIF/JXL, via [`vips`]) is implemented today, and the
-//!   DZI pipeline arrives with the next plan.
+//!   (PNG/JPEG/WebP/AVIF/JXL, via [`vips`]) and DZI tile-pyramid export are
+//!   both implemented today.
 //! - [`wcs`] — astrometric solutions: the linear WCS model, extraction
 //!   from PixInsight XISF properties, and the canonical JSON sidecar.
 //! - [`convert`] — one-call conversion orchestration used by the CLI.
 //! - [`vips`] — discovery and spawning of the official `vips` binary
-//!   (mainstream-format conversion and, later, DZI export).
+//!   (mainstream-format conversion and DZI `dzsave` export).
 //! - [`viewer`] — emission of the static, self-hostable Astrometrical
 //!   viewer page.
 //! - [`publish`] — one-call publish orchestration: routes any supported
-//!   input to a DZI tile pyramid (or, in a later phase, a single full-res
-//!   image) plus the branded viewer page and WCS sidecar.
+//!   input to a DZI tile pyramid or a single full-resolution image, plus
+//!   the branded viewer page and WCS sidecar.
 
 #![warn(missing_docs)]
 
