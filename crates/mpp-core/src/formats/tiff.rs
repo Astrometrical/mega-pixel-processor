@@ -26,6 +26,8 @@ pub enum BitDepth {
     F32,
     /// 16-bit unsigned samples; input clamped to [0, 1] and scaled.
     U16,
+    /// 8-bit unsigned samples; input clamped to [0, 1] and scaled.
+    U8,
 }
 
 /// Options for [`write_bigtiff`].
@@ -38,6 +40,11 @@ pub struct TiffWriteOptions {
 /// Convert a unit-range f32 sample to u16 (clamped, rounded).
 fn to_u16(v: f32) -> u16 {
     (v.clamp(0.0, 1.0) * 65535.0).round() as u16
+}
+
+/// Convert a unit-range f32 sample to u8 (clamped, rounded).
+fn to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// Write `img` to `path` as an uncompressed BigTIFF, streaming strip by
@@ -103,6 +110,8 @@ fn write_bigtiff_with_target(
             (3, BitDepth::F32) => stream!(colortype::RGB32Float, f32, |v: f32| v),
             (1, BitDepth::U16) => stream!(colortype::Gray16, u16, to_u16),
             (3, BitDepth::U16) => stream!(colortype::RGB16, u16, to_u16),
+            (1, BitDepth::U8) => stream!(colortype::Gray8, u8, to_u8),
+            (3, BitDepth::U8) => stream!(colortype::RGB8, u8, to_u8),
             (c, _) => {
                 return Err(Error::format(
                     path,
@@ -238,6 +247,51 @@ mod tests {
         let img = XisfImage::open(&src).unwrap();
         let out = dir.join("out.tif");
         assert!(write_bigtiff(&img, &out, &TiffWriteOptions::default()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn u8_output_scales_unit_range() {
+        let dir = tmpdir("u8");
+        let src = dir.join("in.xisf");
+        synth_xisf(&src, 4, 4, 1, false);
+        let img = XisfImage::open(&src).unwrap();
+        let out = dir.join("out.tif");
+        let opts = TiffWriteOptions {
+            bit_depth: BitDepth::U8,
+        };
+        write_bigtiff(&img, &out, &opts).unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        match dec.read_image().unwrap() {
+            DecodingResult::U8(data) => {
+                assert_eq!(data[0], 0);
+                // sample 8 = 8/16 = 0.5 -> round(0.5 * 255) = 128.
+                assert_eq!(data[8], 128);
+                // sample 15 = 15/16 -> round(239.06) = 239.
+                assert_eq!(data[15], 239);
+            }
+            other => panic!("expected U8 samples, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn u8_rgb_writes() {
+        let dir = tmpdir("u8rgb");
+        let src = dir.join("in.xisf");
+        synth_xisf(&src, 2, 2, 3, false);
+        let img = XisfImage::open(&src).unwrap();
+        let out = dir.join("out.tif");
+        let opts = TiffWriteOptions {
+            bit_depth: BitDepth::U8,
+        };
+        write_bigtiff(&img, &out, &opts).unwrap();
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        match dec.read_image().unwrap() {
+            DecodingResult::U8(data) => assert_eq!(data.len(), 12),
+            other => panic!("expected U8 samples, got {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
