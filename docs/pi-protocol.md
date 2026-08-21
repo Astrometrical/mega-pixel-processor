@@ -373,12 +373,10 @@ If the worker's stdin reaches EOF before a `Finish` frame has been
 received, that means the host is gone (crashed, or closed the pipe without
 finishing the handshake). The worker treats this identically to `Cancel`'s
 cleanup path — staging file and partial output deleted — then exits
-nonzero. (There is no frame to send in this case, since the pipe the
-worker would send it on is the *other* direction — worker stdout — which
-may still be open; the worker still writes `Error { message: "..." }` to
-its stdout on a best-effort basis before exiting, for a host that is
-reading stdout from a *different* process/log even though its own stdin
-write end is gone.)
+nonzero. **No frame is written** in this case: unlike `Cancel`, there is no
+host left to read one, so the worker skips straight to cleanup and exit. A
+host-side process supervisor detects this run's failure via the worker's
+nonzero exit code alone, not via any terminal frame.
 
 ### 7.6 Post-terminal-frame discipline
 
