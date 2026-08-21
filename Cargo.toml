@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mpp-core", "crates/mpp"]
+members = ["crates/mpp-core", "crates/mpp", "crates/mpp-ipc"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/Astrometrical/mega-pixel-processor"
 
 [workspace.dependencies]
 mpp-core = { path = "crates/mpp-core" }
+mpp-ipc = { path = "crates/mpp-ipc" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -22,6 +23,16 @@ quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiff = "0.11"
+nix = { version = "0.29", features = ["mman", "fs"] }
+libc = "0.2"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # Required: CreateFileMappingW's signature references SECURITY_ATTRIBUTES
+    # (Win32_Security); without it shm compilation fails (E0432). Provenance:
+    # verified empirically in MMM (mmm-core/Cargo.toml comment).
+    "Win32_Security",
+    "Win32_System_Memory",
+] }
 
 # Pixel transforms are hot-path; always optimize dependencies even in dev builds
 [profile.dev.package."*"]

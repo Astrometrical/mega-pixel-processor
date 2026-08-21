@@ -1,0 +1,23 @@
+[package]
+name = "mpp-ipc"
+description = "Mega Pixel Processor host/worker IPC — shared-memory pixel transport and wire protocol for the PixInsight module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[features]
+testkit = []
