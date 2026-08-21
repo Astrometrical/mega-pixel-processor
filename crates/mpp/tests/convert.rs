@@ -58,6 +58,39 @@ fn convert_produces_bigtiff() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+fn vips_on_path() -> bool {
+    std::process::Command::new("vips")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn convert_produces_png_via_vips() {
+    if !vips_on_path() {
+        eprintln!("skipping: vips binary not found on PATH");
+        return;
+    }
+    let dir = tmpdir("png");
+    let input = dir.join("in.xisf");
+    synth_xisf(&input, 8, 8);
+    let output = dir.join("out.png");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_mpp"))
+        .args(["convert"])
+        .arg(&input)
+        .arg(&output)
+        .args(["--bit-depth", "u8"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let head = std::fs::read(&output).unwrap();
+    assert_eq!(&head[0..4], &[0x89, b'P', b'N', b'G']);
+    assert_eq!(head[24], 8, "u8 override -> 8-bit PNG");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn convert_missing_input_fails_with_message() {
     let dir = tmpdir("missing");
