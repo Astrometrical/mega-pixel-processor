@@ -146,6 +146,16 @@ class WriteSession {
  private:
   // ---- band accounting ----
   void WaitForFreeSlot();
+  // Validates a worker-supplied BandAck slot id (`slot < cfg_.slots` AND
+  // `slot_busy_[slot]` -- i.e. currently owned by a Band we sent and have
+  // not already freed) before trusting it: an out-of-range id would index
+  // outside the shm mapping on the next PushBand's memcpy, and an in-range
+  // but not-busy id (stale/duplicate ack) would let a slot be reused while
+  // a Band we already sent for it may still be in flight. Throws
+  // `HostError` naming the offending slot and kills+reaps the worker
+  // (`KillAndReapBestEffort`, not a blocking wait -- a worker that just
+  // sent a bogus ack cannot be trusted to exit on its own) on either
+  // violation; only marks the slot free on success.
   void FreeSlot(uint32_t slot);
 
   // ---- frame IO ----
@@ -157,7 +167,14 @@ class WriteSession {
 
   // ---- process lifecycle ----
   int ReapBlocking();               ///< Blocking wait for the child to exit; idempotent.
-  void KillAndReapBestEffort() noexcept;  ///< Used by the destructor and construction failures.
+  // Kills the child (does not wait for a voluntary exit) then reaps it;
+  // idempotent. Used by the destructor, construction failures, and any
+  // point where the worker has just been caught violating the protocol
+  // (e.g. a bogus BandAck slot id -- see FreeSlot) and so cannot be trusted
+  // to exit on its own the way a legitimate Done/Error terminal frame
+  // promises (docs/pi-protocol.md §4) -- ReapBlocking's plain wait would be
+  // unbounded in that case.
+  void KillAndReapBestEffort() noexcept;
 
   WriteSessionConfig cfg_;
   uint64_t slot_bytes_ = 0;
@@ -171,6 +188,15 @@ class WriteSession {
   bool finished_ = false;  ///< True once Finish/Cancel/a fault reached a terminal state.
 
   std::deque<uint32_t> free_slots_;
+  // Busy-set: slot_busy_[i] is true iff slot i was handed out in a Band
+  // frame we sent and has not yet been freed by a validated BandAck. Every
+  // worker-supplied BandAck slot id is checked against this (range AND
+  // membership) before it is trusted to free a slot or index the shm
+  // mapping -- ported from MergeMosaic's mmm_host.cpp Host::run
+  // ("Host memory safety first" guard on BandRequest/OutputBand slot ids,
+  // mmm_host.cpp:534-563), which this file's first pass omitted. See
+  // FreeSlot's doc comment.
+  std::vector<bool> slot_busy_;
   uint32_t outstanding_ = 0;  ///< Bands sent, not yet acked.
 };
 

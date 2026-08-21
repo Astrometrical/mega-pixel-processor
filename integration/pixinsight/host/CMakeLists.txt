@@ -90,3 +90,21 @@ add_test(NAME test_version_mismatch COMMAND test_version_mismatch)
 add_executable(test_worker_missing test/test_worker_missing.cpp)
 target_link_libraries(test_worker_missing PRIVATE mpp_host)
 add_test(NAME test_worker_missing COMMAND test_worker_missing)
+
+# Task 3 fix (code-review finding): FreeSlot's busy-set guard against a
+# bogus/out-of-range worker-supplied BandAck slot id. fake_worker_bogus_ack
+# is a test-only fixture (never the production worker) that speaks just
+# enough of the protocol to ack a bogus slot and then refuses to exit on
+# its own -- see its header comment. Its path is passed to test_bogus_ack
+# as a compile definition (via the $<TARGET_FILE:...> generator expression,
+# which resolves to the actual built binary path/extension per platform)
+# rather than an environment variable, since -- unlike the real worker --
+# this fixture is always built alongside the test that needs it.
+add_executable(fake_worker_bogus_ack test/fake_worker_bogus_ack.cpp)
+target_link_libraries(fake_worker_bogus_ack PRIVATE mpp_host)
+
+add_executable(test_bogus_ack test/test_bogus_ack.cpp)
+target_link_libraries(test_bogus_ack PRIVATE mpp_host)
+target_compile_definitions(test_bogus_ack PRIVATE
+  FAKE_WORKER_BOGUS_ACK_PATH="$<TARGET_FILE:fake_worker_bogus_ack>")
+add_test(NAME test_bogus_ack COMMAND test_bogus_ack)

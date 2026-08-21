@@ -74,6 +74,7 @@ WriteSession::WriteSession(const WriteSessionConfig& cfg)
   for (uint32_t i = 0; i < cfg_.slots; ++i) {
     free_slots_.push_back(i);
   }
+  slot_busy_.assign(cfg_.slots, false);
 
   // Spawn the worker. `in_pipe_`/`out_pipe_` were default-constructed as
   // real OS pipes by the time this body runs (declaration order after
@@ -146,6 +147,7 @@ void WriteSession::PushBand(uint32_t channel, uint64_t start_row, uint32_t rows,
   WaitForFreeSlot();
   uint32_t slot = free_slots_.front();
   free_slots_.pop_front();
+  slot_busy_[slot] = true;
 
   const size_t byte_len = static_cast<size_t>(rows) * cfg_.width * sizeof(float);
   std::memcpy(shm_.base() + static_cast<uint64_t>(slot) * slot_bytes_, samples, byte_len);
@@ -275,6 +277,29 @@ void WriteSession::WaitForFreeSlot() {
 }
 
 void WriteSession::FreeSlot(uint32_t slot) {
+  // Host memory safety first (ported from MergeMosaic's mmm_host.cpp
+  // Host::run, the "Host memory safety first" guard on BandRequest/
+  // OutputBand slot ids -- mmm_host.cpp:534-563; that guard's spirit was
+  // not carried over on this file's first pass, a code-review finding this
+  // fixes): `slot` is worker-supplied and about to gate the NEXT
+  // PushBand's memcpy destination. An out-of-range id would write outside
+  // the shm mapping; an in-range id that is not currently busy (never
+  // handed out, or already freed by an earlier ack) would let a slot be
+  // reused while a Band we already sent for it may still be logically in
+  // flight. Neither is a value this function may act on unchecked -- both
+  // are worker protocol violations, so this kills (not just waits for) the
+  // worker: a worker that just sent a bogus ack cannot be trusted to exit
+  // on its own the way a legitimate terminal frame promises.
+  if (slot >= cfg_.slots || !slot_busy_[slot]) {
+    const bool out_of_range = slot >= cfg_.slots;
+    finished_ = true;
+    KillAndReapBestEffort();
+    throw HostError("worker sent BandAck for slot " + std::to_string(slot) + ", which is " +
+                     (out_of_range
+                          ? "out of range (slots=" + std::to_string(cfg_.slots) + ")"
+                          : "not currently busy (stale or duplicate ack)"));
+  }
+  slot_busy_[slot] = false;
   free_slots_.push_back(slot);
   if (outstanding_ > 0) {
     --outstanding_;
