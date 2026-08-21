@@ -7,3 +7,5 @@
 //! here and the C++ mirror must both match it exactly.
 
 #![warn(missing_docs)]
+
+pub mod shm;
