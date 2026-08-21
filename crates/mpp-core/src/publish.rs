@@ -155,6 +155,7 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
             img.advise_sequential();
             let wcs = crate::wcs::from_xisf_properties(&img.header().properties);
             let tmp = unique_temp(outdir, &stem, "tif");
+            let guard = TempFileGuard(tmp.clone());
             write_bigtiff(
                 &img,
                 &tmp,
@@ -162,21 +163,16 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
                     bit_depth: BitDepth::U8,
                 },
             )?;
-            (
-                tmp.clone(),
-                img.width(),
-                img.height(),
-                wcs,
-                Some(TempFileGuard(tmp)),
-            )
+            (tmp, img.width(), img.height(), wcs, Some(guard))
         } else {
             let fmt = vipsheader_field(input, "format")?;
             let (src, guard) = match fmt.as_str() {
                 "uchar" => (input.to_path_buf(), None),
                 "ushort" => {
                     let tmp = unique_temp(outdir, &stem, "v");
+                    let guard = TempFileGuard(tmp.clone());
                     vips_msb(&vips_bin, input, &tmp)?;
-                    (tmp.clone(), Some(TempFileGuard(tmp)))
+                    (tmp, Some(guard))
                 }
                 other => {
                     return Err(Error::format(
