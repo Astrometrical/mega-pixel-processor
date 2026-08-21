@@ -13,9 +13,12 @@ types live in:
 - `crates/mpp-ipc/src/shm.rs` — shared-memory slot layout (Task 2).
 - `crates/mpp-ipc/src/link.rs` — the worker-side state machine (`HostLink`)
   that this document describes from the host's point of view (Task 4).
-- `crates/mpp-ipc/src/testhost.rs` — `run_host`, a reference implementation
-  of the host side (test-only, feature `testkit`, but protocol-faithful — a
-  useful cross-check while implementing the C++ host) (Task 6).
+- `crates/mpp-ipc/src/testhost.rs` — `run_write_session` and its variants
+  (`run_write_session_shuffled`, `run_cancel_after_first_band`,
+  `run_write_session_incomplete`, `run_oversize_band_session`), a reference
+  implementation of the host side (test-only, feature `testkit`, but
+  protocol-faithful — a useful cross-check while implementing the C++ host)
+  (Task 6).
 
 This protocol is a direct descendant of `mmm-ipc`'s own wire protocol
 (`~/dev/MergeMosaic/integration/pixinsight/PROTOCOL.md`) — same frame
@@ -199,18 +202,58 @@ Example:
   "channels": 3,
   "bit_depth": "f32",
   "shm_name": "/mpp-ipc-3f2a91",
-  "slot_bytes": 4915200,
+  "slot_bytes": 19200000,
   "slots": 4
 }
 ```
 
 (`slot_bytes` above is sized for a 400-row band of a 12000-px-wide image:
-`400 * 12000 * 4 = 19_200_000`... in practice the host picks a band height
+`400 * 12000 * 4 = 19_200_000` — in practice the host picks a band height
 that fits its own memory budget and computes `slot_bytes` from it — the
 value here is illustrative, not a fixed formula the worker enforces beyond
 the `>=` bound in §6.)
 
+**Integer width.** Every numeric field above (`width`, `height`, `channels`,
+`slot_bytes` as `u64`; `protocol_version`, `slots` as `u32`) is transmitted
+as a full-width JSON integer, not a string. A C++ host must decode these
+into a 64-bit (or 32-bit, matching field width) integer type directly —
+never round-trip a `u64` field through `double`/`float` on the way in or
+out, since JSON numbers wider than 2^53 silently lose precision through an
+IEEE-754 double and this protocol's `u64` fields (`width`, `height`,
+`slot_bytes`) are exactly the ones a large mosaic can push past that bound.
+
+**`output_path` encoding.** `output_path` is a JSON string and therefore
+UTF-8 on the wire, regardless of platform. On Windows the worker converts
+this UTF-8 path to UTF-16 before calling into the filesystem APIs; a path
+that is not representable in UTF-8 (or not round-trippable to a valid
+UTF-16 Windows path) is not supported by this protocol version — the host
+is responsible for only ever sending a path the worker can encode.
+
 ## 6. Shared memory: layout and ownership
+
+**`shm_name` grammar.** The name the host chooses and sends as
+`InitMessage.shm_name` must match this exact grammar, enforced by the
+implementation on **every** platform (not just where it is load-bearing):
+starts with a single `/`, contains no other `/`, and is at most 31
+characters total including the leading `/` — the portable limit is macOS's
+`PSHMNAMLEN` (`shm_open`/`shm_unlink` fail there with a bare `EINVAL`
+beyond it), but the worker rejects a name violating this grammar on every
+platform so a name that happens to work on Linux/Windows doesn't silently
+break the first time it runs on macOS. On Windows, neither side transmits
+or expects a Windows object name on the wire: both the host and the worker
+independently normalize the POSIX-style `/name` from `Init` to
+`Local\name` (encoded UTF-16) before calling into the Win32 named-mapping
+APIs. Concretely, this means:
+
+- The host must always put the POSIX-style form (`/name`) in `Init.shm_name`
+  — on every platform, including Windows — and let each side's own
+  normalization step produce the platform-appropriate object name.
+- Passing an already-Windows-normalized name (e.g. `Local\name`, or
+  `/Local\name`) is a bug: the worker's normalizer strips at most one
+  leading `/` and prepends `Local\` unconditionally, so a pre-normalized
+  input becomes a double-prefixed name (`Local\Local\name`) that the host's
+  own differently-prefixed mapping never matches, and `ShmSegment::open`
+  fails.
 
 **Ownership.** The shm segment is created, sized, and unlinked by the
 **host only**. The worker never creates, resizes, or unlinks it — it only
@@ -348,7 +391,9 @@ host                                          worker
  |------------- Finish (tag 130) ------------> |
  |                                             |-- checks every (channel, row) is covered
  |                                             |-- streams staging planes through the encoder
- |                                             |   (may emit Progress (tag 2) frames while doing so)
+ |                                             |   (as of this version, no further Progress is
+ |                                             |    emitted during encoding itself — the last
+ |                                             |    Progress a host sees is from band streaming)
  |<-------------- Done (tag 3) -----------------|
  |                                             |-- exits 0
 ```
@@ -361,11 +406,37 @@ a partially-covered image.
 
 ### 7.4 Cancel
 
-The host may send `Cancel` (tag 131) at any point after `Init`. The worker
-responds with best-effort cleanup — deleting its staging file and any
-partial output file already written — then sends `Error { message:
-"cancelled" }` and exits nonzero. A host should treat that specific
-message as an intentional stop, not a crash.
+`Cancel` (tag 131) is only guaranteed to be observed if the host sends it
+**before** it sends `Finish`. In that window, the worker responds with
+best-effort cleanup — deleting its staging file and any partial output
+file already written — then sends `Error { message: "cancelled" }` and
+exits nonzero. A host should treat that specific message as an intentional
+stop, not a crash.
+
+**After `Finish`, `Cancel` has no effect and must not be relied on.** Once
+the worker reads a `Finish` frame it stops reading stdin entirely — it
+breaks out of its `Band`/`Finish`/`Cancel` read loop and moves straight to
+encoding (§7.3) — so a `Cancel` written to stdin after `Finish` is never
+read by the worker; it sits unread in the pipe (or, if the worker has
+already exited, is simply discarded) while the run proceeds to completion
+and `Done`. The run is considered **committed** as soon as `Finish` is
+sent: there is no cooperative abort path past that point.
+
+If a host genuinely needs to abort an in-progress encode after sending
+`Finish`, the only mechanism is killing the worker process outright. This
+is safe in the sense that matters for host-side bookkeeping — the worker's
+exit code is still the authoritative completion signal (§4), and a killed
+process's nonzero (or signal-terminated) exit status is unambiguous — but
+it bypasses the worker's own in-process cleanup: `Staging`'s cleanup runs
+via that type's `Drop` impl (or the explicit `cleanup()` path on the
+`Cancel`/host-gone arms), and neither runs if the process is killed rather
+than allowed to unwind. Concretely, a `kill()`-based abort after `Finish`
+can leave the staging scratch file behind on disk — it is named
+`<output-filename>.mpp-stage-<worker-pid>` and lives next to the output
+file (same directory as `output_path`). A host that kills a worker for
+this reason should, on a best-effort basis, delete any
+`<output-filename>.mpp-stage-*` file it finds next to the output path
+afterward.
 
 ### 7.5 Host-gone (stdin EOF before Finish)
 
@@ -386,6 +457,52 @@ free to unlink the segment as soon as it observes either frame (or the
 worker's process exit, whichever it detects first) without any risk of a
 racing access from the worker side.
 
+### 7.7 Host receiving obligations
+
+A conforming host must handle the following implemented behaviors on the
+worker→host direction; a host that assumes otherwise (e.g. that `Progress`
+only ever appears in one specific spot, or that a zero-row `Band` is
+malformed) will misbehave against the real worker:
+
+- **`Progress` may arrive at any point before the terminal frame.** The
+  worker emits `Progress` during band streaming (§7.2, after a `BandAck`);
+  as of this protocol version it does not emit further `Progress` frames
+  during encoding itself (§7.3) — the last `Progress` a host sees is from
+  band streaming, and then `Done`/`Error` follows once encoding finishes.
+  A host's read loop must still tolerate an interleaved `Progress` frame
+  between any two frames it is otherwise waiting on (a `BandAck`, or the
+  final `Done`/`Error`) rather than treating an unexpected `Progress` as a
+  protocol violation at a specific point in the exchange — a future
+  protocol version may start emitting encode-time `Progress` without that
+  being a breaking wire-format change, precisely because hosts are already
+  required to tolerate it anywhere.
+- **`BandAck`s arrive in band-processing order.** The worker processes
+  `Band` frames strictly one at a time, synchronously, off a single read
+  loop — it acks band *N* before it reads band *N+1* — so the sequence of
+  `BandAck`s on stdout is always in the same order as the `Band` frames the
+  host sent on stdin. A host may rely on this to match acks to sends
+  positionally without needing to correlate on `slot` (though `slot` is
+  still the field that identifies which slot is free, per §4/§6).
+- **A `rows: 0` `Band` is accepted as a no-op.** A `Band` frame with
+  `rows: 0` passes slot-size validation trivially (`0 <= slot_bytes`),
+  contributes no coverage for its `(channel, start_row)`, and is still
+  acked normally with a `BandAck`. This is not a documented *host*
+  strategy to rely on for anything (a real band should always carry
+  `rows >= 1`), but a host that happens to construct one (e.g. from an
+  empty tile at a mosaic edge) will not get an `Error` for it.
+- **No fixed wall-clock timeout waiting for `Done`.** A host must not
+  impose a fixed timeout on the interval between sending `Finish` and
+  receiving `Done` — encoding a large image (streaming the staged planes
+  through the BigTIFF encoder) can legitimately take far longer than any
+  single band-transfer step, and that duration scales with image size in a
+  way no fixed constant can safely bound. Since (as just noted) this
+  version sends no `Progress` during that specific interval, the health
+  signal available to a host here is the worker process's own liveness
+  (still running, not defunct/zombie) rather than any frame; a host should
+  treat the encode phase as healthy for as long as the process is alive
+  and reserve any hang detection for process-level signals, not elapsed
+  time since `Finish`.
+
 ## 8. Versioning
 
 - **`IPC_PROTOCOL_VERSION`** (currently `1`) bumps on **any** wire-format
@@ -404,6 +521,20 @@ racing access from the worker side.
   binary left behind by a partial install). An exact-string mismatch is
   refused the same way a protocol-version mismatch is — `Error` + nonzero
   exit — even though the wire format itself would have worked.
+- **Keeping the C++ host's expected `worker_version` in sync.** The Plan-B
+  C++ host stamps its own compiled-in expectation of `worker_version` into
+  every `Init` it sends (previous bullet). The intent is that this
+  expected-version constant is **generated from the workspace version at
+  build time**, not hand-maintained as a separately-edited literal in the
+  C++ source: the single source of truth is the Cargo workspace version
+  (`version.workspace = true`, shared by every crate including
+  `mpp-ipc-worker`, whose `WORKER_VERSION` is `env!("CARGO_PKG_VERSION")`
+  of that same value), and the C++ build should read/derive its constant
+  from there rather than a human copying the version string into two
+  places by hand and letting them drift. This generation step is not yet
+  implemented (there is no C++ host yet) — this paragraph records the
+  intent for whoever wires up the Plan-B build so the mechanism is chosen
+  before hand-maintained drift becomes the default.
 
 ### Version history
 
