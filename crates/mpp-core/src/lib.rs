@@ -12,6 +12,8 @@
 //! - [`wcs`] — astrometric solutions: the linear WCS model, extraction
 //!   from PixInsight XISF properties, and the canonical JSON sidecar.
 //! - [`convert`] — one-call conversion orchestration used by the CLI.
+//! - [`vips`] — discovery and spawning of the official `vips` binary
+//!   (mainstream-format conversion and, later, DZI export).
 
 #![warn(missing_docs)]
 
@@ -23,6 +25,8 @@ pub mod formats;
 pub mod wcs;
 
 pub mod convert;
+
+pub mod vips;
 
 #[cfg(test)]
 mod testsupport;
