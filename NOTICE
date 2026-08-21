@@ -6,3 +6,10 @@ This product includes software developed by Astrometrical
 
 Licensed under the Apache License, Version 2.0. See the LICENSE file for the
 full license text.
+
+This product bundles OpenSeadragon (https://openseadragon.github.io/),
+version 6.1.0, licensed under the BSD 3-Clause License (New BSD).
+Copyright (c) CodePlex Foundation and OpenSeadragon contributors.
+The full license text is preserved in
+crates/mpp-core/assets/OPENSEADRAGON-LICENSE.txt and is emitted verbatim
+into every published output directory.
