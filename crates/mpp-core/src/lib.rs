@@ -7,8 +7,9 @@
 //! Public API surface:
 //!
 //! - [`formats`] — image readers/writers: native XISF reading and
-//!   strip-streaming BigTIFF writing today; libvips-backed formats and the
-//!   DZI pipeline arrive with later phase-1 plans.
+//!   strip-streaming BigTIFF writing; vips-backed mainstream-format export
+//!   (PNG/JPEG/WebP/AVIF/JXL, via [`vips`]) is implemented today, and the
+//!   DZI pipeline arrives with the next plan.
 //! - [`wcs`] — astrometric solutions: the linear WCS model, extraction
 //!   from PixInsight XISF properties, and the canonical JSON sidecar.
 //! - [`convert`] — one-call conversion orchestration used by the CLI.

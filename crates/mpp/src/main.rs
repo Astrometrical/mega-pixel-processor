@@ -22,7 +22,7 @@ enum Command {
     Convert {
         /// Input image (.xisf).
         input: PathBuf,
-        /// Output image (.tif/.tiff, written as BigTIFF).
+        /// Output image (.tif/.tiff/.png/.jpg/.webp/.avif/.jxl; extension selects the format).
         output: PathBuf,
         /// Output sample format; defaults to the output format's default.
         #[arg(long, value_enum)]

@@ -20,7 +20,7 @@ Part of the Astrometrical "Mega" tool family, alongside
 
 ## Status
 
-First phase-1 slice implemented: XISF → BigTIFF plus PNG/JPEG/WebP/AVIF/JXL via the vips CLI (`libvips-tools` required for the non-TIFF formats), each with the WCS JSON
+First two phase-1 slices implemented: XISF → BigTIFF plus PNG/JPEG/WebP/AVIF/JXL via the vips CLI (`libvips-tools` required for the non-TIFF formats), each with the WCS JSON
 sidecar. DZI/HTML export is upcoming phase-1 work; see the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Smoke tests
@@ -35,8 +35,11 @@ Photoshop (PS ≥ 26.2 also saves BigTIFF; opening support is older).
   open the result in Photoshop. A solved input also writes
   `<big>.wcs.json` next to the output.
 - Mainstream formats (requires libvips-tools): `target/release/mpp convert
-  <big>.xisf <big>.png` — PNG defaults to 16-bit; JPEG/WebP/AVIF take
-  `--quality`.
+  <big>.xisf <big>.png` — PNG defaults to 16-bit; JPEG/WebP/AVIF/JXL take
+  `--quality` (JXL is lossless by default when `--quality` is omitted).
+  Format dimension ceilings are preflighted before conversion: WebP tops
+  out at 16383 px per side, JPEG at 65500; AVIF's limit is
+  encoder-dependent.
 
 ## License
 

@@ -1,6 +1,7 @@
 //! One-call conversion: open input, write output, emit the WCS sidecar.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::formats::tiff::{BitDepth, TiffWriteOptions, write_bigtiff};
 use crate::formats::xisf::XisfImage;
@@ -62,20 +63,38 @@ impl OutputFormat {
     }
 
     /// Bracketed vips saver options for this format/depth/quality, or "".
+    ///
+    /// JXL is the one format whose vips saver (`jxlsave`) defaults to lossy
+    /// (distance 1.0) with no quality given, so when `quality` is `None` we
+    /// pass `lossless=true` explicitly — an explicit `--quality` is treated
+    /// as a deliberate choice to go lossy instead.
     pub fn saver_options(self, depth: BitDepth, quality: Option<u8>) -> String {
         let mut opts: Vec<String> = Vec::new();
         if self == Self::Png && depth == BitDepth::U16 {
             opts.push("bitdepth=16".to_string());
         }
-        if self.lossy_quality()
-            && let Some(q) = quality
-        {
-            opts.push(format!("Q={q}"));
+        if self.lossy_quality() {
+            match quality {
+                Some(q) => opts.push(format!("Q={q}")),
+                None if self == Self::Jxl => opts.push("lossless=true".to_string()),
+                None => {}
+            }
         }
         if opts.is_empty() {
             String::new()
         } else {
             format!("[{}]", opts.join(","))
+        }
+    }
+
+    /// Hard per-side pixel limit of the format's encoder, where one is
+    /// known (verified on vips 8.15.1): WebP 16383, JPEG 65500. `None`
+    /// means no known hard limit (AVIF's is encoder-dependent).
+    pub fn max_dimension(self) -> Option<u64> {
+        match self {
+            Self::Webp => Some(16_383),
+            Self::Jpeg => Some(65_500),
+            _ => None,
         }
     }
 }
@@ -134,13 +153,21 @@ impl Drop for TempFileGuard {
     }
 }
 
+/// Process-wide counter distinguishing concurrent interchange files within
+/// a single process (see [`interchange_path`]).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// The interchange path for a vips-backed output: same directory (same
 /// filesystem — multi-GB temp data must not land in a small /tmp), named
-/// after the output plus a pid suffix so concurrent runs cannot collide.
+/// after the output's full file name plus a pid suffix (separates
+/// concurrent processes) and a process-wide counter (separates multiple
+/// conversions within one process, e.g. `out.png` and `out.jpg` sharing a
+/// stem, from colliding).
 fn interchange_path(output: &Path) -> PathBuf {
-    let stem = output.file_stem().unwrap_or_default().to_string_lossy();
-    let name = format!("{stem}.mpp-tmp-{}.tif", std::process::id());
-    output.with_file_name(name)
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = format!("{name}.mpp-tmp-{}-{seq}.tif", std::process::id());
+    output.with_file_name(tmp)
 }
 
 /// Convert `input` (XISF) to `output`, whose extension selects the
@@ -183,6 +210,18 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
     }
 
     let img = XisfImage::open(input)?;
+    if let Some(limit) = format.max_dimension()
+        && (img.width() > limit || img.height() > limit)
+    {
+        return Err(Error::format(
+            output,
+            format!(
+                "{format:?} output supports at most {limit} px per side (image is {}x{})",
+                img.width(),
+                img.height()
+            ),
+        ));
+    }
     img.advise_sequential();
     let tiff_opts = TiffWriteOptions { bit_depth: depth };
     match format {
@@ -344,6 +383,42 @@ mod tests {
             OutputFormat::Avif.saver_options(BitDepth::U8, Some(50)),
             "[Q=50]"
         );
+        assert_eq!(
+            OutputFormat::Jxl.saver_options(BitDepth::U16, None),
+            "[lossless=true]"
+        );
+        assert_eq!(
+            OutputFormat::Jxl.saver_options(BitDepth::U16, Some(90)),
+            "[Q=90]"
+        );
+    }
+
+    #[test]
+    fn max_dimension_known_ceilings() {
+        assert_eq!(OutputFormat::Webp.max_dimension(), Some(16_383));
+        assert_eq!(OutputFormat::Jpeg.max_dimension(), Some(65_500));
+        assert_eq!(OutputFormat::Png.max_dimension(), None);
+        assert_eq!(OutputFormat::BigTiff.max_dimension(), None);
+        assert_eq!(OutputFormat::Avif.max_dimension(), None);
+        assert_eq!(OutputFormat::Jxl.max_dimension(), None);
+    }
+
+    #[test]
+    fn dimension_ceilings_fail_before_writing() {
+        let dir = tmpdir("limits");
+        let input = dir.join("in.xisf");
+        synth_xisf(&input, 16_384, 1, 1, false); // 64 KiB of pixel data — cheap
+        let err = convert(&input, &dir.join("o.webp"), &ConvertOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("16383"), "{err}");
+        // No temp or output files were created.
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "in.xisf")
+            .collect();
+        assert!(files.is_empty(), "unexpected files: {files:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

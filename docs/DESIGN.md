@@ -62,7 +62,9 @@ being better, not on being the only place the files work.
   and `pngsave` needs an explicit `bitdepth=16`. Formats: png (u16/u8),
   jpg/webp/avif (u8, `Q=` quality), jxl (u16/u8). vips has no EXR saver,
   so EXR export is out; `fitssave` exists in the Ubuntu build (cfitsio) —
-  relevant to the FITS read/write evaluation still pending.
+  relevant to the FITS read/write evaluation still pending. JXL defaults
+  to lossless (`lossless=true`) unless `--quality` is given; WebP tops out
+  at 16383 px per side and JPEG at 65500 (preflighted before conversion).
 - **XISF is our code** — vips has no XISF.
   **Decided (2026-08-20):** the XISF reader and linear-WCS extraction are
   *ported* from `mmm-core` into `mpp-core` — `mpp-core` owns format code,
