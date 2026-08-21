@@ -4,22 +4,24 @@
 //! host doing it — implements every lifecycle arm of the wire protocol:
 //! successful writes (grayscale f32 and RGB u16, in-order and shuffled band
 //! delivery), incomplete-coverage rejection, version-mismatch rejection,
-//! cancellation cleanup, and oversize-band rejection.
+//! cancellation cleanup, oversize-band rejection, and host-gone cleanup.
 //!
 //! The reference host role (creating the shm segment, driving `Init` →
 //! `Band`… → `Finish`/`Cancel`, checking the child's exit code against its
 //! own terminal frame) is played by `mpp_ipc::testhost`, reached here via
 //! the `testkit` feature (see this crate's `Cargo.toml`). Test 5
-//! (`version_mismatch_errors`) drives the worker directly instead — no
-//! testhost helper is needed for a single malformed `Init`.
+//! (`version_mismatch_errors`) and test 8 (`host_gone_cleans_up`) drive the
+//! worker directly instead — no testhost helper covers a bare `Init`/a
+//! stdin drop without `Finish`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use mpp_ipc::protocol::{
-    ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, read_frame, tag, write_frame,
+    BandHeader, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, read_frame, tag, write_frame,
 };
+use mpp_ipc::shm::ShmSegment;
 use mpp_ipc::testhost::{
     TestHostConfig, run_cancel_after_first_band, run_oversize_band_session, run_write_session,
     run_write_session_incomplete, run_write_session_shuffled,
@@ -400,6 +402,138 @@ fn oversize_band_rejected() {
     assert!(
         !out.exists(),
         "output file must be absent after a rejected run"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 8. host_gone_cleans_up
+// ---------------------------------------------------------------------------
+
+/// Drives the worker directly (no `testhost` helper — this is exactly the
+/// "host disappears" case `run_write_session` can't express): a valid
+/// `Init` and one valid `Band` are sent and acked, then `stdin` is dropped
+/// (closing the pipe) *without* ever sending `Finish`.
+///
+/// `docs/pi-protocol.md` §7.5 says this is the "host-gone" path: the worker
+/// treats stdin EOF-before-`Finish` like `Cancel`'s cleanup (staging file
+/// and any partial output removed) but — unlike `Cancel` — sends **no**
+/// frame at all, since there is no host left to read one; the nonzero exit
+/// code alone is the signal. This test pins exactly that: the worker exits
+/// nonzero, stdout carries nothing beyond the `BandAck` (and any interleaved
+/// `Progress`) already read — no `Done`, no `Error` — and neither the
+/// output file nor a `.mpp-stage-*` staging file is left behind.
+#[test]
+fn host_gone_cleans_up() {
+    let dir = tmpdir("hostgone");
+    let out = dir.join("out.tif");
+    let (width, height, channels, band_rows, slots) = (8u64, 8u64, 1u64, 4u32, 1u32);
+    let slot_bytes = band_rows as u64 * width * 4;
+
+    let shm_name = format!("/mpp-e2e-hg-{}", std::process::id() % 100_000);
+    let mut shm = ShmSegment::create(&shm_name, slot_bytes as usize * slots as usize)
+        .expect("create shm segment");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mpp-ipc-worker"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn mpp-ipc-worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+
+    let init = InitMessage {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
+        output_path: out.to_string_lossy().into_owned(),
+        width,
+        height,
+        channels,
+        bit_depth: "f32".to_string(),
+        shm_name: shm_name.clone(),
+        slot_bytes,
+        slots,
+    };
+    let init_payload = serde_json::to_vec(&init).unwrap();
+    write_frame(&mut stdin, tag::INIT, &init_payload).expect("write Init frame");
+    stdin.flush().expect("flush Init frame");
+
+    // One valid, in-bounds band: rows=4 of channel 0 starting at row 0,
+    // filled with zeros — its contents don't matter, only that the worker
+    // accepts and acks it.
+    let rows = band_rows;
+    let samples = vec![0f32; rows as usize * width as usize];
+    shm.as_mut_slice()[0..samples.len() * 4].copy_from_slice(bytemuck::cast_slice(&samples));
+    let header = BandHeader {
+        channel: 0,
+        start_row: 0,
+        rows,
+        slot: 0,
+    };
+    write_frame(&mut stdin, tag::BAND, &header.to_bytes()).expect("write Band frame");
+    stdin.flush().expect("flush Band frame");
+
+    // Read frames until the BandAck arrives, tolerating an interleaved
+    // Progress (as `docs/pi-protocol.md` §7.2 allows) and failing loudly on
+    // anything else.
+    loop {
+        let (t, payload) = read_frame(&mut stdout).expect("read reply to Band");
+        match t {
+            tag::BAND_ACK => break,
+            tag::PROGRESS => continue,
+            tag::ERROR => {
+                let msg: ErrorMessage = serde_json::from_slice(&payload).unwrap();
+                panic!("worker rejected the valid Band with Error: {}", msg.message);
+            }
+            other => panic!("unexpected tag {other} while waiting for BandAck"),
+        }
+    }
+
+    // The host disappears: close its end of stdin without ever sending
+    // Finish. No more input arrives on the worker's stdin from here on.
+    drop(stdin);
+
+    // Read every remaining frame to EOF. Per §7.5 there must be none beyond
+    // an optional trailing Progress — specifically no Done and no Error.
+    let mut saw_terminal_frame: Option<u8> = None;
+    while let Ok((t, payload)) = read_frame(&mut stdout) {
+        match t {
+            tag::PROGRESS => continue,
+            tag::DONE => panic!("worker sent Done after stdin closed without Finish"),
+            tag::ERROR => {
+                let msg: ErrorMessage = serde_json::from_slice(&payload).unwrap();
+                panic!(
+                    "worker sent Error after stdin closed without Finish (expected no frame \
+                     at all per §7.5): {}",
+                    msg.message
+                );
+            }
+            other => saw_terminal_frame = Some(other),
+        }
+    }
+    // loop exits on the clean EOF `read_frame` returns once the worker
+    // closes its stdout and exits.
+    assert!(
+        saw_terminal_frame.is_none(),
+        "unexpected frame tag {saw_terminal_frame:?} on stdout after stdin closed"
+    );
+
+    let status = child.wait().expect("wait on worker");
+    assert!(
+        !status.success(),
+        "worker must exit nonzero when the host disappears before Finish"
+    );
+
+    assert!(
+        !out.exists(),
+        "output file must be absent after a host-gone run"
+    );
+    let leftovers = staging_leftovers(&dir);
+    assert!(
+        leftovers.is_empty(),
+        "staging file(s) left behind after host-gone cleanup: {leftovers:?}"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
