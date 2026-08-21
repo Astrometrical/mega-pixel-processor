@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="Mega Pixel Processor (mpp)">
+<title>{{TITLE}} — Astrometrical</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23e8e4d8' d='M8 0l1.2 6.8L16 8l-6.8 1.2L8 16 6.8 9.2 0 8l6.8-1.2z'/%3E%3C/svg%3E">
+{{SIDECAR_LINK}}
+<style>
+  :root {
+    --ink: #e8e4d8;        /* warm starlight, not clinical white */
+    --ink-dim: #8a8678;
+    --line: rgba(232, 228, 216, 0.16);
+    --scrim: rgba(3, 4, 6, 0.55);
+    --serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+    --mono: ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
+    --sans: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #030406; overflow: hidden; }
+  #viewer { position: fixed; inset: 0; background: #030406; outline: none; }
+
+  /* Chrome fades away while you look at the sky. */
+  .chrome { transition: opacity 0.6s ease; }
+  body.idle .chrome { opacity: 0; }
+
+  header {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+    padding: 1.1rem 1.4rem 2.6rem;
+    background: linear-gradient(to bottom, var(--scrim), transparent);
+    pointer-events: none;
+  }
+  .wordmark {
+    font: 600 0.6rem/1 var(--sans);
+    letter-spacing: 0.42em; text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+  .wordmark b { color: var(--ink); font-weight: 600; }
+  h1 {
+    margin-top: 0.45rem;
+    font: italic 400 clamp(1.15rem, 2.6vw, 1.7rem)/1.2 var(--serif);
+    color: var(--ink); letter-spacing: 0.01em;
+  }
+
+  footer {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    display: flex; align-items: flex-end; justify-content: space-between;
+    padding: 2.4rem 1.4rem 1rem;
+    background: linear-gradient(to top, var(--scrim), transparent);
+    pointer-events: none;
+  }
+  .meta {
+    font: 400 0.68rem/1.6 var(--mono);
+    color: var(--ink-dim); letter-spacing: 0.04em;
+    white-space: pre-line;
+  }
+  .controls { display: flex; gap: 0.4rem; pointer-events: auto; }
+  .controls button {
+    width: 2.1rem; height: 2.1rem;
+    font: 400 1rem/1 var(--mono); color: var(--ink);
+    background: rgba(3, 4, 6, 0.5);
+    border: 1px solid var(--line); border-radius: 2px;
+    cursor: pointer; backdrop-filter: blur(6px);
+    transition: border-color 0.2s ease, color 0.2s ease;
+  }
+  .controls button:hover { border-color: var(--ink-dim); }
+  .controls button:active { color: #fff; }
+
+  /* OSD navigator: quiet frame, bottom-left above the scrim padding. */
+  .navigator { border: 1px solid var(--line) !important; }
+</style>
+</head>
+<body>
+<div id="viewer"></div>
+
+<header class="chrome">
+  <div class="wordmark"><b>Astrometrical</b>&ensp;·&ensp;Deep&nbsp;Zoom</div>
+  <h1>{{TITLE}}</h1>
+</header>
+
+<footer class="chrome">
+  <div class="meta">{{META_LINE}}</div>
+  <div class="controls" role="group" aria-label="Viewer controls">
+    <button id="zi" title="Zoom in" aria-label="Zoom in">+</button>
+    <button id="zo" title="Zoom out" aria-label="Zoom out">−</button>
+    <button id="home" title="Fit to screen" aria-label="Fit to screen">⌂</button>
+    <button id="fs" title="Fullscreen" aria-label="Fullscreen">⤢</button>
+  </div>
+</footer>
+
+<script src="openseadragon.min.js"></script>
+<script>
+  var viewer = OpenSeadragon({
+    id: 'viewer',
+    tileSources: {{TILE_SOURCE}},
+    showNavigationControl: false,
+    showNavigator: true,
+    navigatorPosition: 'BOTTOM_LEFT',
+    navigatorSizeRatio: 0.15,
+    minZoomImageRatio: 1,
+    maxZoomPixelRatio: 4,
+    visibilityRatio: 1,
+    constrainDuringPan: true
+  });
+  document.getElementById('zi').addEventListener('click', function () {
+    viewer.viewport.zoomBy(1.4); viewer.viewport.applyConstraints();
+  });
+  document.getElementById('zo').addEventListener('click', function () {
+    viewer.viewport.zoomBy(1 / 1.4); viewer.viewport.applyConstraints();
+  });
+  document.getElementById('home').addEventListener('click', function () {
+    viewer.viewport.goHome();
+  });
+  document.getElementById('fs').addEventListener('click', function () {
+    viewer.setFullScreen(!viewer.isFullScreen());
+  });
+
+  // Chrome fades after 2.5 s of stillness; any pointer activity restores it.
+  var idleTimer = null;
+  function wake() {
+    document.body.classList.remove('idle');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      document.body.classList.add('idle');
+    }, 2500);
+  }
+  ['pointermove', 'pointerdown', 'keydown', 'touchstart'].forEach(function (ev) {
+    window.addEventListener(ev, wake, { passive: true });
+  });
+  wake();
+</script>
+</body>
+</html>

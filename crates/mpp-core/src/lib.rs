@@ -15,6 +15,8 @@
 //! - [`convert`] — one-call conversion orchestration used by the CLI.
 //! - [`vips`] — discovery and spawning of the official `vips` binary
 //!   (mainstream-format conversion and, later, DZI export).
+//! - [`viewer`] — emission of the static, self-hostable Astrometrical
+//!   viewer page.
 
 #![warn(missing_docs)]
 
@@ -28,6 +30,8 @@ pub mod wcs;
 pub mod convert;
 
 pub mod vips;
+
+pub mod viewer;
 
 #[cfg(test)]
 mod testsupport;
