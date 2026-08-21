@@ -20,8 +20,7 @@ Part of the Astrometrical "Mega" tool family, alongside
 
 ## Status
 
-First two phase-1 slices implemented: XISF → BigTIFF plus PNG/JPEG/WebP/AVIF/JXL via the vips CLI (`libvips-tools` required for the non-TIFF formats), each with the WCS JSON
-sidecar. DZI/HTML export is upcoming phase-1 work; see the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
+Phase-1 complete: XISF → BigTIFF plus PNG/JPEG/WebP/AVIF/JXL via the vips CLI (`libvips-tools` required for the non-TIFF formats), each with the WCS JSON sidecar, and DZI tile-pyramid export with an Astrometrical-branded OpenSeadragon viewer. See the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Smoke tests
 
@@ -40,6 +39,20 @@ Photoshop (PS ≥ 26.2 also saves BigTIFF; opening support is older).
   Format dimension ceilings are preflighted before conversion: WebP tops
   out at 16383 px per side, JPEG at 65500; AVIF's limit is
   encoder-dependent.
+
+## Publishing a zoomable web view
+
+```sh
+mpp publish mosaic.xisf site/ --title "Veil Nebula"
+# then serve `site/` from any static host:
+python3 -m http.server -d site/
+```
+
+DZI tile pyramid + a self-contained OpenSeadragon viewer (no CDN, works
+self-hosted anywhere). Images ≤ 4096 px publish as a single-image page;
+`--mode dzi|single` overrides. A solved input also writes the
+`*.wcs.json` sidecar next to the tiles and bakes center coordinates into
+the page footer.
 
 ## License
 

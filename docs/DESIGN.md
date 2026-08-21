@@ -110,11 +110,34 @@ version — readers reject unknown majors; additive fields (future
 distortion grids) do not bump it. Source of truth:
 `mpp-core::wcs::sidecar` module docs.
 
+## DZI publishing decisions (2026-08-21)
+
+- Tiles must be genuinely 8-bit before `dzsave`: vips savers CLIP (not
+  rescale) over-range values — a 16-bit input would blow out to white.
+  Routing: XISF → Rust 8-bit temp BigTIFF; 8-bit vips inputs direct;
+  16-bit vips inputs via `vips msb` (deterministic high byte); other
+  sample formats are rejected (publish takes stretched, display-ready
+  input by design).
+- The viewer page inlines the tile source as a JS object (the `.dzi` XML
+  is still emitted for other consumers) and bundles OpenSeadragon v6.1.0
+  (BSD-3-Clause, see NOTICE) with all-relative references, with the
+  `OPENSEADRAGON-LICENSE.txt` file riding alongside — the output works on
+  any dumb static host, per the positioning commitment.
+- Viewer OSD settings mirror the production Astrometrical platform viewer
+  (custom controls, navigator bottom-left, maxZoomPixelRatio 4,
+  visibilityRatio 1). When a solution exists, center RA/Dec and pixel
+  scale are baked into the page's telemetry footer at publish time (a
+  live WCS readout is phase-3 DeepSky work).
+- Universal viewer mode: `--mode single` / auto below 4096 px per side
+  uses OSD's single-image source, no pyramid; oversize explicit-single
+  warns and suggests DZI.
+
 ## Phases
 
-1. **CLI** (this repo, now): convert + sidecar + DZI/HTML. Smoke test that
-   matters: a >4 GB BigTIFF opens in Photoshop (PS ≥ 26.2 saves BigTIFF;
-   opening support is older).
+1. **CLI** (phase 1, completed 2026-08-21): convert + sidecar + DZI/HTML.
+   Remaining loose ends: FITS read/write evaluation, real-data Photoshop
+   smoke test (manual). Smoke test that matters: a >4 GB BigTIFF opens in
+   Photoshop (PS ≥ 26.2 saves BigTIFF; opening support is older).
 2. **PixInsight file-format module**: write-only "BigTIFF" format (`.btf`,
    `.tf8`) as a thin PCL C++ shim streaming pixel bands over the shm
    host/worker channel (pattern proven in MMM's integration/) to a Rust
