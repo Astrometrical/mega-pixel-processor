@@ -20,9 +20,8 @@ Part of the Astrometrical "Mega" tool family, alongside
 
 ## Status
 
-First phase-1 slice implemented: XISF → BigTIFF conversion with the WCS JSON
-sidecar. Mainstream formats via libvips and DZI/HTML export are upcoming
-phase-1 work; see the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
+First phase-1 slice implemented: XISF → BigTIFF plus PNG/JPEG/WebP/AVIF/JXL via the vips CLI (`libvips-tools` required for the non-TIFF formats), each with the WCS JSON
+sidecar. DZI/HTML export is upcoming phase-1 work; see the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Smoke tests
 
@@ -35,6 +34,9 @@ Photoshop (PS ≥ 26.2 also saves BigTIFF; opening support is older).
   `target/release/mpp convert <big>.xisf <big>.tif` on a real mosaic and
   open the result in Photoshop. A solved input also writes
   `<big>.wcs.json` next to the output.
+- Mainstream formats (requires libvips-tools): `target/release/mpp convert
+  <big>.xisf <big>.png` — PNG defaults to 16-bit; JPEG/WebP/AVIF take
+  `--quality`.
 
 ## License
 

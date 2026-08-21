@@ -54,6 +54,15 @@ being better, not on being the only place the files work.
   vips is used by *spawning the official `vips` binaries* for `dzsave` and
   mainstream-format conversion — no FFI bindings, no LGPL linking
   obligations. Revisit bindings only if process spawning proves limiting.
+  Mainstream-format delegation (2026-08-21): all sample-format math stays
+  in Rust — the converter writes a temp BigTIFF at the target bit depth
+  next to the output, then `vips copy` re-containers it. This is because
+  vips savers silently auto-cast unsupported band formats (float [0,1]
+  input becomes a clipped 8-bit image with no error, verified on 8.15.1)
+  and `pngsave` needs an explicit `bitdepth=16`. Formats: png (u16/u8),
+  jpg/webp/avif (u8, `Q=` quality), jxl (u16/u8). vips has no EXR saver,
+  so EXR export is out; `fitssave` exists in the Ubuntu build (cfitsio) —
+  relevant to the FITS read/write evaluation still pending.
 - **XISF is our code** — vips has no XISF.
   **Decided (2026-08-20):** the XISF reader and linear-WCS extraction are
   *ported* from `mmm-core` into `mpp-core` — `mpp-core` owns format code,
