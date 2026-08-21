@@ -17,6 +17,9 @@
 //!   (mainstream-format conversion and, later, DZI export).
 //! - [`viewer`] — emission of the static, self-hostable Astrometrical
 //!   viewer page.
+//! - [`publish`] — one-call publish orchestration: routes any supported
+//!   input to a DZI tile pyramid (or, in a later phase, a single full-res
+//!   image) plus the branded viewer page and WCS sidecar.
 
 #![warn(missing_docs)]
 
@@ -32,6 +35,8 @@ pub mod convert;
 pub mod vips;
 
 pub mod viewer;
+
+pub mod publish;
 
 #[cfg(test)]
 mod testsupport;

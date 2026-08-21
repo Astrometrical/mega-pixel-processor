@@ -84,9 +84,6 @@ pub(crate) fn vips_copy(
 
 /// Build a DZI (Deep Zoom) pyramid: `<out_base>.dzi` + `<out_base>_files/`.
 /// `suffix` is the vips tile suffix, e.g. `.jpg[Q=90]` or `.png`.
-// Only exercised by this module's gated tests today; the publish/dzsave
-// routing task in this plan wires it into non-test code.
-#[allow(dead_code)]
 pub(crate) fn vips_dzsave(
     vips_bin: &Path,
     src: &Path,
@@ -108,9 +105,6 @@ pub(crate) fn vips_dzsave(
 }
 
 /// Deterministic 16-bit → 8-bit: keep each sample's most significant byte.
-// Only exercised by this module's gated tests today; the publish/dzsave
-// routing task in this plan wires it into non-test code.
-#[allow(dead_code)]
 pub(crate) fn vips_msb(vips_bin: &Path, src: &Path, dest: &Path) -> Result<()> {
     run_vips(
         vips_bin,
@@ -132,9 +126,6 @@ pub(crate) fn vips_msb(vips_bin: &Path, src: &Path, dest: &Path) -> Result<()> {
 /// nickname (`"uchar"`). Other enum-typed fields (`interpretation`,
 /// `coding`, …) are returned as that raw dump, unreduced — see
 /// [`normalize_format_field`]'s doc comment for why it doesn't generalize.
-// Only exercised by this module's gated tests today; the publish/dzsave
-// routing task in this plan wires it into non-test code.
-#[allow(dead_code)]
 pub(crate) fn vipsheader_field(src: &Path, field: &str) -> Result<String> {
     let exe = if cfg!(windows) {
         "vipsheader.exe"
@@ -173,9 +164,6 @@ pub(crate) fn vipsheader_field(src: &Path, field: &str) -> Result<String> {
 /// (there's no general `VIPS_<TypeName>_` rule), so any input not
 /// exactly shaped as a `VipsBandFormat` dump — including other enum
 /// dumps and plain scalar fields — passes through unchanged, raw.
-// Reachable only through `vipsheader_field` above, which is itself
-// unreached from non-test code until a later task wires it in.
-#[allow(dead_code)]
 fn normalize_format_field(raw: &str) -> String {
     let Some(value) = raw
         .strip_prefix("((VipsBandFormat) ")

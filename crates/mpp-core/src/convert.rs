@@ -143,9 +143,11 @@ fn ext(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Deletes the wrapped path on drop — the temp interchange TIFF must not
-/// survive any exit path, success or error.
-struct TempFileGuard(PathBuf);
+/// Deletes the wrapped path on drop — a temp interchange file must not
+/// survive any exit path, success or error. Shared by [`crate::publish`],
+/// which writes its own temp interchange files (an 8-bit BigTIFF from XISF,
+/// or an [`crate::vips::vips_msb`]-reduced `.v` file from 16-bit input).
+pub(crate) struct TempFileGuard(pub(crate) PathBuf);
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
@@ -153,21 +155,29 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// Process-wide counter distinguishing concurrent interchange files within
-/// a single process (see [`interchange_path`]).
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Process-wide counter distinguishing concurrent temp interchange files
+/// within a single process (see [`unique_temp`]).
+pub(crate) static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The interchange path for a vips-backed output: same directory (same
-/// filesystem — multi-GB temp data must not land in a small /tmp), named
-/// after the output's full file name plus a pid suffix (separates
-/// concurrent processes) and a process-wide counter (separates multiple
-/// conversions within one process, e.g. `out.png` and `out.jpg` sharing a
-/// stem, from colliding).
+/// A unique temp interchange path inside `dir` (same filesystem as the
+/// caller's real output — multi-GB temp data must not land in a small
+/// `/tmp`): `<prefix>.mpp-tmp-<pid>-<seq>.<ext>`, where the pid separates
+/// concurrent processes and the process-wide [`TEMP_SEQ`] counter separates
+/// multiple temp files within one process from colliding.
+pub(crate) fn unique_temp(dir: &Path, prefix: &str, ext: &str) -> PathBuf {
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        "{prefix}.mpp-tmp-{}-{seq}.{ext}",
+        std::process::id()
+    ))
+}
+
+/// The interchange path for a vips-backed output: same directory as
+/// `output`, named after its full file name (see [`unique_temp`]).
 fn interchange_path(output: &Path) -> PathBuf {
     let name = output.file_name().unwrap_or_default().to_string_lossy();
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = format!("{name}.mpp-tmp-{}-{seq}.tif", std::process::id());
-    output.with_file_name(tmp)
+    let dir = output.parent().unwrap_or_else(|| Path::new(""));
+    unique_temp(dir, &name, "tif")
 }
 
 /// Convert `input` (XISF) to `output`, whose extension selects the
