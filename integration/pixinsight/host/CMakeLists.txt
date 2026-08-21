@@ -17,7 +17,7 @@ else()
   add_compile_options(-Wall -Wextra -Werror -fPIC)
 endif()
 
-add_library(mpp_host STATIC mpp_shm.cpp mpp_protocol.cpp)
+add_library(mpp_host STATIC mpp_shm.cpp mpp_protocol.cpp mpp_host.cpp)
 target_include_directories(mpp_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 if(NOT WIN32 AND NOT APPLE)
   # glibc < 2.34 keeps shm_open/shm_unlink in librt rather than libc; link it
@@ -66,3 +66,27 @@ add_test(NAME test_roundtrip COMMAND test_roundtrip)
 add_executable(test_host_gone test/test_host_gone.cpp)
 target_link_libraries(test_host_gone PRIVATE mpp_host)
 add_test(NAME test_host_gone COMMAND test_host_gone)
+
+# Task 3 golden suite: mpp::WriteSession (mpp_host.h/.cpp) driving the real
+# worker through PushBand/Finish/Cancel, plus two raw-frame/no-worker edge
+# cases (test_version_mismatch bypasses WriteSession deliberately -- see its
+# header comment; test_worker_missing never spawns a process at all).
+add_executable(test_split_bands test/test_split_bands.cpp)
+target_link_libraries(test_split_bands PRIVATE mpp_host)
+add_test(NAME test_split_bands COMMAND test_split_bands)
+
+add_executable(test_u16 test/test_u16.cpp)
+target_link_libraries(test_u16 PRIVATE mpp_host)
+add_test(NAME test_u16 COMMAND test_u16)
+
+add_executable(test_cancel test/test_cancel.cpp)
+target_link_libraries(test_cancel PRIVATE mpp_host)
+add_test(NAME test_cancel COMMAND test_cancel)
+
+add_executable(test_version_mismatch test/test_version_mismatch.cpp)
+target_link_libraries(test_version_mismatch PRIVATE mpp_host)
+add_test(NAME test_version_mismatch COMMAND test_version_mismatch)
+
+add_executable(test_worker_missing test/test_worker_missing.cpp)
+target_link_libraries(test_worker_missing PRIVATE mpp_host)
+add_test(NAME test_worker_missing COMMAND test_worker_missing)
