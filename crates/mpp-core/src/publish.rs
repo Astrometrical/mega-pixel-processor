@@ -1,7 +1,7 @@
 //! One-call publish orchestration: route any supported input to a web
-//! viewer output (DZI tile pyramid today; a single full-resolution image in
-//! a later phase) plus the branded Astrometrical viewer page and WCS
-//! sidecar.
+//! viewer output (a DZI tile pyramid or a single full-resolution image, by
+//! size or explicit request) plus the branded Astrometrical viewer page and
+//! WCS sidecar.
 //!
 //! [`publish`] always needs the `vips` binary (both modes route through it —
 //! DZI tiling itself, and non-XISF input probing/reduction), unlike
@@ -33,8 +33,8 @@ pub enum PublishMode {
     /// A Deep Zoom Image tile pyramid, for large images (the OpenSeadragon
     /// viewer streams only the tiles the current view needs).
     Dzi,
-    /// A single full-resolution image file, for small images. Not yet
-    /// implemented — see [`publish`]'s docs.
+    /// A single full-resolution image file, for small images — an inline
+    /// `{ type: 'image', ... }` tile source rather than a DZI pyramid.
     Single,
 }
 
@@ -106,12 +106,33 @@ fn mode_label(mode: PublishMode) -> &'static str {
     }
 }
 
+/// Resolve `requested` against image dimensions `w`×`h`: [`PublishMode::Auto`]
+/// becomes [`PublishMode::Single`] at or below [`SINGLE_MODE_MAX_DIM`] per
+/// side, else [`PublishMode::Dzi`]; an explicit mode passes through
+/// unchanged (oversize-single warnings are the caller's concern, since they
+/// need the original request to know the mode was explicit).
+fn resolve_mode(requested: PublishMode, w: u64, h: u64) -> PublishMode {
+    match requested {
+        PublishMode::Auto => {
+            if w.max(h) <= SINGLE_MODE_MAX_DIM {
+                PublishMode::Single
+            } else {
+                PublishMode::Dzi
+            }
+        }
+        explicit => explicit,
+    }
+}
+
 /// Publish `input` as a self-hostable web viewer under `outdir`: an 8-bit
-/// [`PublishMode::Dzi`] tile pyramid (built by vips `dzsave`) or, in a later
-/// phase, a [`PublishMode::Single`] full-resolution image — plus the
-/// branded OpenSeadragon viewer page ([`crate::viewer::emit_viewer`]) and,
-/// when the input carries an astrometric solution and `opts.sidecar` is on,
-/// the WCS JSON sidecar.
+/// [`PublishMode::Dzi`] tile pyramid (built by vips `dzsave`) or a
+/// [`PublishMode::Single`] full-resolution `<stem>.jpg` — plus the branded
+/// OpenSeadragon viewer page ([`crate::viewer::emit_viewer`]) and, when the
+/// input carries an astrometric solution and `opts.sidecar` is on, the WCS
+/// JSON sidecar. [`PublishMode::Auto`] (the default) picks between the two
+/// by [`SINGLE_MODE_MAX_DIM`]; an explicit [`PublishMode::Single`] above
+/// that threshold proceeds anyway, with a warning to stderr, since the
+/// browser will load the whole image.
 ///
 /// `input` may be XISF (astrometric solution extracted natively) or any
 /// other vips-readable, display-ready (8- or 16-bit) format; 16-bit input is
@@ -119,8 +140,9 @@ fn mode_label(mode: PublishMode) -> &'static str {
 /// other sample formats are rejected with a message to stretch and export
 /// first. `outdir` is created if missing.
 ///
-/// **Not yet implemented:** [`PublishMode::Single`] — resolving to it
-/// (explicitly or via `Auto`) returns an error; a later phase wires it in.
+/// In single mode, a `.jpg`/`.jpeg` input is copied byte-for-byte to
+/// `<stem>.jpg` rather than re-encoded; any other input is re-encoded via
+/// vips at `opts.tile_quality` (default 90).
 pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<PublishReport> {
     let vips_bin = vips_available().ok_or_else(|| {
         Error::format(
@@ -193,26 +215,13 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
             (src, w, h, None, guard)
         };
 
-    let mode_used = match opts.mode {
-        PublishMode::Auto => {
-            if w.max(h) <= SINGLE_MODE_MAX_DIM {
-                PublishMode::Single
-            } else {
-                PublishMode::Dzi
-            }
-        }
-        PublishMode::Single => {
-            if w.max(h) > SINGLE_MODE_MAX_DIM {
-                eprintln!(
-                    "warning: single mode requested for a {w}x{h} image \
-                     (> {SINGLE_MODE_MAX_DIM}px per side); consider DZI mode \
-                     for a tiled pyramid instead"
-                );
-            }
-            PublishMode::Single
-        }
-        PublishMode::Dzi => PublishMode::Dzi,
-    };
+    let mode_used = resolve_mode(opts.mode, w, h);
+    if opts.mode == PublishMode::Single && w.max(h) > SINGLE_MODE_MAX_DIM {
+        eprintln!(
+            "note: {w}x{h} exceeds {SINGLE_MODE_MAX_DIM} px; single-image mode \
+             loads the whole image in the browser — consider --mode dzi"
+        );
+    }
 
     if opts.tile_quality.is_some() && opts.tile_format == TileFormat::Png {
         return Err(Error::format(
@@ -225,10 +234,15 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
 
     let tile_source = match mode_used {
         PublishMode::Single => {
-            return Err(Error::format(
-                outdir,
-                "single mode is not wired yet (next commit)",
-            ));
+            let dest = outdir.join(format!("{stem}.jpg"));
+            if in_ext == "jpg" || in_ext == "jpeg" {
+                std::fs::copy(input, &dest).map_err(|e| Error::io(&dest, e))?;
+            } else {
+                let quality = opts.tile_quality.unwrap_or(90);
+                let dest_spec = format!("{}[Q={quality}]", dest.display());
+                crate::vips::vips_copy(&vips_bin, &src8, &dest_spec, &dest)?;
+            }
+            format!("{{ type: 'image', url: '{stem}.jpg' }}")
         }
         PublishMode::Dzi => {
             let (suffix, fmt) = match opts.tile_format {
@@ -382,6 +396,78 @@ mod tests {
         assert_eq!((report.width, report.height), (32, 16));
         assert!(!report.wcs_found, "no WCS path for non-XISF input");
         assert!(out.join("plain.dzi").is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_mode_small_image_publishes_single() {
+        if crate::vips::vips_available().is_none() {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        }
+        let dir = tmpdir("single");
+        let input = dir.join("m27.xisf");
+        synth_xisf(&input, 64, 48, 1, true);
+        let out = dir.join("site");
+        let report = publish(&input, &out, &PublishOptions::default()).unwrap();
+
+        assert_eq!(report.mode_used, PublishMode::Single);
+        assert!(out.join("m27.jpg").is_file());
+        assert!(!out.join("m27.dzi").exists(), "no pyramid in single mode");
+        let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(html.contains("type: 'image'"));
+        assert!(html.contains("m27.jpg"));
+        assert!(
+            out.join("m27.wcs.json").is_file(),
+            "sidecar in single mode too"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_mode_threshold_boundary() {
+        // Pure resolution logic — no vips needed if factored as a function.
+        assert_eq!(
+            resolve_mode(PublishMode::Auto, 4096, 100),
+            PublishMode::Single
+        );
+        assert_eq!(resolve_mode(PublishMode::Auto, 4097, 100), PublishMode::Dzi);
+        assert_eq!(resolve_mode(PublishMode::Dzi, 10, 10), PublishMode::Dzi);
+        assert_eq!(
+            resolve_mode(PublishMode::Single, 100_000, 10),
+            PublishMode::Single
+        );
+    }
+
+    #[test]
+    fn jpg_input_single_mode_copies_without_reencode() {
+        let Some(vips) = crate::vips::vips_available() else {
+            eprintln!("skipping: vips binary not found on PATH");
+            return;
+        };
+        let dir = tmpdir("jpgcopy");
+        // Produce a small uchar jpg with vips itself (`vips black` emits uchar).
+        let v = dir.join("s.v");
+        crate::vips::run_vips(
+            &vips,
+            &[
+                "black".as_ref(),
+                v.as_os_str(),
+                "40".as_ref(),
+                "30".as_ref(),
+            ],
+            &v,
+        )
+        .unwrap();
+        let input = dir.join("photo.jpg");
+        crate::vips::vips_copy(&vips, &v, &input.display().to_string(), &input).unwrap();
+
+        let out = dir.join("site");
+        let report = publish(&input, &out, &PublishOptions::default()).unwrap();
+        assert_eq!(report.mode_used, PublishMode::Single);
+        let src = std::fs::read(&input).unwrap();
+        let dst = std::fs::read(out.join("photo.jpg")).unwrap();
+        assert_eq!(src, dst, "byte-identical copy, not re-encoded");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
