@@ -139,12 +139,60 @@ distortion grids) do not bump it. Source of truth:
    smoke test (manual). Smoke test that matters: a >4 GB BigTIFF opens in
    Photoshop (PS ≥ 26.2 saves BigTIFF; opening support is older).
 2. **PixInsight file-format module** (in progress — plan A's Rust worker +
-   IPC has landed; plan B's C++ PCL host is next): write-only "BigTIFF"
-   format (`.btf`, `.tf8`) as a thin PCL C++ shim streaming pixel bands over
-   the shm host/worker channel (pattern proven in MMM's integration/) to a
-   Rust worker that encodes. Write-only is legitimate (PI's RAW format is
-   read-only); import can come later. Reuses MMM's CI build/sign/publish
-   scripts; the Astrometrical update repo serves both packages.
+   IPC landed; plan B's C++ PCL host module has landed through Task 5 of 7:
+   host static lib + golden `ctest` suite, the module shim itself
+   (`BigTIFF-pxm.so`, builds clean, zero-warning, no undefined `mpp::`
+   symbols), version sync, and the compliance/provenance/docs set below.
+   Remaining: CI workflow + build scripts (Task 6), closeout (Task 7)):
+   write-only "BigTIFF" format (`.btf`, `.tf8`) as a thin PCL C++ shim
+   streaming pixel bands over the shm host/worker channel (pattern proven in
+   MMM's integration/) to a Rust worker that encodes. Write-only is
+   legitimate (PI's RAW format is read-only); import can come later. Reuses
+   MMM's CI build/sign/publish scripts; the Astrometrical update repo serves
+   both packages.
+
+   Decisions made while landing plan B (implementation plan
+   `docs/superpowers/plans/2026-08-22-pi-module-shim.md`):
+   - **Host-push module architecture**: unlike MMM's `mmm-pxm` (worker pulls
+     input panel rows and pushes output bands, a bidirectional
+     request/reply server loop), mpp's protocol is host-push and
+     one-directional (`docs/pi-protocol.md` §1) — the PCL shim already has
+     every pixel PixInsight hands it via `WriteSamples`, so it simply
+     streams `Band` frames as bands arrive; `mpp::WriteSession` (the host
+     driver) has no callback interfaces to implement, just a synchronous
+     fill-a-slot/send/await-ack rhythm over a free-slot pool.
+   - **Sample-format mapping** (PI image type → wire `bit_depth`; every
+     `WriteSamples` buffer is normalized to f32 in `[0,1]` regardless of the
+     negotiated output format): `pcl::Image` (f32) → `"f32"` native;
+     `pcl::DImage` (f64) → `"f32"` narrowed (lossy, reported);
+     `UInt8Image`/`UInt16Image` → `"u8"`/`"u16"` exact;
+     `UInt32Image` → `"f32"` via `v/(2^32-1)` (lossy, reported). See
+     `integration/pixinsight/README.md`'s mapping table for the full detail.
+   - **No-options v1**: no format-specific options dialog, no ICC/thumbnail/
+     property storage — the module advertises only what is true; a
+     FITS-keyword/property sidecar into BigTIFF is a phase-3 candidate, and
+     the WCS sidecar stays `mpp`'s own JSON mechanism regardless.
+   - **Manual-smoke verification boundary**: loading the module inside
+     PixInsight is deliberately *not* automated. The machine-verifiable
+     boundary is compile/link/symbol gates (zero warnings, no undefined
+     `mpp::` symbols, the three PCL entry points exported) plus the host
+     library's golden `ctest` suite, which proves the wire protocol and
+     process lifecycle against the real `mpp-ipc-worker` binary with no
+     PixInsight involved. The human-run manual smoke procedure is
+     documented in `integration/pixinsight/README.md`.
+   - **C++20 forced for the module** (not the plan's original C++17
+     constraint): PCL 2.10.4's own `Image.h` does not compile under C++17
+     (`pcl::Complex<float>` clip/truncate comparisons only resolve under
+     C++20 overload rules, confirmed empirically). Scoped narrowly: only
+     `integration/pixinsight/module/`'s translation units build as C++20;
+     `integration/pixinsight/host/` (the PCL-free static lib) remains
+     C++17-clean, gated by its own CMake build.
+   - **v1 defers PI-abort wiring**: PixInsight's abort mechanism is not
+     wired to a mid-write `Cancel` in v1. `Close()` on a still-open write
+     session sends `Cancel` and *blocks* until the worker replies (a wedged
+     worker hangs `Close()`); only the destructor path (no `Close()` ever
+     ran) is non-blocking, killing and reaping the worker directly. Noted
+     as a known limitation in `integration/pixinsight/README.md`.
 3. **DeepSky viewer components / platform hooks**: richer viewer (WCS
    readout, annotations, catalog overlays), possible hosted platform.
 

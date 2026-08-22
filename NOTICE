@@ -13,3 +13,37 @@ Copyright (c) CodePlex Foundation and OpenSeadragon contributors.
 The full license text is preserved in
 crates/mpp-core/assets/OPENSEADRAGON-LICENSE.txt and is emitted verbatim
 into every published output directory.
+
+--------------------------------------------------------------------------
+
+The optional PixInsight file-format module built from
+integration/pixinsight/module/ (BigTIFF-pxm.so / .dylib / .dll) links
+against the PixInsight Class Library (PCL), Copyright (c) 2003-2026
+Pleiades Astrophoto S.L. All Rights Reserved, licensed under the
+PixInsight Class Library License, Version 2.0.1, 29 December 2025
+(https://pixinsight.com/license/PCL-License-2.0.html). Only that module's
+build products are subject to this license; everything else in this
+repository, including integration/pixinsight/host/ and mpp-ipc-worker,
+remains Apache-2.0 and links no PCL code.
+
+Per that license's redistribution requirement (condition 4), this product
+reproduces the following acknowledgment, required verbatim:
+
+    "This product is based on software from the PixInsight project,
+    developed by Pleiades Astrophoto and its contributors
+    (https://pixinsight.com/)."
+
+This mpp module is an independent, clean-room implementation built against
+PCL's public API only (see integration/pixinsight/README.md's provenance
+statement); it is not endorsed by, sponsored by, or otherwise affiliated
+with Pleiades Astrophoto S.L. or the PixInsight project. "PixInsight" and
+"Pleiades Astrophoto" are names of Pleiades Astrophoto S.L., used here only
+to identify the library this optional module links against, not to imply
+endorsement (PCL License 2.0.1, condition 3).
+
+--------------------------------------------------------------------------
+
+integration/pixinsight/host/third_party/json.hpp vendors nlohmann/json
+(https://github.com/nlohmann/json), version 3.11.3. SPDX-FileCopyrightText:
+2013-2023 Niels Lohmann <https://nlohmann.me>. SPDX-License-Identifier:
+MIT.
