@@ -236,12 +236,20 @@ narrowly to that directory:
   headers. Distributing that binary is subject to the **PixInsight Class
   Library License, Version 2.0.1** — retained notices, the required
   end-user acknowledgment sentence, and the no-endorsement clause are
-  reproduced in `/NOTICE` (root of this repository). The PCL license text
-  itself is not redistributed from this repository (it ships with every
-  PixInsight/PCL installation); see
-  `/opt/PixInsight/etc/legal/licenses/PCL-License-2.0` on a machine with
-  PixInsight installed, or
-  https://pixinsight.com/license/PCL-License-2.0.html.
+  reproduced in `/NOTICE` (root of this repository), and the full license
+  text is shipped byte-verbatim in this directory as
+  [`LICENSE-PCL`](LICENSE-PCL) (copied from
+  `/opt/PixInsight/etc/legal/licenses/PCL-License-2.0`; PCL License 2.0.1
+  condition 2 requires the conditions/restriction/disclaimer to be
+  reproduced in the documentation accompanying a binary redistribution, so
+  this repository ships the text rather than only pointing at it). Any
+  distributed package containing `BigTIFF-pxm.so` should include
+  `LICENSE-PCL` alongside it (the Task 6 CI staging step does this). The
+  same text is also published at
+  https://pixinsight.com/license/PCL-License-2.0.html and ships with every
+  PixInsight/PCL installation at
+  `/opt/PixInsight/etc/legal/licenses/PCL-License-2.0`, listed here as
+  additional pointers, not as a substitute for the in-repo copy.
 - **`integration/pixinsight/host/` and everything else** — the host static
   library, `mpp-ipc-worker`, and the rest of this project — remain
   Apache-2.0. `host/` never includes a PCL header (enforced by the file

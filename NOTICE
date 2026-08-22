@@ -18,13 +18,14 @@ into every published output directory.
 
 The optional PixInsight file-format module built from
 integration/pixinsight/module/ (BigTIFF-pxm.so / .dylib / .dll) links
-against the PixInsight Class Library (PCL), Copyright (c) 2003-2026
-Pleiades Astrophoto S.L. All Rights Reserved, licensed under the
-PixInsight Class Library License, Version 2.0.1, 29 December 2025
-(https://pixinsight.com/license/PCL-License-2.0.html). Only that module's
-build products are subject to this license; everything else in this
-repository, including integration/pixinsight/host/ and mpp-ipc-worker,
-remains Apache-2.0 and links no PCL code.
+against the PixInsight Class Library (PCL), Copyright (c) 2025, Pleiades
+Astrophoto S.L. All Rights Reserved, licensed under the PixInsight Class
+Library License, Version 2.0.1, 29 December 2025. The full license text is
+reproduced verbatim in integration/pixinsight/LICENSE-PCL (also published
+at https://pixinsight.com/license/PCL-License-2.0.html). Only that
+module's build products are subject to this license; everything else in
+this repository, including integration/pixinsight/host/ and
+mpp-ipc-worker, remains Apache-2.0 and links no PCL code.
 
 Per that license's redistribution requirement (condition 4), this product
 reproduces the following acknowledgment, required verbatim:
