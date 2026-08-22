@@ -21,10 +21,15 @@
 # Windows/MSVC build system yet (only module/makefile-x64, used for Linux
 # and macOS; see build-module-windows.ps1's header comment). Everything
 # before that step (PCL build/cache, Rust tests, host CTest suite, the
-# debug worker build) still runs and gates real signal. That one step is
-# marked continue-on-error: true so this known, already-flagged gap doesn't
-# turn the whole windows job (and thus this required check) red; the step
-# itself still reports failed in the run summary, so the gap stays visible
+# debug worker build, the PCL API-version gate) still runs and gates real
+# signal. Only that one module-build step is marked continue-on-error: true
+# so this known, already-flagged gap doesn't turn the whole windows job
+# (and thus this required check) red -- the PCL API-version gate is
+# deliberately its OWN prior step, NOT continue-on-error, so a real
+# API-version violation still fails the job rather than being swallowed by
+# the module-build step's tolerance for its own, unrelated known gap. The
+# module-build step itself still reports failed in the run summary, so the
+# gap stays visible
 # rather than silently masked. The steps after it (bundle provenance,
 # artifact upload) are skipped, not run, when it didn't succeed.
 name: Module
@@ -260,15 +265,27 @@ jobs:
           $env:MPP_WORKER_EXE = Join-Path $PWD 'target/debug/mpp-ipc-worker.exe'
           ctest --test-dir integration/pixinsight/host/ci-build --build-config Release --output-on-failure
 
+      # Deliberately its OWN step, NOT continue-on-error, and BEFORE the
+      # known-gap module-build step below. A previous review round found
+      # this check embedded inside that continue-on-error step, where a
+      # real "local PCL exceeds the pin" failure would have been silently
+      # swallowed by the known-gap tolerance meant only for the missing
+      # module/CMakeLists.txt. Splitting it out here means it still fails
+      # the job for real when it should.
+      - name: PCL API-version gate
+        shell: pwsh
+        run: integration/pixinsight/ci/check-pcl-api-version.ps1 -PclInc "$PWD/pcl-ci/include"
+
       # KNOWN GAP: expected to fail here until a future task adds a
       # module/CMakeLists.txt (MSVC build) for mpp -- see this script's
       # header comment. continue-on-error keeps this one step from failing
       # the job (everything before it -- PCL build/cache, Rust tests, host
-      # CTest suite, the debug worker build -- still gates for real); the
-      # step still reports its own red/failed status in the run summary, so
-      # the gap stays visible rather than silently masked. The two steps
-      # below are skipped when this one didn't actually produce anything,
-      # rather than failing the job a second time on a missing stage/.
+      # CTest suite, the debug worker build, the PCL API-version gate above
+      # -- still gates for real); the step still reports its own
+      # red/failed status in the run summary, so the gap stays visible
+      # rather than silently masked. The two steps below are skipped when
+      # this one didn't actually produce anything, rather than failing the
+      # job a second time on a missing stage/.
       - name: Build module + worker, stage payload
         id: build_module
         continue-on-error: true

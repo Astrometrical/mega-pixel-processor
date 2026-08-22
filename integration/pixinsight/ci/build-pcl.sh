@@ -7,10 +7,12 @@
 # adaptation is the pin values in pcl-pin.env, not this script's body).
 #
 # Includes MergeMosaic's HARD gate asserting the pinned tree's compiled
-# PCL_API_Version equals PCL_API_VERSION_HEX from pcl-pin.env (0186,
-# verified empirically against this dev machine's installed PixInsight 1.9.4
-# headers -- see pcl-pin.env's provenance comment). Raising it drops older
-# cores; update PCL_API_VERSION_HEX only deliberately, after re-verifying.
+# PCL_API_Version equals PCL_API_VERSION_HEX from pcl-pin.env (0187,
+# verified by fetching the pinned SHA's own header from GitLab -- see
+# pcl-pin.env's provenance comment; this is deliberately checked against the
+# freshly fetched checkout below, NOT any locally installed PixInsight,
+# which may bundle an older/lagging header). Raising it drops older cores;
+# update PCL_API_VERSION_HEX only deliberately, after re-verifying.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -60,25 +60,41 @@ MAKE_ARGS=()
 
 echo "=== [1/7] PCL API-version gate ==="
 # build-pcl.sh/build-pcl-macos.sh/build-pcl-windows.ps1 hard-gate the API
-# version of a *freshly built* PCL, but that gate never runs on this path:
-# a prebuilt PCLINCDIR is either passed via --pcl-inc or (as on this dev
-# machine) falls through to the makefile's own default
-# (/opt/PixInsight/include), and no pinned-checkout header exists in either
-# case. Re-verify here against whichever include dir is actually about to
-# be linked against, so this can't silently pass -- if the header can't be
-# read at all, that's also a hard failure, not a skip.
+# version of a *freshly built* PCL (equality against the pinned checkout's
+# own header), but that gate never runs on this path: a prebuilt PCLINCDIR
+# is either passed via --pcl-inc or (as on this dev machine) falls through
+# to the makefile's own default (/opt/PixInsight/include), and no
+# pinned-checkout header exists in either case. Re-verify here against
+# whichever include dir is actually about to be linked against -- but with
+# asymmetric semantics, not equality: PCL_API_Version becomes the module's
+# declared API-version floor, so the DANGEROUS direction is the local
+# header claiming something HIGHER than the pin (the module would silently
+# lock out cores between the two versions -- the failure MMM saw live).
+# The local header claiming something LOWER than the pin is comparatively
+# safe (a locally-installed PixInsight app's bundled headers can legitimately
+# lag the pinned GitLab checkout's tag -- exactly the case on this dev
+# machine, /opt/PixInsight/include's PixInsight 1.9.4 bundle vs. the pin's
+# PCL 2.10.4 tag; see pcl-pin.env's provenance comment) and only warrants a
+# loud warning, not a build failure. Either way, failing to read a
+# PCL_API_Version at all is a hard failure, never a silent skip.
 # shellcheck source=/dev/null
 source "$CI_DIR/pcl-pin.env"
 EFFECTIVE_PCL_INC="${PCL_INC:-/opt/PixInsight/include}"
 API_HDR="$EFFECTIVE_PCL_INC/pcl/api/APIInterface.h"
 [ -f "$API_HDR" ] || { echo "ERROR: cannot verify PCL_API_Version -- $API_HDR not found (PCLINCDIR misconfigured?)" >&2; exit 1; }
-grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX}[[:space:]]*$" "$API_HDR" || {
-  echo "ERROR: PCL_API_Version at $EFFECTIVE_PCL_INC != 0x${PCL_API_VERSION_HEX}:" >&2
-  grep 'define PCL_API_Version' "$API_HDR" >&2 || echo "  (no PCL_API_Version found in $API_HDR)" >&2
-  echo "This module would declare a wrong API-version floor. Update PCL_API_VERSION_HEX in pcl-pin.env only deliberately, after re-verifying against the actual headers." >&2
+ACTUAL_HEX="$(grep -oE '^#define[[:space:]]+PCL_API_Version[[:space:]]+0x[0-9A-Fa-f]+' "$API_HDR" | grep -oE '0x[0-9A-Fa-f]+' | sed 's/^0x//')"
+[ -n "$ACTUAL_HEX" ] || { echo "ERROR: no PCL_API_Version found in $API_HDR" >&2; exit 1; }
+ACTUAL_DEC=$((16#$ACTUAL_HEX))
+PINNED_DEC=$((16#$PCL_API_VERSION_HEX))
+if [ "$ACTUAL_DEC" -gt "$PINNED_DEC" ]; then
+  echo "ERROR: PCL_API_Version at $EFFECTIVE_PCL_INC is 0x${ACTUAL_HEX}, higher than the pinned 0x${PCL_API_VERSION_HEX}." >&2
+  echo "This module would declare a higher API-version floor than intended, silently locking out cores between the two versions. Update PCL_API_VERSION_HEX in pcl-pin.env only deliberately, after re-verifying against the pinned checkout." >&2
   exit 1
-}
-echo "PCL_API_Version confirmed 0x${PCL_API_VERSION_HEX} at $API_HDR"
+elif [ "$ACTUAL_DEC" -lt "$PINNED_DEC" ]; then
+  echo "WARNING: PCL_API_Version at $EFFECTIVE_PCL_INC is 0x${ACTUAL_HEX}, lower than the pinned 0x${PCL_API_VERSION_HEX} -- the locally installed headers likely lag the pinned GitLab checkout's tag. Continuing (the built module will declare whichever floor these headers actually carry; a manual PixInsight load/save smoke test settles which one)." >&2
+else
+  echo "PCL_API_Version confirmed 0x${PCL_API_VERSION_HEX} at $API_HDR"
+fi
 
 echo "=== [2/7] make clean ==="
 make -C "$MODULE_DIR" clean

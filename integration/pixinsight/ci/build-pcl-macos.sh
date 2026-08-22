@@ -10,8 +10,10 @@
 # (no mmm/mpp-specific naming in this file -- it only builds PCL + its
 # vendored 3rdparty archives). CANNOT be run/verified on this machine
 # (Linux). Includes MergeMosaic's HARD PCL_API_Version gate against
-# PCL_API_VERSION_HEX from pcl-pin.env (0186, verified empirically -- see
-# pcl-pin.env's provenance comment). Everything else (arm64 makefile
+# PCL_API_VERSION_HEX from pcl-pin.env (0187, verified against the pinned
+# SHA's own header on GitLab -- see pcl-pin.env's provenance comment; NOT
+# checked against any locally installed PixInsight, which may lag).
+# Everything else (arm64 makefile
 # generation, SDK isysroot retargeting, the
 # 7-archive build for the six 3rdparty libs the mpp module's Darwin link
 # line also needs -- see module/makefile-x64's PLATFORM_LIBS for Darwin) is
