@@ -292,6 +292,8 @@ narrowly to that directory:
   container (phase-3 candidates; the WCS sidecar remains `mpp`'s own JSON
   mechanism, not carried into this module).
 - Non-blocking abort wiring (see "Known v1 limitation" above).
-- Code signing for distribution to other machines, and the Astrometrical
-  update repository (dormant in MergeMosaic too, pending Certified-Developer
-  certification).
+- Code signing and update-repository publishing: these live in the
+  `astrometrical-mmm-site` sibling project (which builds the Astrometrical
+  tools website and hosts the PixInsight update repositories). This repo's
+  CI stages the unsigned per-platform artifacts that pipeline consumes;
+  the module is distributed through an Astrometrical update repository.
