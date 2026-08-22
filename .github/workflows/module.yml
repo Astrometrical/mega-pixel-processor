@@ -277,11 +277,19 @@ jobs:
       # (e.g. /d/a/repo/repo) with no guaranteed auto-translation for a
       # plain environment-variable assignment (unlike PATH or argv path
       # heuristics) -- pwsh's $PWD/Join-Path avoids that ambiguity entirely.
+      # Fail fast after each native command: pwsh only propagates the LAST
+      # command's exit code, so without the explicit checks a cmake
+      # configure/build failure would roll on into ctest and surface as
+      # confusing "Could not find executable ... (Not Run)" test failures
+      # instead of the real compile error (exactly what happened when MSVC
+      # C4996 broke six test TUs).
       - name: Host golden CTest suite (no PixInsight)
         shell: pwsh
         run: |
           cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build integration/pixinsight/host/ci-build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:MPP_WORKER_EXE = Join-Path $PWD 'target/debug/mpp-ipc-worker.exe'
           ctest --test-dir integration/pixinsight/host/ci-build --build-config Release --output-on-failure
 

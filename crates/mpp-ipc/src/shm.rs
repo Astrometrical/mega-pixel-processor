@@ -687,10 +687,16 @@ mod tests {
     fn open_rejects_undersized_existing_segment() {
         let name = format!("/mpp-shm-undersize-{}", std::process::id());
         let host = ShmSegment::create(&name, 64).unwrap();
-        let err = ShmSegment::open(&name, 128).unwrap_err();
+        // `open` requires the object to be AT LEAST the requested size, and
+        // the OS may page-round the creator's 64 bytes up (macOS rounds a
+        // POSIX shm object to its 16 KiB page size, so opening with 128
+        // would legitimately succeed there). Request a size beyond any
+        // plausible page rounding so the rejection is observable on every
+        // platform.
+        let err = ShmSegment::open(&name, 1 << 20).unwrap_err();
         assert!(
-            err.to_string().contains("64"),
-            "error should mention the actual size: {err}"
+            err.to_string().contains("expected at least 1048576"),
+            "error should mention the required size: {err}"
         );
         drop(host);
     }

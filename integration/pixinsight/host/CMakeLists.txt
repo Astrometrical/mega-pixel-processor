@@ -13,6 +13,11 @@ if(MSVC)
   # charset keeps narrow string literals well-defined for the
   # FormatMessageA/widen paths in mpp_os.h/mpp_shm.cpp.
   add_compile_options(/W4 /WX /EHsc /utf-8)
+  # The golden tests read MPP_WORKER_EXE via std::getenv (standard C++);
+  # MSVC's C4996 CRT-deprecation ("consider _dupenv_s") would turn that
+  # into a /WX build failure. The reads are start-of-main, read-only, so
+  # silence the CRT deprecation rather than forking the code per platform.
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
   add_compile_options(-Wall -Wextra -Werror -fPIC)
 endif()
