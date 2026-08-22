@@ -14,6 +14,12 @@
 /*_dzi/
 /*.dzi
 
+# PixInsight module build artifacts (makefile-x64 outputs)
+/integration/pixinsight/module/x64/
+/integration/pixinsight/module/*.so
+/integration/pixinsight/module/*.dylib
+/integration/pixinsight/module/*.xsgn
+
 # WSL / Windows artifacts
 *Zone.Identifier
 
