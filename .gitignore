@@ -19,6 +19,15 @@
 /integration/pixinsight/module/*.so
 /integration/pixinsight/module/*.dylib
 /integration/pixinsight/module/*.xsgn
+/integration/pixinsight/module/win-build/
+
+# PixInsight host CTest build directory (cmake -B target of ci/build-module-*
+# and .github/workflows/module.yml)
+/integration/pixinsight/host/ci-build/
+
+# CI build-module-*.sh/.ps1 staging output + local PCL build/cache prefix
+/stage/
+/pcl-ci/
 
 # WSL / Windows artifacts
 *Zone.Identifier
