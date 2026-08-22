@@ -109,6 +109,16 @@ cargo build --release -p mpp-ipc-worker
 make -C integration/pixinsight/module -f makefile-x64
 ```
 
+On Windows the module is built by `module/CMakeLists.txt` (MSVC, mirroring
+how the real PCL modules build on vc17 — fully linked against
+`PCL-pxi.lib` + the six vendored 3rdparty libs, no PixInsight install
+needed), driven end-to-end by `ci/build-module-windows.ps1`:
+
+```powershell
+integration/pixinsight/ci/build-module-windows.ps1 `
+  -PclInc <pcl-prefix>/include -PclLib <pcl-prefix>/lib -Stage stage
+```
+
 This produces `integration/pixinsight/module/BigTIFF-pxm.so`. The host
 library (`host/`) has its own build (`cmake -S integration/pixinsight/host
 -B <build-dir> && cmake --build <build-dir>`) used only for its golden CTest

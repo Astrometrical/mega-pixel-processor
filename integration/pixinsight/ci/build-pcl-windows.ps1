@@ -11,13 +11,9 @@
 # pcl-pin.env (see the pin file's policy comment; NOT checked against any
 # locally installed PixInsight, which may lag).
 #
-# Known gap (flagged, not fixed here): mpp's module/ has no Windows/MSVC
-# build system yet (only makefile-x64, GNU-make + g++/clang++ for
-# Linux/macOS -- see module/Makefile, module/makefile-x64). This script only
-# builds PCL itself; build-module-windows.ps1 is the one that needs a
-# module CMakeLists.txt that does not exist yet (Task 4's scope was
-# Linux/macOS via makefile-x64 only). See build-module-windows.ps1's header
-# comment.
+# This script only builds PCL itself; the module DLL is built by
+# module/CMakeLists.txt (the Windows-only MSVC project), driven by
+# build-module-windows.ps1.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$Out,

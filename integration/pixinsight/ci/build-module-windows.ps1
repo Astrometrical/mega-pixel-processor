@@ -11,10 +11,7 @@
 #
 # This script also does NOT run the PCL API-version gate itself -- that
 # lives in check-pcl-api-version.ps1, run as its own module.yml step
-# *before* this one. This step is wrapped in continue-on-error: true in
-# module.yml (see the KNOWN GAP note below), and the API-version gate must
-# NOT be swallowed by that tolerance -- a version that exceeds the pin is a
-# real, hard failure, not part of the known Windows-module-build gap.
+# *before* this one.
 #
 # Adapted (mechanical rename + retarget) from MergeMosaic's
 # integration/pixinsight/ci/build-module-windows.ps1; see
@@ -22,22 +19,10 @@
 # LICENSE-PCL double-staging rationale (identical here). MergeMosaic's
 # single -Pcl <prefix> parameter is split into -PclInc/-PclLib to match
 # module/makefile-x64's PCLINCDIR/PCLLIBDIR variable names, consistent with
-# build-module-linux.sh/build-module-macos.sh in this same directory.
-#
-# KNOWN GAP (flagged, not fixed by this task): unlike MergeMosaic, mpp's
-# integration/pixinsight/module/ has NO Windows/MSVC build system yet --
-# only module/makefile-x64 + module/Makefile (GNU make + g++/clang++, used
-# for Linux and macOS; see makefile-x64's UNAME_S Darwin/else branches).
-# There is no module/CMakeLists.txt, so the `cmake -S $moduleDir` step below
-# (mechanically adapted from MergeMosaic's, which DOES have that project)
-# will fail until a future task adds an MSVC build for the module itself.
-# This script (and the "windows" job in .github/workflows/module.yml that
-# calls it) is therefore expected to fail at that step on its first real CI
-# run -- CANNOT be run/verified on this machine (Linux) either way. Task
-# 6's brief explicitly scoped this file as "adapted, minimal/mechanical,
-# unverified"; fixing the underlying module Windows build is out of scope
-# here (it belongs with Task 4's module build system, not Task 6's CI
-# plumbing).
+# build-module-linux.sh/build-module-macos.sh in this same directory. The
+# module itself is built by module/CMakeLists.txt (the Windows-only MSVC
+# project; Linux/macOS use module/makefile-x64). CANNOT be run/verified on
+# this machine (Linux) -- module.yml's windows job is its verification.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$PclInc,
@@ -53,8 +38,7 @@ $PclInc = (Resolve-Path $PclInc).Path
 $PclLib = (Resolve-Path $PclLib).Path
 
 # Configure (x64 + toolset v143, pinned so the module's ABI can't drift if
-# the runner image advances) and build Release. See the KNOWN GAP note
-# above: this cmake project does not exist in mpp's module/ yet.
+# the runner image advances) and build Release.
 cmake -S $moduleDir -B $build -A x64 -T v143 -DPCLINCDIR="$PclInc" -DPCLLIBDIR="$PclLib"
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
