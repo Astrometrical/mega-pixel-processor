@@ -8,8 +8,7 @@
 # vendored 3rdparty archives; win/PCL.vcxproj is copied byte-identical).
 # CANNOT be run/verified on this machine (Linux, no MSVC). Includes
 # MergeMosaic's HARD PCL_API_Version gate against PCL_API_VERSION_HEX from
-# pcl-pin.env (0187, verified against the pinned SHA's own header on
-# GitLab -- see pcl-pin.env's provenance comment; NOT checked against any
+# pcl-pin.env (see the pin file's policy comment; NOT checked against any
 # locally installed PixInsight, which may lag).
 #
 # Known gap (flagged, not fixed here): mpp's module/ has no Windows/MSVC

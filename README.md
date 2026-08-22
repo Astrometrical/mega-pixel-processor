@@ -20,7 +20,7 @@ Part of the Astrometrical "Mega" tool family, alongside
 
 ## Status
 
-**Phase-2 (Plan B) complete:** A write-only PixInsight file-format module, `BigTIFF-pxm.so`, lets PixInsight save images directly as BigTIFF (`.btf`, `.tf8`) past the classic TIFF 4 GB limit. The module is machine-verified (all cargo gates green; host library CTest golden suite 8/8; module `.so` builds clean, zero `-Wall -Wextra` warnings, links fully with no undefined `mpp::` symbols; version-sync test guards protocol agreement). Manual PixInsight load/save smoke pending on the human side; unsigned — Astrometrical CPD certificate pending. See [integration/pixinsight/README.md](integration/pixinsight/README.md) for build, install, and manual-test instructions.
+**Phase-2 (Plan B) complete:** A write-only PixInsight file-format module, `BigTIFF-pxm.so`, lets PixInsight (1.9.0 and newer) save images directly as BigTIFF (`.btf`, `.tf8`) past the classic TIFF 4 GB limit. The module is machine-verified (all cargo gates green; host library CTest golden suite 8/8; module `.so` builds clean, zero `-Wall -Wextra` warnings, links fully with no undefined `mpp::` symbols; version-sync test guards protocol agreement). Manual PixInsight load/save smoke pending on the human side; unsigned — Astrometrical CPD certificate pending. See [integration/pixinsight/README.md](integration/pixinsight/README.md) for build, install, and manual-test instructions.
 
 **Phase-1 complete:** XISF → BigTIFF plus PNG/JPEG/WebP/AVIF/JXL via the vips CLI (`libvips-tools` required for the non-TIFF formats), each with the WCS JSON sidecar, and DZI tile-pyramid export with an Astrometrical-branded OpenSeadragon viewer. See the roadmap in [docs/DESIGN.md](docs/DESIGN.md).
 

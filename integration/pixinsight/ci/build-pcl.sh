@@ -7,9 +7,8 @@
 # adaptation is the pin values in pcl-pin.env, not this script's body).
 #
 # Includes MergeMosaic's HARD gate asserting the pinned tree's compiled
-# PCL_API_Version equals PCL_API_VERSION_HEX from pcl-pin.env (0187,
-# verified by fetching the pinned SHA's own header from GitLab -- see
-# pcl-pin.env's provenance comment; this is deliberately checked against the
+# PCL_API_Version equals PCL_API_VERSION_HEX from pcl-pin.env (see the pin
+# file's policy comment; this is deliberately checked against the
 # freshly fetched checkout below, NOT any locally installed PixInsight,
 # which may bundle an older/lagging header). Raising it drops older cores;
 # update PCL_API_VERSION_HEX only deliberately, after re-verifying.

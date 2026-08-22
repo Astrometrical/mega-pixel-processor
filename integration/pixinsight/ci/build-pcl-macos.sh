@@ -4,21 +4,23 @@
 #   build-pcl-macos.sh --out <prefix-dir> [--work <clone-dir>] [--arch arm64|x64]
 # arm64 (default) serves PixInsight 1.9.4+ native cores; x64 serves Intel
 # Macs and every 1.9.0-1.9.3 macOS core (pre-1.9.4 PixInsight is x64-only on
-# macOS, running under Rosetta on Apple Silicon).
+# macOS, running under Rosetta on Apple Silicon). The two arches build from
+# DIFFERENT pins (see pcl-pin.env): arm64 needs PCL 2.10.x -- older PCL has
+# no arm64 code paths at all (pcl/Defs.h hard-errors on non-x86;
+# Atomic.h/Math.h use x86 inline asm unconditionally) -- and every arm64
+# core is >= 1.9.4, so its higher API version excludes nobody on that arch.
 #
 # Adapted from MergeMosaic's integration/pixinsight/ci/build-pcl-macos.sh
 # (no mmm/mpp-specific naming in this file -- it only builds PCL + its
 # vendored 3rdparty archives). CANNOT be run/verified on this machine
-# (Linux). Includes MergeMosaic's HARD PCL_API_Version gate against
-# PCL_API_VERSION_HEX from pcl-pin.env (0187, verified against the pinned
-# SHA's own header on GitLab -- see pcl-pin.env's provenance comment; NOT
-# checked against any locally installed PixInsight, which may lag).
-# Everything else (arm64 makefile
-# generation, SDK isysroot retargeting, the
-# 7-archive build for the six 3rdparty libs the mpp module's Darwin link
-# line also needs -- see module/makefile-x64's PLATFORM_LIBS for Darwin) is
-# unchanged, since the mpp module's macOS build has the exact same
-# link-completeness requirement MergeMosaic's does.
+# (Linux). Includes MergeMosaic's HARD PCL_API_Version gate against the
+# arch-appropriate PCL_API_VERSION_HEX from pcl-pin.env (see the pin file's
+# policy comment; NOT checked against any locally installed PixInsight,
+# which may lag). The SDK isysroot retargeting and the 7-archive build for
+# the six 3rdparty libs the mpp module's Darwin link line also needs (see
+# module/makefile-x64's PLATFORM_LIBS for Darwin) are unchanged, since the
+# mpp module's macOS build has the exact same link-completeness requirement
+# MergeMosaic's does.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +39,15 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
 case "$ARCH" in arm64|x64) ;; *) echo "--arch must be arm64 or x64" >&2; exit 2 ;; esac
+
+# arm64 builds from its own pin (see the policy comment in pcl-pin.env).
+if [ "$ARCH" = arm64 ]; then
+  PCL_SHA="$PCL_ARM64_SHA"
+  PCL_VER_MAJOR="$PCL_ARM64_VER_MAJOR"
+  PCL_VER_MINOR="$PCL_ARM64_VER_MINOR"
+  PCL_VER_RELEASE="$PCL_ARM64_VER_RELEASE"
+  PCL_API_VERSION_HEX="$PCL_ARM64_API_VERSION_HEX"
+fi
 WORK="${WORK:-$(mktemp -d)}"
 mkdir -p "$OUT/lib" "$OUT/include" "$WORK"
 
@@ -68,31 +79,25 @@ grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX
   exit 1
 }
 
-# Pre-1.9.4 PCL trees ship x64-only macOS makefiles (upstream added arm64
-# variants in PCL 2.10.3). The x64->arm64 delta in upstream's generated
-# makefiles is purely mechanical -- verified by reproducing all seven of PCL
-# 2.10.4's real arm64 makefiles byte-identically (mod timestamp) from their
-# x64 siblings: '-arch x86_64' -> '-arch arm64', drop '-msse4.2', and
-# 'x64' -> 'arm64' in paths. Generate any missing arm64 makefile from the
-# pin's own x64 one, so source lists always match the pinned tree exactly.
-# (x64 builds always use the tree's own makefile-x64 -- present at every pin.)
+# Each arch uses its own pin's native makefiles: makefile-x64 exists at
+# every pin; makefile-arm64 exists at the arm64 pin (2.10.3+). A mechanical
+# x64->arm64 makefile transform on an older pin is NOT viable (MergeMosaic
+# proved this in CI): pre-2.10.3 PCL has no arm64 code paths at all --
+# pcl/Defs.h hard-errors on non-x86 and Atomic.h/Math.h use x86 inline asm
+# unconditionally -- which is exactly why arm64 builds from a separate pin.
 THIRDPARTY_LIBS=(cminpack lcms lz4 RFC6234 zlib zstd)
-gen_arm64_makefile() {
-  local dir="$1"
-  [ -f "$dir/makefile-arm64" ] && return 0
-  [ -f "$dir/makefile-x64" ] || { echo "expected $dir/makefile-x64 in PCL tree" >&2; exit 1; }
-  sed -e 's/-arch x86_64/-arch arm64/g' -e 's/ -msse4\.2//g' -e 's/x64/arm64/g' \
-    "$dir/makefile-x64" > "$dir/makefile-arm64"
-  mkdir -p "$dir/arm64/Release"
-}
-if [ "$ARCH" = arm64 ]; then
-  gen_arm64_makefile src/pcl/macosx/g++
-  for lib in "${THIRDPARTY_LIBS[@]}"; do
-    gen_arm64_makefile "src/3rdparty/$lib/macosx/g++"
-  done
-fi
 MK="src/pcl/macosx/g++/makefile-$ARCH"
-[ -f "$MK" ] || { echo "expected $MK in PCL tree" >&2; exit 1; }
+[ -f "$MK" ] || { echo "expected $MK in PCL tree (wrong pin for --arch $ARCH?)" >&2; exit 1; }
+
+# The 2.8.3 pin's vendored zlib (1.2.x era) #defines fdopen to NULL under
+# TARGET_OS_MAC -- modern SDKs define that unconditionally, so the macro then
+# mangles the SDK's own _stdio.h fdopen declaration when gzguts.h includes
+# <stdio.h> ("expected identifier or '('"). Newer vendored zlib (arm64 pin)
+# dropped the define, making this sed a no-op there. (MergeMosaic's fix,
+# adopted verbatim.)
+/usr/bin/sed -i '' -E \
+  's@#([[:space:]]*)define fdopen\(fd,mode\) NULL(.*)@/* fdopen NULL define removed: mangles the SDK _stdio.h declaration */@' \
+  src/3rdparty/zlib/zutil.h
 
 # The upstream macosx makefiles hardcode an Xcode isysroot; retarget it to the
 # runner's installed SDK for robustness.
@@ -117,9 +122,9 @@ cp -f "$LIB" "$OUT/lib/libPCL-pxi.a"
 # vendored 3rdparty static libs (cminpack, lcms, lz4, RFC6234, zlib, zstd) --
 # without them the module link is missing lcms (cmsOpenProfileFromFile, ...)
 # and other symbols pulled in transitively through PCL. Build them the same
-# way PCL's own driver does: src/3rdparty/macosx/make-3rdparty-arm64.sh cd's
-# into each src/3rdparty/<lib>/macosx/g++ and runs `make -f makefile-arm64`.
-# Each of those makefiles (confirmed by reading them at the pinned SHA) has
+# way PCL's own make-3rdparty driver does (its name/presence varies by pin):
+# cd into each src/3rdparty/<lib>/macosx/g++ and run its makefile-$ARCH.
+# Each of those makefiles (confirmed by reading them in the PCL tree) has
 # an OBJ_DIR under its own source tree AND a "post-build" step that
 # `cp -p`s the finished lib*-pxi.a into $PCLLIBDIR64 -- same pattern as the
 # core makefile above -- so exporting PCLLIBDIR64 (already done) is enough

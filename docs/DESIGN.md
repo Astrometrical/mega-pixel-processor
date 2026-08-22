@@ -181,12 +181,24 @@ distortion grids) do not bump it. Source of truth:
      PixInsight involved. The human-run manual smoke procedure is
      documented in `integration/pixinsight/README.md`.
    - **C++20 forced for the module** (not the plan's original C++17
-     constraint): PCL 2.10.4's own `Image.h` does not compile under C++17
+     constraint): PCL 2.9.x's `Image.h` does not compile under C++17
      (`pcl::Complex<float>` clip/truncate comparisons only resolve under
-     C++20 overload rules, confirmed empirically). Scoped narrowly: only
+     C++20 overload rules, confirmed empirically against the installed
+     1.9.4 SDK's 2.9.4 headers; the pinned 2.8.3 headers do compile as
+     C++17, but the macOS-arm64 leg builds from the 2.10.x arm64 pin, so
+     C++20 is kept uniform per-pin). Scoped narrowly: only
      `integration/pixinsight/module/`'s translation units build as C++20;
      `integration/pixinsight/host/` (the PCL-free static lib) remains
      C++17-clean, gated by its own CMake build.
+   - **Compatibility policy — PixInsight >= 1.9.0** (adopted from
+     MergeMosaic after its 1.9.3 field report "Unsupported API version 187
+     (expected <= 186)"): the PCL static lib bakes `PCL_API_Version` into
+     the module as its declared core-API floor, so the module is built
+     against the PCL matching the OLDEST supported core — PCL 2.8.3 / API
+     0x0182 for all x64 targets, with a separate macOS-arm64 pin (PCL
+     2.10.4 / 0x0187; pre-2.10.3 PCL cannot compile for arm64, and every
+     arm64 core is >= 1.9.4). Single source of truth + hard build gates:
+     `integration/pixinsight/ci/pcl-pin.env`.
    - **v1 defers PI-abort wiring**: PixInsight's abort mechanism is not
      wired to a mid-write `Cancel` in v1. `Close()` on a still-open write
      session sends `Cancel` and *blocks* until the worker replies (a wedged

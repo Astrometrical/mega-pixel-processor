@@ -43,13 +43,24 @@ to its own binary (via `dladdr` on POSIX / `GetModuleFileNameW` on Windows,
 the same pattern MergeMosaic's `mmm-pxm` module uses), not linked into the
 `.so` at all.
 
+Supported PixInsight versions: **1.9.0 and newer**. The module's declared
+core-API floor is baked in from the PCL revision it links (see
+`ci/pcl-pin.env`'s compatibility policy): all x64 targets build against
+PCL 2.8.3 / API 0x0182, which every 1.9.x core accepts; the macOS arm64
+build serves 1.9.4+ (the first arm64-capable core) from its own PCL 2.10.4
+pin, and 1.9.0–1.9.3 macOS users (x64 cores, Rosetta on Apple Silicon) are
+served by the macos-x64 build.
+
 Note the C++ standard split: the host library (`host/`) is gated as C++17 by
 its own CMake build (`-Wall -Wextra -Werror`, zero warnings). The module
-(`module/`) is compiled as **C++20**, not C++17, purely because PCL 2.10.4's
-own `Image.h` fails to compile under C++17 (`pcl::Complex<float>`
-clip/truncate comparisons only resolve under C++20 overload rules — verified
-empirically building this module). The module's makefile documents this;
-`host/`'s CMake build is unaffected.
+(`module/`) is compiled as **C++20**, not C++17, because PCL 2.9.x's
+`Image.h` fails to compile under C++17 (`pcl::Complex<float>` clip/truncate
+comparisons only resolve under C++20 overload rules — verified empirically
+against the installed 1.9.4 SDK's 2.9.4 headers). The pinned 2.8.3 headers
+do compile as C++17, but the macOS-arm64 leg builds from the 2.10.x arm64
+pin, so the module stays C++20 uniformly rather than varying the standard
+per pin. The module's makefile documents this; `host/`'s CMake build is
+unaffected.
 
 ## Sample-format mapping
 
@@ -76,12 +87,16 @@ Dependencies:
 
 - PCL public headers, `/opt/PixInsight/include` (override with
   `PCLINCDIR=...`).
-- `libPCL-pxi.a`, built from PCL source. This repo does not build PCL
-  itself — build it once following MergeMosaic's `ci/build-pcl.sh` pattern
-  (`~/dev/MergeMosaic/integration/pixinsight/ci/build-pcl.sh`; this repo's
-  own copy of that script lands in Task 6 of the implementation plan).
-  Point `PCLLIBDIR` at the resulting `lib/` directory (default
-  `$HOME/.local/pcl-build/lib`, which is where the script above places it).
+- `libPCL-pxi.a`, built from the pinned PCL source — build it once with
+  this repo's own script:
+  `bash integration/pixinsight/ci/build-pcl.sh --out $HOME/.local/pcl-build-0182`
+  (fetches `ci/pcl-pin.env`'s pinned PCL 2.8.3 and hard-gates its
+  `PCL_API_Version`). Point `PCLINCDIR`/`PCLLIBDIR` at the resulting
+  `include/` and `lib/` directories (defaults:
+  `$HOME/.local/pcl-build-0182/{include,lib}`, matching the pin's 0x0182
+  API version — see `ci/pcl-pin.env`'s compatibility policy; do **not**
+  build against a locally installed PixInsight's bundled headers, whose
+  newer `PCL_API_Version` would silently raise the module's core floor).
 - A Rust toolchain (`cargo`) to build `mpp-ipc-worker`.
 
 ```sh
@@ -89,8 +104,8 @@ Dependencies:
 cargo build --release -p mpp-ipc-worker
 
 # 2. Build the module (Linux; see makefile-x64 for the macOS branch).
-#    PCLINCDIR/PCLLIBDIR default to /opt/PixInsight/include and
-#    $HOME/.local/pcl-build/lib respectively; override if yours differ.
+#    PCLINCDIR/PCLLIBDIR default to $HOME/.local/pcl-build-0182/include
+#    and $HOME/.local/pcl-build-0182/lib; override if yours differ.
 make -C integration/pixinsight/module -f makefile-x64
 ```
 
@@ -191,7 +206,7 @@ true non-blocking abort is deferred to a later phase.
 This module (`module/`) and its supporting host library (`host/`) were
 designed and implemented **exclusively** from:
 
-- The public PCL headers under `/opt/PixInsight/include/pcl/` (PCL 2.10.4):
+- The public PCL headers under `/opt/PixInsight/include/pcl/` (PCL 2.9.4):
   `MetaFileFormat.h`, `FileFormatBase.h`, `FileFormatImplementation.h`,
   `FileFormatInstance.h`, `MetaModule.h`, `MetaObject.h`,
   `ImageDescription.h`, `ImageInfo.h`, `ImageOptions.h`, `ColorSpace.h`,

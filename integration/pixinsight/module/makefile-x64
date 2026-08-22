@@ -13,9 +13,13 @@
 #
 # Divergences from MMM's makefile (deliberate):
 #   * -std=c++20, same as MMM: the plan's global constraint says C++17, but
-#     PCL 2.10.4's Image.h does not compile as C++17 (pcl::Complex<float>
-#     comparisons in its clip/truncate code resolve only under C++20 rules),
-#     verified empirically here. Our own module + host sources stay
+#     PCL 2.9.x Image.h does not compile as C++17 (pcl::Complex<float>
+#     comparisons in its clip/truncate code resolve only under C++20 rules;
+#     verified empirically against the installed 1.9.4 SDK's 2.9.4 headers).
+#     The pinned 2.8.3 headers DO compile as C++17 (also verified), but the
+#     macOS-arm64 leg builds from the 2.10.x arm64 pin (see ci/pcl-pin.env),
+#     so the module stays C++20 uniformly rather than varying the language
+#     standard per pin. Our own module + host sources stay
 #     C++17-clean (the host lib is built and gated as C++17 by its CMake
 #     suite); this makefile merely compiles them in c++20 mode to satisfy
 #     the PCL headers.
@@ -26,8 +30,14 @@
 #     -I with -Wno-parentheses.)
 ######################################################################
 
-PCLINCDIR ?= /opt/PixInsight/include
-PCLLIBDIR ?= $(HOME)/.local/pcl-build/lib
+# Defaults point at a prefix produced by `ci/build-pcl.sh --out
+# $HOME/.local/pcl-build-0182` (the pinned PCL 2.8.3 / API 0x0182 -- see
+# ci/pcl-pin.env's compatibility policy). Do NOT default PCLINCDIR to a
+# locally installed PixInsight's bundled headers: their PCL_API_Version is
+# whatever that install ships (e.g. /opt/PixInsight 1.9.4 ships 0x0186) and
+# becomes the module's declared core floor, silently dropping older cores.
+PCLINCDIR ?= $(HOME)/.local/pcl-build-0182/include
+PCLLIBDIR ?= $(HOME)/.local/pcl-build-0182/lib
 HOSTDIR    = ../host
 
 OBJDIR   = x64/Release
@@ -53,7 +63,26 @@ ifeq ($(UNAME_S),Darwin)
   # symbols in a .dylib: libPCL-pxi.a pulls in AppKit + PCL's vendored
   # 3rdparty static libs transitively; -lPCL-pxi must precede the 3rdparty
   # libs it depends on.
-  PLATFORM_CXXFLAGS := -arch arm64 -mmacosx-version-min=14 -stdlib=libc++ \
+  # MPP_MACOS_ARCH selects the macOS slice: arm64 (default; PixInsight
+  # 1.9.4+ native cores) or x64 (Intel Macs, plus ALL 1.9.0-1.9.3 macOS
+  # cores -- pre-1.9.4 PixInsight is x64-only on macOS, running under
+  # Rosetta on Apple Silicon, and an x64 core cannot load an arm64 dylib).
+  # Arch flags mirror the pinned PCL's own macosx makefiles: x64 adds
+  # -msse4.2 and targets macOS 12 (the 1.9.0-era envelope per PCL 2.8.3's
+  # makefile-x64, and older Intel machines are exactly the audience); arm64
+  # targets macOS 14 (per the arm64 pin's makefile-arm64).
+  MPP_MACOS_ARCH ?= arm64
+  ifeq ($(MPP_MACOS_ARCH),x64)
+    MACOS_ARCH_FLAGS := -arch x86_64 -mmacosx-version-min=12 -msse4.2
+  else
+    MACOS_ARCH_FLAGS := -arch arm64 -mmacosx-version-min=14
+  endif
+  # The arch/min-version flags must also reach the LINK step (the dylib's
+  # LC_BUILD_VERSION minos is stamped at link time; without it the linker
+  # defaults to the host/SDK, silently raising the shipped minimum macOS).
+  # -msse4.2 is compile-only and harmless at link.
+  SHARED_FLAGS += $(MACOS_ARCH_FLAGS)
+  PLATFORM_CXXFLAGS := $(MACOS_ARCH_FLAGS) -stdlib=libc++ \
                         -D__PCL_MACOSX
   PLATFORM_LIBS := -framework AppKit -lpthread -lPCL-pxi \
                     -llz4-pxi -lzstd-pxi -lzlib-pxi -lRFC6234-pxi \

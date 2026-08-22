@@ -2,15 +2,13 @@
 # linked against, against the pin's PCL_API_VERSION_HEX in pcl-pin.env.
 #   check-pcl-api-version.ps1 -PclInc <dir>
 #
-# Asymmetric, not equality (see build-module-linux.sh's matching gate for
-# the full rationale, mirrored here): PCL_API_Version becomes the module's
-# declared API-version floor, so the DANGEROUS direction is the local
-# header claiming something HIGHER than the pin (the module would silently
-# lock out cores between the two versions). A local value LOWER than the
-# pin is comparatively safe -- a locally installed PixInsight app's bundled
-# headers can legitimately lag the pinned GitLab checkout's tag -- and only
-# warrants a loud warning, not a failure. Failing to read a PCL_API_Version
-# at all is a hard failure either way, never a silent skip.
+# Strict equality (see build-module-linux.sh's matching gate for the full
+# rationale, mirrored here): PCL_API_Version becomes the module's declared
+# API-version floor. HIGHER than the pin silently locks out cores between
+# the two versions; LOWER means linking headers older than the pin actually
+# tested. Either direction is a misconfigured -PclInc -- point it at a
+# prefix built from the pin. Failing to read a PCL_API_Version at all is
+# likewise a hard failure, never a silent skip.
 #
 # Split out into its own script (called as its own module.yml workflow
 # step, not inlined inside build-module-windows.ps1) so the windows job can
@@ -42,10 +40,7 @@ $actualHex = $m.Groups[1].Value
 $actualDec = [Convert]::ToInt32($actualHex, 16)
 $pinnedDec = [Convert]::ToInt32($apiWant, 16)
 
-if ($actualDec -gt $pinnedDec) {
-  throw "PCL_API_Version at $PclInc is 0x$actualHex, higher than the pinned 0x$apiWant. This module would declare a higher API-version floor than intended, silently locking out cores between the two versions. Update PCL_API_VERSION_HEX in pcl-pin.env only deliberately, after re-verifying against the pinned checkout."
-} elseif ($actualDec -lt $pinnedDec) {
-  Write-Warning "PCL_API_Version at $PclInc is 0x$actualHex, lower than the pinned 0x$apiWant -- the locally installed headers likely lag the pinned GitLab checkout's tag. Continuing (the built module will declare whichever floor these headers actually carry; a manual PixInsight load/save smoke test settles which one)."
-} else {
-  Write-Host "PCL_API_Version confirmed 0x$apiWant at $apiHdr"
+if ($actualDec -ne $pinnedDec) {
+  throw "PCL_API_Version at $PclInc is 0x$actualHex, but the pin (pcl-pin.env) requires exactly 0x$apiWant. The module's declared core-API floor comes from these headers; point -PclInc at a prefix built from the pin. Update PCL_API_VERSION_HEX only deliberately -- raising it drops older cores."
 }
+Write-Host "PCL_API_Version confirmed 0x$apiWant at $apiHdr"

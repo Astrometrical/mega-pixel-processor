@@ -4,8 +4,9 @@
 
 This document **quotes and closely paraphrases declarations and documentation
 comments from the public headers of the PixInsight Class Library (PCL),
-version 2.10.4** (header banner: "PCL 2.10.4", files released
-2026-06-21T15:44:54Z). Those headers are:
+version 2.9.4** (header banner: "PCL 2.9.4", files released
+2025-03-31T15:40:28Z — the SDK bundled with the installed PixInsight 1.9.4).
+Those headers are:
 
 **Copyright (c) 2003-2026 Pleiades Astrophoto S.L. All Rights Reserved.**
 
@@ -40,7 +41,19 @@ did NOT re-read those files; facts below marked "(MMM ref)" are carried from
 MMM's already-written reference document, not re-derived from PCL sources.
 
 All `file:line` citations below refer to `/opt/PixInsight/include/pcl/<file>`
-at PCL 2.10.4 unless another path is given.
+at PCL 2.9.4 unless another path is given.
+
+> **Build-pin caveat:** CI builds the module against PCL **2.8.3**
+> (PixInsight 1.9.0), pinned in `ci/pcl-pin.env`, so the module's declared
+> `PCL_API_Version` (0x0182) admits every 1.9.x core — see the policy
+> comment in the pin file. (Exception: the macos-arm64 leg builds against
+> 2.10.4, the first arm64-capable PCL; every arm64 core is ≥ 1.9.4.) This
+> document's file+line citations refer to the PCL 2.9.4 headers installed
+> at `/opt/PixInsight/include`; the entry-point/ABI facts below are stable
+> across that span — the module compiles and links warning-free against the
+> pinned 2.8.3 headers using exactly this surface — but any *new* API must
+> be verified against the pinned 2.8.3 headers before use in the module,
+> since 2.8.3 is what most targets compile against.
 
 ---
 
@@ -513,8 +526,9 @@ guarantee about the core's exact behavior — hence §7.3.
 
 ## 6. Build/link facts Task 4 needs (from MMM, our code — verified working)
 
-- Link `libPCL-pxi.a` (`PCLLIBDIR ?= $(HOME)/.local/pcl-build/lib`), headers
-  `PCLINCDIR ?= /opt/PixInsight/include`; Linux flags include
+- Link `libPCL-pxi.a` (`PCLLIBDIR ?= $(HOME)/.local/pcl-build-0182/lib`), headers
+  `PCLINCDIR ?= $(HOME)/.local/pcl-build-0182/include` (a `ci/build-pcl.sh
+  --out` prefix at the pin); Linux flags include
   `-D__PCL_LINUX -D__PCL_AVX2 -D__PCL_FMA -mavx2 -mfma -m64
   -fnon-call-exceptions -minline-all-stringops -fPIC -pthread`, link
   `-shared ... -lPCL-pxi -lpthread -lrt` (MMM `makefile-x64:14-77`).
