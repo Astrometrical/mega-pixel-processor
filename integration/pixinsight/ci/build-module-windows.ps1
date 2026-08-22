@@ -45,6 +45,26 @@ $build = Join-Path $moduleDir 'win-build'
 $PclInc = (Resolve-Path $PclInc).Path
 $PclLib = (Resolve-Path $PclLib).Path
 
+# PCL API-version gate: build-pcl-windows.ps1 hard-gates a *freshly built*
+# PCL, but that never runs on this prebuilt-PCL path. Re-verify against
+# whichever -PclInc is actually about to be linked against, so this can't
+# silently pass -- a missing header is a hard failure, not a skip. See
+# build-module-linux.sh's matching step for the full rationale.
+$pin = @{}
+Get-Content (Join-Path $PSScriptRoot 'pcl-pin.env') | ForEach-Object {
+  if ($_ -match '^\s*([A-Z_]+)="?([^"]*)"?\s*$') { $pin[$Matches[1]] = $Matches[2] }
+}
+$apiWant = $pin['PCL_API_VERSION_HEX']
+if (-not $apiWant) { throw 'PCL_API_VERSION_HEX not found in pcl-pin.env' }
+$apiHdr = Join-Path $PclInc 'pcl/api/APIInterface.h'
+if (-not (Test-Path $apiHdr)) { throw "cannot verify PCL_API_Version -- $apiHdr not found (PclInc misconfigured?)" }
+$apiHdrText = Get-Content $apiHdr -Raw
+if ($apiHdrText -notmatch "(?m)^#define\s+PCL_API_Version\s+0x$apiWant\s*$") {
+  $got = ($apiHdrText | Select-String 'define PCL_API_Version.*').Matches.Value
+  throw "PCL_API_Version at $PclInc != 0x$apiWant (got: $got). This module would declare a wrong API-version floor; update PCL_API_VERSION_HEX in pcl-pin.env only deliberately, after re-verifying against the actual headers."
+}
+Write-Host "PCL_API_Version confirmed 0x$apiWant at $apiHdr"
+
 # Configure (x64 + toolset v143, pinned so the module's ABI can't drift if
 # the runner image advances) and build Release. See the KNOWN GAP note
 # above: this cmake project does not exist in mpp's module/ yet.

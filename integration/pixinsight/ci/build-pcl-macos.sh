@@ -9,11 +9,10 @@
 # Adapted from MergeMosaic's integration/pixinsight/ci/build-pcl-macos.sh
 # (no mmm/mpp-specific naming in this file -- it only builds PCL + its
 # vendored 3rdparty archives). CANNOT be run/verified on this machine
-# (Linux). Divergence from MergeMosaic's current version: the HARD
-# PCL_API_Version gate is replaced with a soft warning -- see build-pcl.sh's
-# header comment for why (mpp's pcl-pin.env deliberately omits
-# PCL_API_VERSION_HEX, an unverified value would hard-fail every CI run).
-# Everything else (arm64 makefile generation, SDK isysroot retargeting, the
+# (Linux). Includes MergeMosaic's HARD PCL_API_Version gate against
+# PCL_API_VERSION_HEX from pcl-pin.env (0186, verified empirically -- see
+# pcl-pin.env's provenance comment). Everything else (arm64 makefile
+# generation, SDK isysroot retargeting, the
 # 7-archive build for the six 3rdparty libs the mpp module's Darwin link
 # line also needs -- see module/makefile-x64's PLATFORM_LIBS for Darwin) is
 # unchanged, since the mpp module's macOS build has the exact same
@@ -57,6 +56,15 @@ if [ -f "$VER_CPP" ]; then
   check_ver_fn Minor   "$PCL_VER_MINOR"   || echo "warning: Version.cpp minor != $PCL_VER_MINOR" >&2
   check_ver_fn Release "$PCL_VER_RELEASE" || echo "warning: Version.cpp release != $PCL_VER_RELEASE" >&2
 fi
+
+# HARD gate on the API version compiled into the module (mirrors build-pcl.sh).
+API_HDR="include/pcl/api/APIInterface.h"
+grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX}[[:space:]]*$" "$API_HDR" || {
+  echo "ERROR: PCL_API_Version at this pin != 0x${PCL_API_VERSION_HEX}:" >&2
+  grep 'define PCL_API_Version' "$API_HDR" >&2 || echo "  (no PCL_API_Version found in $API_HDR)" >&2
+  echo "Raising it drops older cores; update PCL_API_VERSION_HEX in pcl-pin.env only deliberately." >&2
+  exit 1
+}
 
 # Pre-1.9.4 PCL trees ship x64-only macOS makefiles (upstream added arm64
 # variants in PCL 2.10.3). The x64->arm64 delta in upstream's generated

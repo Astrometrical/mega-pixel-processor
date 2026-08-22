@@ -30,15 +30,34 @@ done
 
 MODULE_DIR="$REPO_ROOT/integration/pixinsight/module"
 HOST_DIR="$REPO_ROOT/integration/pixinsight/host"
+CI_DIR="$REPO_ROOT/integration/pixinsight/ci"
 
 MAKE_ARGS=()
 [ -n "$PCL_INC" ] && MAKE_ARGS+=("PCLINCDIR=$PCL_INC")
 [ -n "$PCL_LIB" ] && MAKE_ARGS+=("PCLLIBDIR=$PCL_LIB")
 
-echo "=== [1/6] make clean ==="
+echo "=== [1/7] PCL API-version gate ==="
+# See build-module-linux.sh's matching step for the full rationale: the
+# build-pcl* hard gate never runs on this prebuilt-PCL path, so re-verify
+# here against whichever include dir is actually about to be linked
+# against -- a missing header is a hard failure, not a skip.
+# shellcheck source=/dev/null
+source "$CI_DIR/pcl-pin.env"
+EFFECTIVE_PCL_INC="${PCL_INC:-/opt/PixInsight/include}"
+API_HDR="$EFFECTIVE_PCL_INC/pcl/api/APIInterface.h"
+[ -f "$API_HDR" ] || { echo "ERROR: cannot verify PCL_API_Version -- $API_HDR not found (PCLINCDIR misconfigured?)" >&2; exit 1; }
+grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX}[[:space:]]*$" "$API_HDR" || {
+  echo "ERROR: PCL_API_Version at $EFFECTIVE_PCL_INC != 0x${PCL_API_VERSION_HEX}:" >&2
+  grep 'define PCL_API_Version' "$API_HDR" >&2 || echo "  (no PCL_API_Version found in $API_HDR)" >&2
+  echo "This module would declare a wrong API-version floor. Update PCL_API_VERSION_HEX in pcl-pin.env only deliberately, after re-verifying against the actual headers." >&2
+  exit 1
+}
+echo "PCL_API_Version confirmed 0x${PCL_API_VERSION_HEX} at $API_HDR"
+
+echo "=== [2/7] make clean ==="
 make -C "$MODULE_DIR" clean
 
-echo "=== [2/6] build BigTIFF-pxm.dylib ==="
+echo "=== [3/7] build BigTIFF-pxm.dylib ==="
 build_log="$(mktemp)"
 trap 'rm -f "$build_log"' EXIT
 make -C "$MODULE_DIR" "${MAKE_ARGS[@]}" 2>&1 | tee "$build_log"
@@ -52,7 +71,7 @@ fi
 DYLIB="$MODULE_DIR/BigTIFF-pxm.dylib"
 [ -f "$DYLIB" ] || { echo "BigTIFF-pxm.dylib not built" >&2; exit 1; }
 
-echo "=== [3/6] nm gates ==="
+echo "=== [4/7] nm gates ==="
 # Host objects must be linked in: any undefined mpp:: symbol means they
 # weren't (MMM's build-module-macos.sh phrasing, mechanically renamed).
 if nm -u "$DYLIB" | grep -E ' _?_ZN3mpp' ; then
@@ -70,18 +89,18 @@ done
 echo "PCL entry points exported:"
 echo "$ENTRY_POINTS"
 
-echo "=== [4/6] build mpp-ipc-worker ==="
+echo "=== [5/7] build mpp-ipc-worker ==="
 ( cd "$REPO_ROOT" && cargo build --release -p mpp-ipc-worker )
 WORKER="$REPO_ROOT/target/release/mpp-ipc-worker"
 [ -f "$WORKER" ] || { echo "mpp-ipc-worker not built" >&2; exit 1; }
 
-echo "=== [5/6] host CTest golden suite ==="
+echo "=== [6/7] host CTest golden suite ==="
 CTEST_BUILD="$HOST_DIR/ci-build"
 cmake -S "$HOST_DIR" -B "$CTEST_BUILD"
 cmake --build "$CTEST_BUILD"
 MPP_WORKER_EXE="$WORKER" ctest --test-dir "$CTEST_BUILD" --output-on-failure
 
-echo "=== [6/6] stage artifacts ==="
+echo "=== [7/7] stage artifacts ==="
 DOC_SRC="$REPO_ROOT/integration/pixinsight"
 [ -f "$DOC_SRC/README.md" ] || { echo "module documentation missing at $DOC_SRC/README.md" >&2; exit 1; }
 [ -f "$DOC_SRC/LICENSE-PCL" ] || { echo "PCL license text missing at $DOC_SRC/LICENSE-PCL" >&2; exit 1; }

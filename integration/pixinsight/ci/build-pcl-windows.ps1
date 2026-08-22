@@ -6,11 +6,10 @@
 # Adapted from MergeMosaic's integration/pixinsight/ci/build-pcl-windows.ps1
 # (no mmm/mpp-specific naming in this file -- it only builds PCL + its
 # vendored 3rdparty archives; win/PCL.vcxproj is copied byte-identical).
-# CANNOT be run/verified on this machine (Linux, no MSVC). Divergence from
-# MergeMosaic's current version: the HARD PCL_API_Version gate is replaced
-# with a soft warning -- see build-pcl.sh's header comment for why (mpp's
-# pcl-pin.env deliberately omits PCL_API_VERSION_HEX; an unverified value
-# would hard-fail every CI run instead of just this platform's).
+# CANNOT be run/verified on this machine (Linux, no MSVC). Includes
+# MergeMosaic's HARD PCL_API_Version gate against PCL_API_VERSION_HEX from
+# pcl-pin.env (0186, verified empirically -- see pcl-pin.env's provenance
+# comment).
 #
 # Known gap (flagged, not fixed here): mpp's module/ has no Windows/MSVC
 # build system yet (only makefile-x64, GNU-make + g++/clang++ for
@@ -64,6 +63,17 @@ try {
         Write-Warning "Version.cpp $fn != $want (SHA is the hard gate; continuing)"
       }
     }
+  }
+
+  # HARD gate on the API version compiled into the module (mirrors build-pcl.sh):
+  # PCL_API_Version becomes the module's declared API requirement, and cores
+  # older than it refuse to load the module.
+  $apiWant = $pin['PCL_API_VERSION_HEX']
+  if (-not $apiWant) { throw 'PCL_API_VERSION_HEX not found in pcl-pin.env' }
+  $apiHdr = Get-Content 'include/pcl/api/APIInterface.h' -Raw
+  if ($apiHdr -notmatch "(?m)^#define\s+PCL_API_Version\s+0x$apiWant\s*$") {
+    $got = ($apiHdr | Select-String 'define PCL_API_Version.*').Matches.Value
+    throw "PCL_API_Version at this pin != 0x$apiWant (got: $got). Raising it drops older cores; update PCL_API_VERSION_HEX in pcl-pin.env only deliberately."
   }
 
   # Drop the pinned core project into the (upstream-absent) windows build dir.

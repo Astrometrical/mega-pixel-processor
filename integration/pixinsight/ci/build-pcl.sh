@@ -6,16 +6,11 @@
 # file has no mmm/mpp-specific naming -- it only builds PCL itself -- so the
 # adaptation is the pin values in pcl-pin.env, not this script's body).
 #
-# Divergence from MergeMosaic's *current* build-pcl.sh (deliberate): that
-# version adds a HARD gate asserting the pinned tree's compiled
-# PCL_API_Version equals a PCL_API_VERSION_HEX value in pcl-pin.env. mpp's
-# pcl-pin.env intentionally omits that field (not independently verified
-# against this SHA's actual header without a network fetch of the pinned
-# commit, which this task didn't run) -- a wrong hard-coded value would hard
-# **fail every CI run**. This script keeps only the softer Version.cpp
-# major/minor/release check (warn, don't fail) that the *original*
-# MergeMosaic build-pcl.sh (pre-API-gate) used; SHA pinning is still the
-# authoritative, hard-gated identity check below.
+# Includes MergeMosaic's HARD gate asserting the pinned tree's compiled
+# PCL_API_Version equals PCL_API_VERSION_HEX from pcl-pin.env (0186,
+# verified empirically against this dev machine's installed PixInsight 1.9.4
+# headers -- see pcl-pin.env's provenance comment). Raising it drops older
+# cores; update PCL_API_VERSION_HEX only deliberately, after re-verifying.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,6 +54,18 @@ if [ -f "$VER_CPP" ]; then
   check_ver_fn Minor   "$PCL_VER_MINOR"   || echo "warning: Version.cpp minor != $PCL_VER_MINOR (source may have shifted)" >&2
   check_ver_fn Release "$PCL_VER_RELEASE" || echo "warning: Version.cpp release != $PCL_VER_RELEASE (source may have shifted)" >&2
 fi
+
+# HARD gate on the API version compiled into the module. PCL_API_Version
+# becomes the module's declared API requirement; cores older than it refuse
+# to load the module, so a pin bump that raises it silently drops support
+# for older PixInsight versions.
+API_HDR="include/pcl/api/APIInterface.h"
+grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX}[[:space:]]*$" "$API_HDR" || {
+  echo "ERROR: PCL_API_Version at this pin != 0x${PCL_API_VERSION_HEX}:" >&2
+  grep 'define PCL_API_Version' "$API_HDR" >&2 || echo "  (no PCL_API_Version found in $API_HDR)" >&2
+  echo "Raising it drops older cores; update PCL_API_VERSION_HEX in pcl-pin.env only deliberately." >&2
+  exit 1
+}
 
 # Build only the static PCL library (the mpp module links -lPCL-pxi and
 # nothing else on Linux -- see module/makefile-x64's Linux PLATFORM_LIBS,
