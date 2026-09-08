@@ -5,6 +5,7 @@
 //! stream pixel data out in constant memory.
 
 pub mod tiff;
+pub mod tiff_read;
 pub mod xisf;
 
 /// A planar f32 image source the streaming writers can drain row by row.
