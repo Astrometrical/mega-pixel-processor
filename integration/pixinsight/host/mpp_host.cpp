@@ -65,6 +65,42 @@ std::string GenerateShmName() {
   return "/mpp-" + std::to_string(pid) + "-" + std::to_string(id);
 }
 
+// ReadSessionConfig's analog of ValidateConfig above: same "fail fast, zero
+// resources touched, no process spawned" discipline, before any shm segment
+// or pipe is created (see the member-initializer-list ordering in
+// ReadSession's ctor below).
+ReadSessionConfig ValidateReadConfig(const ReadSessionConfig& cfg) {
+  if (cfg.worker_exe.empty()) {
+    throw HostError("ReadSessionConfig.worker_exe is empty");
+  }
+  if (!std::filesystem::exists(cfg.worker_exe)) {
+    throw HostError("mpp-ipc-worker executable not found at \"" + cfg.worker_exe +
+                     "\" -- check the worker path / installation next to the module");
+  }
+  if (cfg.input_path.empty()) {
+    throw HostError("ReadSessionConfig.input_path is empty");
+  }
+  if (cfg.width == 0) {
+    throw HostError(
+        "ReadSessionConfig.width must be nonzero (from a prior ReadSession::Probe call) -- it "
+        "sizes the shm slots before ImageMeta arrives");
+  }
+  if (cfg.sample_bytes == 0) {
+    throw HostError("ReadSessionConfig.sample_bytes must be nonzero");
+  }
+  if (cfg.band_rows == 0) {
+    throw HostError("ReadSessionConfig.band_rows must be nonzero");
+  }
+  if (cfg.slots == 0) {
+    throw HostError("ReadSessionConfig.slots must be nonzero (>= 2 recommended)");
+  }
+  return cfg;
+}
+
+uint64_t ComputeReadSlotBytes(const ReadSessionConfig& cfg) {
+  return static_cast<uint64_t>(cfg.band_rows) * cfg.width * cfg.sample_bytes;
+}
+
 }  // namespace
 
 WriteSession::WriteSession(const WriteSessionConfig& cfg)
@@ -348,6 +384,262 @@ int WriteSession::ReapBlocking() {
 }
 
 void WriteSession::KillAndReapBestEffort() noexcept {
+  if (!spawned_ || reaped_) return;
+  os_kill_process(pid_);
+  reaped_ = true;
+  os_wait_process(pid_);  // discard exit code; best-effort reap only
+}
+
+// ===========================================================================
+// ReadSession -- the read-direction inversion of WriteSession above (see
+// mpp_host.h's class doc comment): the worker fills shm slots and requests
+// them via ReadBand, this class fills nothing and only acks. Every
+// process-lifecycle/frame-IO helper below is a deliberate near-duplicate of
+// WriteSession's own (ReadFrameOrThrow, WriteFramed, ReapBlocking,
+// KillAndReapBestEffort) rather than a shared base class -- the two classes'
+// constructors and terminal-state bookkeeping differ enough (ReadSession has
+// no PushBand/Finish/Cancel surface at all) that sharing would cost more
+// clarity than the few duplicated lines save, matching the plan's choice to
+// keep WriteSession and ReadSession as separate top-level classes.
+
+ReadSession::ReadSession(const ReadSessionConfig& cfg)
+    : cfg_(ValidateReadConfig(cfg)),
+      slot_bytes_(ComputeReadSlotBytes(cfg_)),
+      shm_(ShmSegment::create(GenerateShmName(), slot_bytes_ * cfg_.slots)) {
+  try {
+    pid_ = os_spawn(cfg_.worker_exe, in_pipe_.read_end, out_pipe_.write_end,
+                     {in_pipe_.write_end, out_pipe_.read_end});
+  } catch (const std::exception& e) {
+    throw HostError("failed to spawn mpp-ipc-worker (\"" + cfg_.worker_exe + "\"): " + e.what());
+  }
+  spawned_ = true;
+  in_pipe_.close_read();
+  out_pipe_.close_write();
+
+  try {
+    // Geometry/bit_depth fields the worker will override via ImageMeta once
+    // it opens the file (see ReadSessionConfig's doc comment) -- only
+    // output_path/shm_name/slot_bytes/slots/mode are load-bearing for a read
+    // session's Init.
+    InitMessage init;
+    init.protocol_version = kProtocolVersion;
+    init.worker_version = kExpectedWorkerVersion;
+    init.output_path = cfg_.input_path;
+    init.width = cfg_.width;
+    init.height = 0;
+    init.channels = cfg_.channels;
+    init.bit_depth = "";
+    init.shm_name = shm_.name();
+    init.slot_bytes = slot_bytes_;
+    init.slots = cfg_.slots;
+    init.mode = "read";
+    WriteFramed(encode_init(init));
+
+    WorkerFrame f = ReadFrameOrThrow();
+    if (f.tag == WorkerTag::Error) {
+      finished_ = true;
+      ReapBlocking();
+      throw HostError("worker reported error: " + f.error.message);
+    }
+    if (f.tag != WorkerTag::ImageMeta) {
+      finished_ = true;
+      KillAndReapBestEffort();
+      throw HostError("expected ImageMeta (tag " +
+                       std::to_string(static_cast<int>(WorkerTag::ImageMeta)) +
+                       ") as the first reply frame in a read session, got tag " +
+                       std::to_string(static_cast<int>(f.tag)));
+    }
+    meta_ = f.image_meta;
+  } catch (...) {
+    // The worker is alive but not necessarily past this point cleanly;
+    // killing it here (rather than leaving it to the destructor, which
+    // never runs for a constructor that exits via exception) is what keeps
+    // a failed ReadSession construction from leaking a process -- mirrors
+    // WriteSession's constructor exactly.
+    if (!finished_) {
+      KillAndReapBestEffort();
+    }
+    throw;
+  }
+}
+
+ReadSession::~ReadSession() {
+  if (!finished_) {
+    KillAndReapBestEffort();
+  }
+  // in_pipe_/out_pipe_ (Pipe) and shm_ (ShmSegment) release themselves via
+  // their own destructors, which run automatically after this body returns.
+}
+
+void ReadSession::ReadAll(
+    const std::function<void(uint32_t channel, uint64_t start_row, uint32_t rows,
+                              const void* samples)>& sink) {
+  if (finished_) {
+    throw HostError("ReadAll called after the session already reached a terminal state");
+  }
+
+  for (;;) {
+    WorkerFrame f = ReadFrameOrThrow();
+    switch (f.tag) {
+      case WorkerTag::ReadBand: {
+        const BandHeader& hdr = f.read_band;
+        if (hdr.slot >= cfg_.slots) {
+          finished_ = true;
+          KillAndReapBestEffort();
+          throw HostError("worker sent ReadBand for slot " + std::to_string(hdr.slot) +
+                           ", out of range (slots=" + std::to_string(cfg_.slots) + ")");
+        }
+        const uint64_t byte_len =
+            static_cast<uint64_t>(hdr.rows) * meta_.width * cfg_.sample_bytes;
+        if (byte_len > slot_bytes_) {
+          finished_ = true;
+          KillAndReapBestEffort();
+          throw HostError("worker's ReadBand channel " + std::to_string(hdr.channel) +
+                           " start_row " + std::to_string(hdr.start_row) + " rows " +
+                           std::to_string(hdr.rows) + " needs " + std::to_string(byte_len) +
+                           " bytes, exceeds slot_bytes " + std::to_string(slot_bytes_));
+        }
+
+        const uint8_t* src = shm_.base() + static_cast<uint64_t>(hdr.slot) * slot_bytes_;
+        if (sink) {
+          sink(hdr.channel, hdr.start_row, hdr.rows, src);
+        }
+
+        WriteFramed(encode_read_band_ack(hdr.slot));
+        break;
+      }
+      case WorkerTag::Progress:
+        break;  // no read-mode Progress is emitted today, but tolerate/drop per §7.7's spirit
+      case WorkerTag::Done: {
+        finished_ = true;
+        int code = ReapBlocking();
+        if (code != 0) {
+          throw HostError("worker exited with code " + std::to_string(code) +
+                           " after sending Done (the exit code is the authoritative completion "
+                           "signal, docs/pi-protocol.md §4)");
+        }
+        return;
+      }
+      case WorkerTag::Error:
+        finished_ = true;
+        ReapBlocking();
+        throw HostError("worker reported error: " + f.error.message);
+      case WorkerTag::BandAck:
+      case WorkerTag::Invalid:
+      default:
+        finished_ = true;
+        KillAndReapBestEffort();
+        throw HostError("worker sent an unexpected frame (tag " +
+                         std::to_string(static_cast<int>(f.tag)) +
+                         ") during ReadAll of a read session");
+    }
+  }
+}
+
+ImageMeta ReadSession::Probe(const std::string& worker_exe, const std::string& input_path) {
+  if (worker_exe.empty()) {
+    throw HostError("ReadSession::Probe: worker_exe is empty");
+  }
+  if (!std::filesystem::exists(worker_exe)) {
+    throw HostError("mpp-ipc-worker executable not found at \"" + worker_exe +
+                     "\" -- check the worker path / installation next to the module");
+  }
+
+  Pipe in_pipe;
+  Pipe out_pipe;
+  os_pid pid = os_invalid_pid;
+  try {
+    pid = os_spawn(worker_exe, in_pipe.read_end, out_pipe.write_end,
+                   {in_pipe.write_end, out_pipe.read_end}, {"--probe", input_path});
+  } catch (const std::exception& e) {
+    throw HostError("failed to spawn mpp-ipc-worker --probe (\"" + worker_exe + "\"): " +
+                     e.what());
+  }
+  in_pipe.close_read();
+  out_pipe.close_write();
+  // The `--probe` CLI entry never touches stdin (main.rs checks argv before
+  // the stdin handshake); close our write end immediately so it doesn't
+  // matter either way.
+  in_pipe.close_write();
+
+  std::string output;
+  bool reaped = false;
+  int exit_code = 0;
+  try {
+    uint8_t buf[4096];
+    for (;;) {
+      long n = os_read(out_pipe.read_end, buf, sizeof(buf));
+      if (n < 0) {
+        throw HostError("mpp-ipc-worker --probe: reading stdout failed");
+      }
+      if (n == 0) break;  // EOF
+      output.append(reinterpret_cast<char*>(buf), static_cast<size_t>(n));
+    }
+    out_pipe.close_read();
+    reaped = true;
+    exit_code = os_wait_process(pid);
+  } catch (...) {
+    if (!reaped) {
+      os_kill_process(pid);
+      os_wait_process(pid);
+    }
+    throw;
+  }
+
+  if (exit_code != 0) {
+    throw HostError("mpp-ipc-worker --probe \"" + input_path + "\" exited with code " +
+                     std::to_string(exit_code));
+  }
+  try {
+    return ParseImageMeta(output);
+  } catch (const std::exception& e) {
+    throw HostError(std::string("mpp-ipc-worker --probe: failed to parse ImageMeta JSON output (") +
+                     e.what() + "): " + output);
+  }
+}
+
+WorkerFrame ReadSession::ReadFrameOrThrow() {
+  WorkerFrame f;
+  bool got;
+  try {
+    got = read_worker_frame(out_pipe_.read_end, f);
+  } catch (const std::exception& e) {
+    finished_ = true;
+    int code = ReapBlocking();
+    throw HostError(std::string("protocol error reading worker frame: ") + e.what() +
+                     " (worker exit code " + std::to_string(code) + ")");
+  }
+  if (!got) {
+    finished_ = true;
+    int code = ReapBlocking();
+    throw HostError(
+        "worker closed its output unexpectedly before completing the run (exit code " +
+        std::to_string(code) + ")");
+  }
+  return f;
+}
+
+void ReadSession::WriteFramed(const std::vector<uint8_t>& framed) {
+  size_t total = 0;
+  while (total < framed.size()) {
+    long w = os_write(in_pipe_.write_end, framed.data() + total, framed.size() - total);
+    if (w < 0) {
+#ifndef _WIN32
+      if (errno == EINTR) continue;
+#endif
+      throw HostError("write to worker stdin failed (the worker may have exited)");
+    }
+    total += static_cast<size_t>(w);
+  }
+}
+
+int ReadSession::ReapBlocking() {
+  if (reaped_) return 0;
+  reaped_ = true;
+  return os_wait_process(pid_);
+}
+
+void ReadSession::KillAndReapBestEffort() noexcept {
   if (!spawned_ || reaped_) return;
   os_kill_process(pid_);
   reaped_ = true;

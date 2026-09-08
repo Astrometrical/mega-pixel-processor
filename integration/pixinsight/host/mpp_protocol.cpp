@@ -134,6 +134,21 @@ std::vector<uint8_t> BandHeader::to_bytes() const {
   return buf;
 }
 
+ImageMeta ParseImageMeta(const std::string& json) {
+  auto j = nlohmann::json::parse(json);
+  ImageMeta meta;
+  // u64 fields decoded straight from JSON integers, never routed through
+  // double, matching docs/pi-protocol.md §5's "Integer width" rule (the
+  // same discipline `encode_init` follows for the host->worker direction).
+  meta.width = j.at("width").get<uint64_t>();
+  meta.height = j.at("height").get<uint64_t>();
+  meta.channels = j.at("channels").get<uint64_t>();
+  meta.alpha = j.at("alpha").get<uint64_t>();
+  meta.color_space = j.at("color_space").get<std::string>();
+  meta.bit_depth = j.at("bit_depth").get<std::string>();
+  return meta;
+}
+
 BandHeader BandHeader::from_bytes(const std::vector<uint8_t>& payload) {
   if (payload.size() != kWireLen) {
     throw std::runtime_error("BandHeader::from_bytes: expected " + std::to_string(kWireLen) +
@@ -191,6 +206,17 @@ bool read_worker_frame(os_handle h, WorkerFrame& out) {
       out.error.message = j.at("message").get<std::string>();
       break;
     }
+    case static_cast<uint8_t>(WorkerTag::ImageMeta): {
+      out.tag = WorkerTag::ImageMeta;
+      out.image_meta =
+          ParseImageMeta(std::string(payload.begin(), payload.end()));
+      break;
+    }
+    case static_cast<uint8_t>(WorkerTag::ReadBand): {
+      out.tag = WorkerTag::ReadBand;
+      out.read_band = BandHeader::from_bytes(payload);
+      break;
+    }
     default:
       throw std::runtime_error("read_worker_frame: unknown tag " + std::to_string(tag_byte));
   }
@@ -220,6 +246,7 @@ std::vector<uint8_t> encode_init(const InitMessage& init) {
   j["shm_name"] = init.shm_name;
   j["slot_bytes"] = init.slot_bytes;
   j["slots"] = init.slots;
+  j["mode"] = init.mode;
   return build_frame(static_cast<uint8_t>(HostTag::Init), j.dump());
 }
 
@@ -235,6 +262,13 @@ std::vector<uint8_t> encode_finish() {
 
 std::vector<uint8_t> encode_cancel() {
   return build_frame(static_cast<uint8_t>(HostTag::Cancel), std::string());
+}
+
+std::vector<uint8_t> encode_read_band_ack(uint32_t slot) {
+  std::vector<uint8_t> payload;
+  put_u32_le(payload, slot);
+  return build_frame(static_cast<uint8_t>(HostTag::ReadBandAck), payload.data(),
+                      static_cast<uint32_t>(payload.size()));
 }
 
 }  // namespace mpp

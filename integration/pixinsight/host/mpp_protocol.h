@@ -25,7 +25,16 @@ namespace mpp {
 /// `mpp_ipc::protocol::IPC_PROTOCOL_VERSION` (docs/pi-protocol.md §8).
 /// `InitMessage::protocol_version` is stamped with this; the worker aborts
 /// on a mismatch.
-inline constexpr uint32_t kProtocolVersion = 1;
+///
+/// Version 2 adds a **read** direction alongside the original write-only
+/// host-push protocol (`crates/mpp-ipc/src/protocol.rs`'s module docs):
+/// `InitMessage::mode` selects which way a session runs, and the worker can
+/// report `ImageMeta` (tag `kTagImageMeta`) and request bands via
+/// `kTagReadBand`, acked by the host via `kTagReadBandAck`. `docs/pi-protocol.md`
+/// itself still documents v1 only as of this change (its read-mode
+/// addendum is a later task) -- this header is kept in sync with the Rust
+/// source of truth (`crates/mpp-ipc/src/protocol.rs`) directly until then.
+inline constexpr uint32_t kProtocolVersion = 2;
 
 /// Exact release version of the `mpp-ipc-worker` binary this host library
 /// was built to drive (the worker's `CARGO_PKG_VERSION`). Stamped into
@@ -43,10 +52,14 @@ enum class HostTag : uint8_t {
   Band = 129,
   Finish = 130,
   Cancel = 131,
+  /// Acks a worker `READ_BAND` request (read-direction sessions, protocol
+  /// v2+): 4-byte `slot: u32` payload naming the slot the host has finished
+  /// consuming, now free for the worker to reuse.
+  ReadBandAck = 132,
 };
 
 /// Tags for frames the worker writes to its stdout (worker -> host).
-/// `Invalid` is never sent on the wire (real worker tags are 1-4); it
+/// `Invalid` is never sent on the wire (real worker tags are 1-6); it
 /// exists only as a safe default for a default-constructed `WorkerFrame` so
 /// an unfilled frame can never be mistaken for a real message.
 /// docs/pi-protocol.md §4.
@@ -56,7 +69,24 @@ enum class WorkerTag : uint8_t {
   Progress = 2,
   Done = 3,
   Error = 4,
+  /// The worker's authoritative geometry for a read session (protocol v2+),
+  /// sent once immediately after a `Read`-mode `Init` handshake, before any
+  /// `ReadBand` request. JSON payload, `ImageMeta`.
+  ImageMeta = 5,
+  /// The worker requests one band of pixel data (read-direction sessions,
+  /// protocol v2+): 20-byte binary payload, `BandHeader` (the same layout
+  /// as the host->worker `Band` frame, direction reversed).
+  ReadBand = 6,
 };
+
+/// Convenience byte-valued aliases for the protocol v2 tag numbers, mirroring
+/// `mpp_ipc::protocol::tag::{IMAGE_META,READ_BAND,READ_BAND_ACK}` exactly.
+/// Equivalent to `static_cast<uint8_t>(WorkerTag::ImageMeta)` etc. -- provided
+/// so callers (and this library's own golden tests) can compare a raw wire
+/// tag byte without spelling out the cast every time.
+inline constexpr uint8_t kTagImageMeta = static_cast<uint8_t>(WorkerTag::ImageMeta);
+inline constexpr uint8_t kTagReadBand = static_cast<uint8_t>(WorkerTag::ReadBand);
+inline constexpr uint8_t kTagReadBandAck = static_cast<uint8_t>(HostTag::ReadBandAck);
 
 /// Host -> worker `Init` message (tag `HostTag::Init`), sent bare (its JSON
 /// fields directly, not wrapped as `{"Init": {...}}`) as the very first
@@ -73,6 +103,14 @@ struct InitMessage {
   std::string shm_name;
   uint64_t slot_bytes = 0;
   uint32_t slots = 0;
+  /// Which direction this session runs: `"write"` (the v1 host-push flow,
+  /// the default -- matches `mpp_ipc::protocol::SessionMode`'s
+  /// `#[derive(Default)]`) or `"read"` (the v2 worker-pull flow). Always
+  /// emitted on the wire by `encode_init` (never omitted), even for a write
+  /// session, matching the Rust struct's own serialization (only
+  /// *deserializing* a v1 payload that omits the field defaults it to
+  /// `Write` -- `encode_init` never needs to produce that shape itself).
+  std::string mode = "write";
 };
 
 /// Host -> worker `Band` frame payload (tag `HostTag::Band`): names one
@@ -114,6 +152,26 @@ struct ErrorMessage {
   std::string message;
 };
 
+/// Worker -> host `ImageMeta` message (tag `WorkerTag::ImageMeta`): the
+/// worker's authoritative geometry for a read session, derived from the
+/// image it opened rather than anything the host asserted in `Init`.
+/// Mirrors `mpp_ipc::protocol::ImageMeta` field-for-field.
+struct ImageMeta {
+  uint64_t width = 0;
+  uint64_t height = 0;
+  uint64_t channels = 0;  // total channel count, including alpha
+  uint64_t alpha = 0;     // 1 if `channels` includes an alpha channel, 0 otherwise
+  std::string color_space;  // "gray" | "rgb"
+  std::string bit_depth;    // "u8" | "u16" | "u32" | "f32" | "f64"
+};
+
+/// Parses an `ImageMeta` JSON payload (as sent worker->host on tag
+/// `WorkerTag::ImageMeta`, or printed standalone by `mpp-ipc-worker --probe`).
+/// Throws `std::runtime_error` (via nlohmann's own exceptions, or an
+/// explicit throw for a missing/mistyped field) if `json` does not parse or
+/// is missing a required field.
+ImageMeta ParseImageMeta(const std::string& json);
+
 /// A decoded worker->host frame (binary or JSON), tagged-union style: only
 /// the field(s) matching `tag` are meaningful.
 struct WorkerFrame {
@@ -123,6 +181,8 @@ struct WorkerFrame {
   ProgressMessage progress{};    // valid iff tag == Progress
   DoneMessage done{};            // valid iff tag == Done
   ErrorMessage error{};          // valid iff tag == Error
+  ImageMeta image_meta{};        // valid iff tag == ImageMeta
+  BandHeader read_band{};        // valid iff tag == ReadBand
 };
 
 /// Reads one raw frame from `h` (blocking): the tag byte and payload bytes,
@@ -141,8 +201,9 @@ void write_frame(os_handle h, uint8_t tag, const uint8_t* payload, uint32_t len)
 /// Reads and decodes one worker->host frame from `h` (blocking). Returns
 /// false on a clean EOF before any byte of a new frame. Throws
 /// `std::runtime_error` if EOF is hit mid-frame (truncated), the tag is not
-/// one of the four worker tags, or a JSON/binary payload fails to parse in
-/// the shape its tag requires.
+/// one of the six worker tags (`BandAck`, `Progress`, `Done`, `Error`,
+/// `ImageMeta`, `ReadBand`), or a JSON/binary payload fails to parse in the
+/// shape its tag requires.
 bool read_worker_frame(os_handle h, WorkerFrame& out);
 
 /// Builds a framed `Init` frame (tag 128) from an `InitMessage`, ready to
@@ -160,5 +221,10 @@ std::vector<uint8_t> encode_finish();
 
 /// Builds a framed, empty-payload `Cancel` frame (tag 131).
 std::vector<uint8_t> encode_cancel();
+
+/// Builds a framed `ReadBandAck` frame (tag 132, `kTagReadBandAck`): a
+/// 4-byte little-endian `slot` payload telling the worker that slot is free
+/// for reuse (read-direction sessions, protocol v2+).
+std::vector<uint8_t> encode_read_band_ack(uint32_t slot);
 
 }  // namespace mpp

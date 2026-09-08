@@ -96,6 +96,15 @@ add_executable(test_worker_missing test/test_worker_missing.cpp)
 target_link_libraries(test_worker_missing PRIVATE mpp_host)
 add_test(NAME test_worker_missing COMMAND test_worker_missing)
 
+# Task 4 golden suite: mpp::ReadSession (mpp_host.h/.cpp) -- the read
+# direction's inversion of WriteSession -- driving the real worker in
+# Init.mode=read. Writes its own fixture (a small f32 RGB BigTIFF ramp) via
+# WriteSession first, since the host can't encode TIFF and tests must not
+# depend on test_data/, then reads it back and checks Meta()/pixel equality.
+add_executable(test_read test/test_read.cpp)
+target_link_libraries(test_read PRIVATE mpp_host)
+add_test(NAME test_read COMMAND test_read)
+
 # Task 3 fix (code-review finding): FreeSlot's busy-set guard against a
 # bogus/out-of-range worker-supplied BandAck slot id. fake_worker_bogus_ack
 # is a test-only fixture (never the production worker) that speaks just

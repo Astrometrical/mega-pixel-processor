@@ -192,26 +192,31 @@ using os_pid = HANDLE;
 /// Sentinel for "no process".
 inline const os_pid os_invalid_pid = nullptr;
 
-/// Spawns `exe_path` (no extra args -- `mpp-ipc-worker` takes none in normal
-/// operation) with its stdin/stdout wired to the given (already child-side)
-/// pipe ends; stderr is inherited from this process. `bInheritHandles = TRUE`
-/// is required for `STARTF_USESTDHANDLES` to take effect, which means the
-/// child inherits a duplicate of EVERY inheritable handle in this process,
-/// not just `child_stdin`/`child_stdout` -- so every parent-retained pipe
-/// end (the write end of the child's own stdin pipe, the read end of the
-/// child's own stdout pipe) must be marked non-inheritable first, or the
-/// child ends up holding a live handle to its own stdin's write side and
-/// that pipe never signals EOF to it even after this process closes its
-/// copy (breaking docs/pi-protocol.md §7.5 host-gone detection). Pass every
-/// such handle in `parent_ends`; this function clears
-/// `HANDLE_FLAG_INHERIT` on each before spawning, so callers no longer need
-/// to call `SetHandleInformation` themselves. Throws `std::runtime_error`
-/// on failure. `CREATE_NO_WINDOW` suppresses the console window Windows
-/// would otherwise pop for a console app spawned from a GUI host
-/// (PixInsight).
+/// Spawns `exe_path` with its stdin/stdout wired to the given (already
+/// child-side) pipe ends; stderr is inherited from this process.
+/// `bInheritHandles = TRUE` is required for `STARTF_USESTDHANDLES` to take
+/// effect, which means the child inherits a duplicate of EVERY inheritable
+/// handle in this process, not just `child_stdin`/`child_stdout` -- so every
+/// parent-retained pipe end (the write end of the child's own stdin pipe,
+/// the read end of the child's own stdout pipe) must be marked
+/// non-inheritable first, or the child ends up holding a live handle to its
+/// own stdin's write side and that pipe never signals EOF to it even after
+/// this process closes its copy (breaking docs/pi-protocol.md §7.5
+/// host-gone detection). Pass every such handle in `parent_ends`; this
+/// function clears `HANDLE_FLAG_INHERIT` on each before spawning, so
+/// callers no longer need to call `SetHandleInformation` themselves. Throws
+/// `std::runtime_error` on failure. `CREATE_NO_WINDOW` suppresses the
+/// console window Windows would otherwise pop for a console app spawned
+/// from a GUI host (PixInsight).
+///
+/// `args`, appended after `exe_path` on the command line (e.g. `{"--probe",
+/// path}` for `ReadSession::Probe`), defaults to empty -- `mpp-ipc-worker`
+/// takes no arguments in normal (stdin-handshake) operation, so every
+/// existing call site is unaffected.
 inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
                         os_handle child_stdout,
-                        const std::vector<os_handle>& parent_ends = {}) {
+                        const std::vector<os_handle>& parent_ends = {},
+                        const std::vector<std::string>& args = {}) {
     for (os_handle fd : parent_ends) {
         if (fd != os_invalid_handle) SetHandleInformation(fd, HANDLE_FLAG_INHERIT, 0);
     }
@@ -227,7 +232,7 @@ inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof pi);
 
-    std::wstring cmd = detail::build_command_line_w(exe_path, {});
+    std::wstring cmd = detail::build_command_line_w(exe_path, args);
     BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE /*inherit handles*/,
                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     if (!ok) {
@@ -349,12 +354,16 @@ inline void ignore_sigpipe_once() {
 }
 }  // namespace detail
 
-/// Spawns `exe_path` (no extra args -- `mpp-ipc-worker` takes none in normal
-/// operation) via `posix_spawn`, redirecting the child's stdin/stdout to the
-/// given (already child-side) pipe descriptors; stderr is inherited. The
-/// caller retains ownership of `child_stdin`/`child_stdout` (still open in
-/// this process after the call) -- close them explicitly after spawning,
-/// same as `posix_spawn`'s usual contract.
+/// Spawns `exe_path` via `posix_spawn`, redirecting the child's
+/// stdin/stdout to the given (already child-side) pipe descriptors; stderr
+/// is inherited. The caller retains ownership of `child_stdin`/
+/// `child_stdout` (still open in this process after the call) -- close them
+/// explicitly after spawning, same as `posix_spawn`'s usual contract.
+///
+/// `args`, appended after `exe_path` in `argv` (e.g. `{"--probe", path}` for
+/// `ReadSession::Probe`), defaults to empty -- `mpp-ipc-worker` takes no
+/// arguments in normal (stdin-handshake) operation, so every existing call
+/// site is unaffected.
 ///
 /// `posix_spawn` does NOT close inherited descriptors by default (only ones
 /// explicitly marked `FD_CLOEXEC`, which this seam never sets), so a plain
@@ -373,7 +382,8 @@ inline void ignore_sigpipe_once() {
 /// `std::runtime_error` on failure.
 inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
                         os_handle child_stdout,
-                        const std::vector<os_handle>& parent_ends = {}) {
+                        const std::vector<os_handle>& parent_ends = {},
+                        const std::vector<std::string>& args = {}) {
     detail::ignore_sigpipe_once();
 
     posix_spawn_file_actions_t fa;
@@ -386,11 +396,20 @@ inline os_pid os_spawn(const std::string& exe_path, os_handle child_stdin,
         if (fd != os_invalid_handle) posix_spawn_file_actions_addclose(&fa, fd);
     }
 
-    std::string exe_copy = exe_path;
-    char* argv[] = {exe_copy.data(), nullptr};
+    // argv[0] is exe_path, followed by `args`, nullptr-terminated. Owned by
+    // `owned_args` (posix_spawn only reads argv during the call, so the
+    // backing storage only needs to outlive this function, not the child).
+    std::vector<std::string> owned_args;
+    owned_args.reserve(args.size() + 1);
+    owned_args.push_back(exe_path);
+    owned_args.insert(owned_args.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    argv.reserve(owned_args.size() + 1);
+    for (std::string& a : owned_args) argv.push_back(a.data());
+    argv.push_back(nullptr);
 
     pid_t pid = -1;
-    int rc = posix_spawn(&pid, exe_path.c_str(), &fa, nullptr, argv, environ);
+    int rc = posix_spawn(&pid, exe_path.c_str(), &fa, nullptr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
         throw std::runtime_error("posix_spawn " + exe_path + ": " + std::strerror(rc));

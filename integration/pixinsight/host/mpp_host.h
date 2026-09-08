@@ -200,4 +200,117 @@ class WriteSession {
   uint32_t outstanding_ = 0;  ///< Bands sent, not yet acked.
 };
 
+/// Configuration for one `ReadSession`: the worker binary to spawn, the
+/// input file to open, and enough of its geometry (typically from a prior
+/// `ReadSession::Probe` call) to size the shm slots before `ImageMeta`
+/// arrives. `band_rows` is the row count per band the *host* commits shm
+/// space for -- it must be `>=` the largest band the worker will ever send
+/// for this file (the worker, not the host, decides actual band shape from
+/// the file's own chunk layout; sizing this too small surfaces as a
+/// `HostError` from `ReadAll`, mirroring `WriteSessionConfig::band_rows`'s
+/// slot-size discipline inverted). `sample_bytes` is the native on-disk
+/// sample size of the file's `bit_depth` (`ImageMeta::bit_depth`): `1` for
+/// `"u8"`, `2` for `"u16"`, `4` for `"u32"`/`"f32"`, `8` for `"f64"`.
+struct ReadSessionConfig {
+  std::string worker_exe;   ///< Absolute path to the `mpp-ipc-worker` binary.
+  std::string input_path;   ///< Existing image file the worker will open and stream.
+  uint32_t band_rows = 0;   ///< Rows per band the host provisions shm space for.
+  uint32_t slots = 0;       ///< Number of shm slots to create; `>= 2` recommended.
+  uint64_t sample_bytes = 0;  ///< Native sample size in bytes of the file's format.
+  uint64_t width = 0;       ///< Image width in pixels (from a prior probe), to size slots.
+  uint64_t channels = 0;    ///< Channel count (informational; the worker is authoritative).
+};
+
+/// Drives one input file's read session to completion over the
+/// worker-pull direction of the protocol (protocol v2, `docs/pi-protocol.md`
+/// pending its read-mode addendum -- see `mpp_protocol.h`'s `kProtocolVersion`
+/// doc comment): the *worker* fills shm slots and requests them via
+/// `ReadBand`, and this class frees them by replying `ReadBandAck`, the
+/// exact inversion of `WriteSession`'s `PushBand`/`BandAck` rhythm. Not
+/// copyable or movable (owns a live child process and shm mapping via raw
+/// handles); construct one per file read.
+///
+/// RAII: the destructor kills and reaps the worker process if it is still
+/// running when the session is destroyed without having reached a terminal
+/// state via `ReadAll` (e.g. an exception unwinding mid-read) -- a
+/// `ReadSession` going out of scope never leaves an orphaned worker process
+/// behind, mirroring `WriteSession`'s own destructor contract exactly.
+class ReadSession {
+ public:
+  /// Validates `cfg`, creates the shm segment, spawns `cfg.worker_exe` with
+  /// `mode: "read"`, sends `Init`, and reads the worker's first reply frame,
+  /// which must be `ImageMeta` -- stored and returned by `Meta()`. Throws
+  /// `HostError` if `cfg` is invalid, `cfg.worker_exe` does not exist, the
+  /// shm segment cannot be created, the process cannot be spawned, sending
+  /// `Init` fails, the worker replies `Error` instead of `ImageMeta` (e.g.
+  /// the file does not exist or is not a supported format), or the worker
+  /// sends any other unexpected frame/exits early -- in every failure case
+  /// any already-spawned worker process is killed and reaped before the
+  /// exception propagates.
+  explicit ReadSession(const ReadSessionConfig& cfg);
+
+  ~ReadSession();
+
+  ReadSession(const ReadSession&) = delete;
+  ReadSession& operator=(const ReadSession&) = delete;
+  ReadSession(ReadSession&&) = delete;
+  ReadSession& operator=(ReadSession&&) = delete;
+
+  /// The worker's authoritative geometry for the opened file, as reported by
+  /// its `ImageMeta` reply to `Init`. Valid for the lifetime of the session
+  /// (set once, during construction).
+  const ImageMeta& Meta() const { return meta_; }
+
+  /// Pumps `ReadBand` frames from the worker until `Done`: for each band,
+  /// copies nothing itself but hands `sink` a pointer directly into the shm
+  /// slot the worker filled (`rows * Meta().width` native samples of one
+  /// channel, `cfg.sample_bytes` bytes each, native-endian, row-major --
+  /// the same in-slot layout `docs/pi-protocol.md` §6 specifies for the
+  /// write direction, reversed), then acks the slot once `sink` returns so
+  /// the worker may reuse it. Bands may arrive in any order and interleaved
+  /// across channels, mirroring the write direction's own `PushBand`
+  /// ordering freedom (`docs/pi-protocol.md` §7.2) -- `sink` must not assume
+  /// sequential coverage. Must be called at most once. Throws `HostError` on
+  /// a worker `Error` frame, an out-of-range or oversize `ReadBand` request,
+  /// or an unexpected frame/early worker exit.
+  void ReadAll(const std::function<void(uint32_t channel, uint64_t start_row, uint32_t rows,
+                                         const void* samples)>& sink);
+
+  /// Standalone geometry probe: spawns `worker_exe --probe input_path`
+  /// (no `Init` handshake -- the `--probe` CLI entry opens the file and
+  /// prints its `ImageMeta` as JSON, then exits, per `mpp-ipc-worker`'s
+  /// `main.rs`), reads its stdout, and parses it. Throws `HostError` if
+  /// `worker_exe` does not exist, spawning fails, the process exits
+  /// nonzero, or its stdout is not valid `ImageMeta` JSON. Does not create
+  /// any shm segment or otherwise touch the wire protocol proper -- this is
+  /// a lighter-weight query than constructing a full `ReadSession`, useful
+  /// for sizing a subsequent `ReadSessionConfig` (its `width`/`sample_bytes`)
+  /// before committing to shm.
+  static ImageMeta Probe(const std::string& worker_exe, const std::string& input_path);
+
+ private:
+  // ---- frame IO ----
+  // Reads one worker->host frame; throws HostError (reaping the worker) on
+  // EOF or a malformed frame -- mirrors WriteSession::ReadFrameOrThrow
+  // exactly (see its doc comment).
+  WorkerFrame ReadFrameOrThrow();
+  void WriteFramed(const std::vector<uint8_t>& framed);
+
+  // ---- process lifecycle ----
+  int ReapBlocking();               ///< Blocking wait for the child to exit; idempotent.
+  void KillAndReapBestEffort() noexcept;  ///< Kills then reaps; idempotent. See WriteSession's.
+
+  ReadSessionConfig cfg_;
+  uint64_t slot_bytes_ = 0;
+  ImageMeta meta_{};
+
+  ShmSegment shm_;
+  Pipe in_pipe_;   // host -> worker stdin
+  Pipe out_pipe_;  // worker -> host, reads worker stdout
+  os_pid pid_ = os_invalid_pid;
+  bool spawned_ = false;  ///< True once os_spawn succeeded (dtor only acts then).
+  bool reaped_ = false;
+  bool finished_ = false;  ///< True once ReadAll/construction reached a terminal state.
+};
+
 }  // namespace mpp
