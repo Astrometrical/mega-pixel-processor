@@ -693,6 +693,21 @@ channel, `index(r, x) = r * width + x`).
 `ReadBandAck`'s payload is a bare 4-byte little-endian `slot: u32` — the
 slot id the host has finished consuming, now free for the worker to reuse.
 
+**Band geometry is the worker's choice, bounded by `slot_bytes`.** A
+`ReadBand` frame does **not** correspond one-to-one to a file chunk (a strip
+or a tile-row): a single decoded chunk routinely exceeds one slot — a
+single-strip image has `RowsPerStrip == height`, so its whole channel is one
+chunk — so the worker splits each chunk into as many `ReadBand` sub-bands of
+whole rows as needed to fit `slot_bytes` (`rows * width * sample_bytes <=
+slot_bytes` for every frame), each with contiguous `start_row`/`rows` and its
+own slot and ack. A host must therefore treat every `ReadBand` as an
+independent `(channel, start_row, rows)` scatter and must not assume any
+particular banding; the reference host and module already do (they scatter by
+those fields alone). The only geometry guarantee is that a band is always
+whole rows of a single channel, so `slot_bytes` smaller than one full row
+(`width * sample_bytes`) is a host misconfiguration the worker rejects up
+front with an `Error`.
+
 **Inverted slot ownership.** This is the one rule that differs from §6's
 ownership model, and the reason read mode needs its own ack tag rather than
 reusing `BandAck`: on write, the *host* fills a slot and the *worker* acks

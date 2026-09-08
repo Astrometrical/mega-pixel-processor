@@ -56,6 +56,28 @@ fn write_rgb16(path: &Path, w: u32, h: u32) {
     enc.write_image::<colortype::RGB16>(w, h, &data).unwrap();
 }
 
+/// Like [`write_rgb16`] but forces the whole image into a SINGLE strip
+/// (`RowsPerStrip == height`), the geometry real single-strip astro TIFFs
+/// use. `TiffReader::read_bands` then yields one band per channel covering
+/// every row — a band whose byte length (`height * width * sample_bytes`)
+/// far exceeds a fixed ~4 MiB slot, so the worker must sub-divide it.
+fn write_rgb16_single_strip(path: &Path, w: u32, h: u32) {
+    let mut enc = TiffEncoder::new(std::fs::File::create(path).unwrap()).unwrap();
+    let mut data = vec![0u16; (w * h * 3) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 3) as usize;
+            data[i] = (x as u16).wrapping_mul(7).wrapping_add(1);
+            data[i + 1] = (y as u16).wrapping_mul(11).wrapping_add(2);
+            data[i + 2] = ((x + y) as u16).wrapping_mul(13).wrapping_add(3);
+        }
+    }
+    let mut image = enc.new_image::<colortype::RGB16>(w, h).unwrap();
+    // One strip spanning the full height: RowsPerStrip == height.
+    image.rows_per_strip(h).unwrap();
+    image.write_data(&data).unwrap();
+}
+
 /// A read-mode session driven exactly the way a real host would: creates
 /// the shm segment, spawns the worker with `Init { mode: Read, .. }`,
 /// reads `ImageMeta`, then acks every `READ_BAND` until `Done`/`Error`.
@@ -274,6 +296,79 @@ fn rgb16_read_session_matches_direct_tiff_reader_decode() {
     assert_eq!(planes.len(), total_channels);
     for (ch, (got, want)) in planes.iter().zip(ref_planes.iter()).enumerate() {
         assert_eq!(got, want, "channel {ch} plane mismatch");
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Regression for the "oversize band" failure: a single-strip file whose
+/// per-channel band is far larger than one shm slot. `TiffReader::read_bands`
+/// yields ONE band per channel spanning all rows, so the worker MUST split
+/// each band into slot-sized sub-bands (its own slot + ack apiece) or it
+/// cannot open a large fraction of the files this feature advertises. Asserts
+/// byte-for-byte reassembly against a direct `TiffReader` decode.
+#[test]
+fn oversize_single_strip_band_reassembles_via_subbands() {
+    let dir = tmpdir("subband");
+    let path = dir.join("in.tif");
+    let (w, h) = (8u32, 64u32);
+    write_rgb16_single_strip(&path, w, h);
+
+    // Reference decode straight through TiffReader for the byte comparison.
+    let mut reference = TiffReader::open(&path).unwrap();
+    let ref_info = reference.info().clone();
+    let sample_bytes = ref_info.sample_format.bytes();
+    let total_channels = ref_info.total_channels() as usize;
+    let plane_len_bytes = ref_info.height as usize * ref_info.width as usize * sample_bytes;
+    let mut ref_planes = vec![vec![0u8; plane_len_bytes]; total_channels];
+    reference
+        .read_bands(&mut |ch, start_row, _rows, bytes| {
+            let off = start_row as usize * ref_info.width as usize * sample_bytes;
+            ref_planes[ch as usize][off..off + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+
+    // Arithmetic proving band > slot (the exact regression condition):
+    //   sample_bytes = 2 (u16)
+    //   row_bytes    = width * sample_bytes      = 8 * 2  = 16 bytes
+    //   band_bytes   = height * row_bytes        = 64 * 16 = 1024 bytes  (one
+    //                  per-channel band, since RowsPerStrip == height == 64)
+    //   slot_bytes   = row_bytes * 8             = 16 * 8 = 128 bytes
+    //   max_rows     = slot_bytes / row_bytes    = 128 / 16 = 8 rows
+    //   sub-bands    = ceil(64 / 8)              = 8 per channel
+    // So each whole-strip channel band (1024 B) is 8x the slot (128 B) and
+    // must be split into 8 sub-bands; before the fix the worker rejected it
+    // outright as an "oversize band".
+    let row_bytes = w as u64 * sample_bytes as u64;
+    let max_rows = 8u64;
+    let slot_bytes = row_bytes * max_rows; // 128
+    let band_bytes = h as u64 * row_bytes; // 1024
+    assert!(
+        band_bytes > slot_bytes,
+        "regression precondition: a whole-strip channel band ({band_bytes} B) must exceed \
+         slot_bytes ({slot_bytes} B) so the worker is forced to sub-divide it"
+    );
+    // Fewer slots than the sub-bands one channel produces, so the run also
+    // exercises the block/reclaim/reuse path across sub-bands.
+    let slots = 3u32;
+
+    let mut session = ReadSession::start(&path, slot_bytes, slots);
+    let meta = session.expect_image_meta();
+    assert_eq!(meta.width, ref_info.width);
+    assert_eq!(meta.height, ref_info.height);
+    assert_eq!(meta.channels, ref_info.total_channels() as u64);
+    assert_eq!(ref_info.sample_format, SampleFormat::U16);
+
+    let planes = session.drain_bands(ref_info.width, sample_bytes, plane_len_bytes);
+    session.expect_exit_success();
+
+    assert_eq!(planes.len(), total_channels);
+    for (ch, (got, want)) in planes.iter().zip(ref_planes.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "channel {ch} plane mismatch after sub-band reassembly"
+        );
     }
 
     std::fs::remove_dir_all(&dir).unwrap();

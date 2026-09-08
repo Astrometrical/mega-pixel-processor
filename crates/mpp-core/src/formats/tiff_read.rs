@@ -124,6 +124,17 @@ impl TiffReader {
             .dimensions()
             .map_err(|e| Error::format(path, format!("TIFF dimensions: {e}")))?;
 
+        // A zero-dimension image has no pixels to read and, worse, would let
+        // a consumer that sizes bands as `bytes / (width * sample_bytes)`
+        // (the module's read sink does exactly this) divide by zero. Reject
+        // it here so it surfaces as a clean, named error at open time.
+        if width == 0 || height == 0 {
+            return Err(Error::format(
+                path,
+                format!("image has a zero dimension ({width}x{height}); nothing to read"),
+            ));
+        }
+
         let color_type = decoder
             .colortype()
             .map_err(|e| Error::format(path, format!("unsupported TIFF colour type: {e}")))?;
@@ -502,6 +513,169 @@ mod tests {
         let r = TiffReader::open(&path).unwrap();
         assert_eq!(r.info().color, ColorClass::Gray);
         assert_eq!(r.info().sample_format, SampleFormat::U8);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_bands_reassembles_rgba8_including_alpha() {
+        // Alpha is in v1 read scope (RGBA -> 4 channels): prove the alpha
+        // plane round-trips end-to-end alongside the colour planes, with a
+        // distinct per-pixel alpha value so a dropped/duplicated alpha shows
+        // up as a mismatch.
+        let (w, h) = (5u32, 3u32);
+        let dir = tmpdir("rgba8");
+        let path = dir.join("in.tif");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                data[i] = (x as u8).wrapping_mul(3).wrapping_add(1); // R
+                data[i + 1] = (y as u8).wrapping_mul(5).wrapping_add(2); // G
+                data[i + 2] = ((x + y) as u8).wrapping_mul(7).wrapping_add(3); // B
+                data[i + 3] = ((x * w + y) as u8).wrapping_mul(11).wrapping_add(4); // A
+            }
+        }
+        enc.write_image::<colortype::RGBA8>(w, h, &data).unwrap();
+
+        let mut r = TiffReader::open(&path).unwrap();
+        assert_eq!(r.info().color, ColorClass::Rgb);
+        assert_eq!(r.info().color_channels, 3);
+        assert_eq!(r.info().alpha_channels, 1);
+        assert_eq!(r.info().total_channels(), 4);
+        assert_eq!(r.info().sample_format, SampleFormat::U8);
+
+        let mut planes = vec![vec![0u8; (w * h) as usize]; 4];
+        r.read_bands(&mut |ch, start_row, rows, bytes| {
+            assert_eq!(bytes.len(), rows as usize * w as usize);
+            for rr in 0..rows as u64 {
+                for x in 0..w as u64 {
+                    let px = ((start_row + rr) * w as u64 + x) as usize;
+                    planes[ch as usize][px] = bytes[(rr * w as u64 + x) as usize];
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Verify every plane, alpha (channel 3) included, against the source.
+        for y in 0..h {
+            for x in 0..w {
+                let src = ((y * w + x) * 4) as usize;
+                let px = (y * w + x) as usize;
+                for ch in 0..4 {
+                    assert_eq!(
+                        planes[ch][px],
+                        data[src + ch],
+                        "channel {ch} pixel ({x},{y}) mismatch"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_zero_dimension() {
+        // A zero-dimension image must be rejected at open time with a clear,
+        // named error rather than reaching a consumer that computes
+        // `band_bytes / (width * sample_bytes)` and divides by zero. The
+        // `tiff` crate's encoder cannot itself write a 0-dimension image, so
+        // build a minimal classic TIFF by hand with ImageWidth = 0.
+        let dir = tmpdir("zero-dim");
+        let path = dir.join("in.tif");
+
+        struct Entry {
+            tag: u16,
+            ty: u16,
+            count: u32,
+            value: [u8; 4],
+        }
+        fn short(v: u16) -> [u8; 4] {
+            let mut b = [0u8; 4];
+            b[0..2].copy_from_slice(&v.to_le_bytes());
+            b
+        }
+        // A 0-wide, 1-tall, 1 strip (empty) BlackIsZero Gray8 image.
+        let entries = vec![
+            Entry {
+                tag: 256,
+                ty: 3,
+                count: 1,
+                value: short(0),
+            }, // ImageWidth = 0
+            Entry {
+                tag: 257,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // ImageLength = 1
+            Entry {
+                tag: 258,
+                ty: 3,
+                count: 1,
+                value: short(8),
+            }, // BitsPerSample
+            Entry {
+                tag: 259,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // Compression: none
+            Entry {
+                tag: 262,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // Photometric
+            Entry {
+                tag: 273,
+                ty: 4,
+                count: 1,
+                value: [0; 4],
+            }, // StripOffsets (empty)
+            Entry {
+                tag: 277,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // SamplesPerPixel
+            Entry {
+                tag: 278,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // RowsPerStrip
+            Entry {
+                tag: 279,
+                ty: 4,
+                count: 1,
+                value: [0; 4],
+            }, // StripByteCounts = 0
+        ];
+        let ifd_start = 8u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for e in &entries {
+            bytes.extend_from_slice(&e.tag.to_le_bytes());
+            bytes.extend_from_slice(&e.ty.to_le_bytes());
+            bytes.extend_from_slice(&e.count.to_le_bytes());
+            bytes.extend_from_slice(&e.value);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // next IFD: none
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = TiffReader::open(&path).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("zero dimension")
+                || msg.contains("0x1")
+                || msg.contains("nothing to read"),
+            "expected error to name the zero dimension, got: {err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

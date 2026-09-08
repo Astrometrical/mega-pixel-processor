@@ -30,10 +30,10 @@ namespace mpp {
 /// host-push protocol (`crates/mpp-ipc/src/protocol.rs`'s module docs):
 /// `InitMessage::mode` selects which way a session runs, and the worker can
 /// report `ImageMeta` (tag `kTagImageMeta`) and request bands via
-/// `kTagReadBand`, acked by the host via `kTagReadBandAck`. `docs/pi-protocol.md`
-/// itself still documents v1 only as of this change (its read-mode
-/// addendum is a later task) -- this header is kept in sync with the Rust
-/// source of truth (`crates/mpp-ipc/src/protocol.rs`) directly until then.
+/// `kTagReadBand`, acked by the host via `kTagReadBandAck`. The full read-mode
+/// contract now lives in `docs/pi-protocol.md` §9 (the wire-shape source of
+/// truth); this header mirrors the Rust definitions in
+/// `crates/mpp-ipc/src/protocol.rs` field-for-field.
 inline constexpr uint32_t kProtocolVersion = 2;
 
 /// Exact release version of the `mpp-ipc-worker` binary this host library
