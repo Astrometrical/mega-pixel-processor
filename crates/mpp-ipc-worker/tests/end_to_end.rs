@@ -4,15 +4,18 @@
 //! host doing it — implements every lifecycle arm of the wire protocol:
 //! successful writes (grayscale f32 and RGB u16, in-order and shuffled band
 //! delivery), incomplete-coverage rejection, version-mismatch rejection,
-//! cancellation cleanup, oversize-band rejection, and host-gone cleanup.
+//! cancellation cleanup, oversize-band rejection, host-gone cleanup, and
+//! (Task 3) rejecting a read-direction `ReadBandAck` reply on a write
+//! session.
 //!
 //! The reference host role (creating the shm segment, driving `Init` →
 //! `Band`… → `Finish`/`Cancel`, checking the child's exit code against its
 //! own terminal frame) is played by `mpp_ipc::testhost`, reached here via
 //! the `testkit` feature (see this crate's `Cargo.toml`). Test 5
-//! (`version_mismatch_errors`) and test 8 (`host_gone_cleans_up`) drive the
-//! worker directly instead — no testhost helper covers a bare `Init`/a
-//! stdin drop without `Finish`.
+//! (`version_mismatch_errors`), test 8 (`host_gone_cleans_up`), and test 9
+//! (`read_band_ack_on_write_session_errors`) drive the worker directly
+//! instead — no testhost helper covers a bare `Init`, a stdin drop without
+//! `Finish`, or an out-of-direction reply frame.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -537,6 +540,99 @@ fn host_gone_cleans_up() {
     assert!(
         leftovers.is_empty(),
         "staging file(s) left behind after host-gone cleanup: {leftovers:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 9. read_band_ack_on_write_session_errors
+// ---------------------------------------------------------------------------
+
+/// A host that sends `ReadBandAck` (tag [`tag::READ_BAND_ACK`]) — a
+/// read-direction-only reply — on a `SessionMode::Write` session must be
+/// refused: `main.rs`'s `run_write` gained a dedicated match arm for this
+/// exact frame (added alongside Task 3's read mode, to keep `HostEvent`'s
+/// match exhaustive), and this test is the positive proof that arm actually
+/// rejects it rather than silently accepting or panicking. Driven directly
+/// (no `testhost` helper, matching `version_mismatch_errors`'s style above)
+/// since this is a single malformed frame, not a full write session: a
+/// valid `Init` handshake, then `ReadBandAck { slot: 0 }` in place of the
+/// `Band` frame a write session actually expects.
+#[test]
+fn read_band_ack_on_write_session_errors() {
+    let dir = tmpdir("write-rejects-readbandack");
+    let out = dir.join("out.tif");
+    let (width, height, channels, slots) = (8u64, 8u64, 1u64, 1u32);
+    let slot_bytes = width * 4;
+
+    let shm_name = format!("/mpp-e2e-wrba-{}", std::process::id() % 100_000);
+    let _shm = ShmSegment::create(&shm_name, slot_bytes as usize * slots as usize)
+        .expect("create shm segment");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mpp-ipc-worker"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn mpp-ipc-worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+
+    let init = InitMessage {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
+        output_path: out.to_string_lossy().into_owned(),
+        width,
+        height,
+        channels,
+        bit_depth: "f32".to_string(),
+        shm_name: shm_name.clone(),
+        slot_bytes,
+        slots,
+        mode: SessionMode::Write,
+    };
+    let payload = serde_json::to_vec(&init).unwrap();
+    write_frame(&mut stdin, tag::INIT, &payload).expect("write Init frame");
+    stdin.flush().expect("flush Init frame");
+
+    // A read-direction reply on a write session: never valid per
+    // `docs/pi-protocol.md`'s direction split, and never sent by any real
+    // host in write mode — this is exactly what `run_write`'s new match arm
+    // exists to reject.
+    write_frame(&mut stdin, tag::READ_BAND_ACK, &0u32.to_le_bytes())
+        .expect("write ReadBandAck frame");
+    stdin.flush().expect("flush ReadBandAck frame");
+
+    let (t, payload) = read_frame(&mut stdout).expect("read worker's reply frame");
+    assert_eq!(t, tag::ERROR, "expected an Error frame");
+    let msg: ErrorMessage = serde_json::from_slice(&payload).expect("Error payload is valid JSON");
+    assert!(
+        msg.message.contains("ReadBandAck"),
+        "error must name ReadBandAck: {}",
+        msg.message
+    );
+
+    let status = child.wait().expect("wait on worker");
+    assert!(
+        !status.success(),
+        "a ReadBandAck on a write session must exit nonzero"
+    );
+
+    assert!(
+        !out.exists(),
+        "output file must be absent after a rejected run"
+    );
+    // `run_write`'s `ReadBandAck` arm returns straight through `fail`
+    // without an explicit `cleanup()` call (unlike the `Cancel`/`HostGone`
+    // arms), but `Staging`'s `Drop` impl best-effort removes its scratch
+    // file regardless of how the owning `Staging` value goes out of scope
+    // (see `staging.rs`) — the same guarantee every other error return in
+    // the `Band` arm above already relies on.
+    let leftovers = staging_leftovers(&dir);
+    assert!(
+        leftovers.is_empty(),
+        "staging file(s) left behind: {leftovers:?}"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();

@@ -231,11 +231,26 @@ fn rgb16_read_session_matches_direct_tiff_reader_decode() {
         .unwrap();
 
     // Slot sized generously for a whole band of the largest possible chunk
-    // (this small image encodes as one strip per row range well under this
-    // bound); several slots so the worker's free-slot pool actually
-    // exercises more than one slot across the run.
+    // (this small image encodes as a single strip spanning the full
+    // height, well under this bound).
     let slot_bytes = ref_info.width * 32 * sample_bytes as u64;
-    let slots = 3u32;
+    // `total_channels` is 3 (RGB, no alpha) and, because the `tiff` crate
+    // encodes an image this small as a single strip, `TiffReader::read_bands`
+    // calls `sink` exactly 3 times — one full-height band per channel, back
+    // to back, with no other bands in between. `slots` is deliberately set
+    // *below* that count (2 < 3) so the third `sink` call cannot find a free
+    // slot and must block in `run_read`'s free-slot-pool reclaim loop
+    // (`while free_slots.is_empty() { link.next_event() ... }`), waiting for
+    // this test's `ReadSession` (playing the host) to ack an earlier slot
+    // before the worker reuses it — this is the exact block/reclaim/reuse
+    // path a 3-slots-for-3-bands run can never exercise, since every band
+    // would get its own never-reused slot.
+    let slots = 2u32;
+    assert!(
+        (slots as usize) < total_channels,
+        "test setup: slots ({slots}) must be fewer than the {total_channels} bands this image \
+         produces, so the read exercises slot reuse"
+    );
 
     let mut session = ReadSession::start(&path, slot_bytes, slots);
     let meta = session.expect_image_meta();
