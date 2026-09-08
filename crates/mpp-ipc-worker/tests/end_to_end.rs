@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use mpp_ipc::protocol::{
-    BandHeader, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, read_frame, tag, write_frame,
+    BandHeader, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, SessionMode, read_frame, tag,
+    write_frame,
 };
 use mpp_ipc::shm::ShmSegment;
 use mpp_ipc::testhost::{
@@ -304,6 +305,7 @@ fn version_mismatch_errors() {
         shm_name: "/mpp-e2e-vermismatch-never-opened".to_string(),
         slot_bytes: 128,
         slots: 1,
+        mode: SessionMode::Write,
     };
     assert_ne!(init.protocol_version, IPC_PROTOCOL_VERSION);
     let payload = serde_json::to_vec(&init).unwrap();
@@ -455,6 +457,7 @@ fn host_gone_cleans_up() {
         shm_name: shm_name.clone(),
         slot_bytes,
         slots,
+        mode: SessionMode::Write,
     };
     let init_payload = serde_json::to_vec(&init).unwrap();
     write_frame(&mut stdin, tag::INIT, &init_payload).expect("write Init frame");

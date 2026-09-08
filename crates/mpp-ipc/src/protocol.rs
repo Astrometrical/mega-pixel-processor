@@ -1,4 +1,4 @@
-//! Wire protocol v1 between the PixInsight host and `mpp-ipc-worker`.
+//! Wire protocol v2 between the PixInsight host and `mpp-ipc-worker`.
 //!
 //! One control-channel frame is `[u8 tag][u32 LE payload_len][payload
 //! bytes]` ([`write_frame`] / [`read_frame`]). `Band` frames (the hot path)
@@ -6,6 +6,14 @@
 //! message is a JSON document via `serde_json`. This is the Rust source of
 //! truth for `docs/pi-protocol.md` — keep both in sync, in the same commit,
 //! on any wire-format change.
+//!
+//! Version 2 adds a **read** direction alongside the original write-only
+//! host-push protocol: [`InitMessage::mode`] selects [`SessionMode::Write`]
+//! (the v1 behavior, and the default for wire-compat with v1 `Init` JSON
+//! that omits the field) or [`SessionMode::Read`], and the worker can send
+//! [`ImageMeta`] (tag [`tag::IMAGE_META`]) and request bands via
+//! [`tag::READ_BAND`] (reusing [`BandHeader`]'s 20-byte layout), acked by
+//! the host with [`tag::READ_BAND_ACK`].
 
 use std::io::{self, Read, Write};
 
@@ -14,10 +22,10 @@ use serde::{Deserialize, Serialize};
 /// Wire-protocol version. Bumped on any wire-format change (new tag,
 /// reordered/resized binary field, renamed/retyped JSON field, changed
 /// lifecycle rule) — see `docs/pi-protocol.md` §8.
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 
 /// Frame tag constants. Host→worker tags start at 128; worker→host tags are
-/// small integers 1–4 (a debugging convenience for spotting a mixed-up
+/// small integers 1–6 (a debugging convenience for spotting a mixed-up
 /// direction — nothing in the codec relies on the ranges not overlapping).
 pub mod tag {
     /// Host→worker: `InitMessage`, JSON payload. Must be the first frame.
@@ -28,6 +36,10 @@ pub mod tag {
     pub const FINISH: u8 = 130;
     /// Host→worker: empty payload; abort the run.
     pub const CANCEL: u8 = 131;
+    /// Host→worker: 4-byte `slot: u32` payload; acks a worker `READ_BAND`
+    /// request, naming the slot the host has filled with the requested
+    /// pixel data (read-direction sessions, protocol v2+).
+    pub const READ_BAND_ACK: u8 = 132;
     /// Worker→host: 4-byte `slot: u32` payload; the slot is free for reuse.
     pub const BAND_ACK: u8 = 1;
     /// Worker→host: `ProgressMessage`, JSON payload.
@@ -36,6 +48,32 @@ pub mod tag {
     pub const DONE: u8 = 3;
     /// Worker→host: `ErrorMessage`, JSON payload; the last frame on failure.
     pub const ERROR: u8 = 4;
+    /// Worker→host: `ImageMeta`, JSON payload; the worker's authoritative
+    /// geometry for a read session (protocol v2+).
+    pub const IMAGE_META: u8 = 5;
+    /// Worker→host: `BandHeader`, 20-byte binary payload; the worker
+    /// requests one band of pixel data (read-direction sessions, protocol
+    /// v2+).
+    pub const READ_BAND: u8 = 6;
+}
+
+/// Which direction of the protocol an `Init` handshake starts:
+/// [`SessionMode::Write`] is the original v1 host-push flow (the host
+/// delivers bands, the worker encodes them), [`SessionMode::Read`] is the
+/// new v2 worker-pull flow (the worker requests bands of an existing image,
+/// the host delivers them).
+///
+/// Defaults to [`SessionMode::Write`] so a v1 `Init` JSON payload — which
+/// has no `mode` field at all — still deserializes correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Host pushes bands to the worker, which encodes an output file (v1
+    /// behavior).
+    #[default]
+    Write,
+    /// Worker pulls bands from the host, reading an existing image.
+    Read,
 }
 
 /// Host→worker `Init` message (tag [`tag::INIT`]), sent bare (not wrapped in
@@ -66,6 +104,15 @@ pub struct InitMessage {
     pub slot_bytes: u64,
     /// Number of slots in the shm segment, `>= 1`.
     pub slots: u32,
+    /// Which direction this session runs: [`SessionMode::Write`] (the v1
+    /// host-push flow) or [`SessionMode::Read`] (the v2 worker-pull flow).
+    /// Absent in v1 `Init` JSON, which defaults to [`SessionMode::Write`]
+    /// for wire-compat. Placed last so existing positional/partial
+    /// constructors keep compiling as far as field order goes (the field
+    /// must still be listed explicitly since `InitMessage` has no
+    /// `Default` impl of its own).
+    #[serde(default)]
+    pub mode: SessionMode,
 }
 
 /// Worker→host `Progress` message (tag [`tag::PROGRESS`]).
@@ -91,6 +138,26 @@ pub struct DoneMessage {
 pub struct ErrorMessage {
     /// Human-readable error description.
     pub message: String,
+}
+
+/// Worker→host `ImageMeta` message (tag [`tag::IMAGE_META`]): the worker's
+/// authoritative geometry for a read session ([`SessionMode::Read`]),
+/// derived from the image it opened rather than anything the host asserted
+/// in `Init`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageMeta {
+    /// Image width in pixels.
+    pub width: u64,
+    /// Image height in pixels.
+    pub height: u64,
+    /// Total channel count, including alpha.
+    pub channels: u64,
+    /// `1` if `channels` includes an alpha channel, `0` otherwise.
+    pub alpha: u64,
+    /// Color space: `"gray"` or `"rgb"`.
+    pub color_space: String,
+    /// Sample format: `"u8"`, `"u16"`, `"u32"`, `"f32"`, or `"f64"`.
+    pub bit_depth: String,
 }
 
 /// Host→worker `Band` frame payload (tag [`tag::BAND`]): names one
@@ -210,6 +277,7 @@ mod tests {
             shm_name: "/mpp-ipc-3f2a91".to_string(),
             slot_bytes: 4_915_200,
             slots: 4,
+            mode: SessionMode::Write,
         }
     }
 
@@ -318,7 +386,7 @@ mod tests {
         let init = sample_init();
         let value = serde_json::to_value(&init).unwrap();
         let expected = serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "worker_version": "0.1.0",
             "output_path": "/tmp/out.tif",
             "width": 12000,
@@ -327,7 +395,8 @@ mod tests {
             "bit_depth": "f32",
             "shm_name": "/mpp-ipc-3f2a91",
             "slot_bytes": 4_915_200,
-            "slots": 4
+            "slots": 4,
+            "mode": "write"
         });
         assert_eq!(value, expected);
     }
@@ -401,5 +470,82 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, tag::FINISH, &[]).unwrap();
         assert_eq!(buf, vec![tag::FINISH, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn protocol_version_is_2() {
+        assert_eq!(IPC_PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn image_meta_json_roundtrip() {
+        let m = ImageMeta {
+            width: 9888,
+            height: 6568,
+            channels: 3,
+            alpha: 0,
+            color_space: "rgb".into(),
+            bit_depth: "f32".into(),
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"width\":9888") && j.contains("\"color_space\":\"rgb\""));
+        assert_eq!(serde_json::from_str::<ImageMeta>(&j).unwrap(), m);
+    }
+
+    #[test]
+    fn init_mode_defaults_to_write() {
+        // A v1 InitMessage JSON (no "mode") must still parse, as Write.
+        let v1 = serde_json::json!({
+            "protocol_version": 2, "worker_version": "0.1.0", "output_path": "/x",
+            "width": 1, "height": 1, "channels": 1, "bit_depth": "f32",
+            "shm_name": "/mpp-x", "slot_bytes": 4, "slots": 1
+        })
+        .to_string();
+        let init: InitMessage = serde_json::from_str(&v1).unwrap();
+        assert_eq!(init.mode, SessionMode::Write);
+    }
+
+    #[test]
+    fn init_mode_read_deserializes() {
+        let v2 = serde_json::json!({
+            "protocol_version": 2, "worker_version": "0.1.0", "output_path": "/x",
+            "width": 1, "height": 1, "channels": 1, "bit_depth": "f32",
+            "shm_name": "/mpp-x", "slot_bytes": 4, "slots": 1, "mode": "read"
+        })
+        .to_string();
+        let init: InitMessage = serde_json::from_str(&v2).unwrap();
+        assert_eq!(init.mode, SessionMode::Read);
+    }
+
+    #[test]
+    fn new_tag_constants_have_expected_values_and_no_collisions() {
+        assert_eq!(tag::IMAGE_META, 5);
+        assert_eq!(tag::READ_BAND, 6);
+        assert_eq!(tag::READ_BAND_ACK, 132);
+
+        let worker_to_host = [
+            tag::BAND_ACK,
+            tag::PROGRESS,
+            tag::DONE,
+            tag::ERROR,
+            tag::IMAGE_META,
+            tag::READ_BAND,
+        ];
+        let host_to_worker = [
+            tag::INIT,
+            tag::BAND,
+            tag::FINISH,
+            tag::CANCEL,
+            tag::READ_BAND_ACK,
+        ];
+        let mut all: Vec<u8> = worker_to_host
+            .iter()
+            .chain(host_to_worker.iter())
+            .copied()
+            .collect();
+        let before_dedup = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), before_dedup, "tag constants must be disjoint");
     }
 }

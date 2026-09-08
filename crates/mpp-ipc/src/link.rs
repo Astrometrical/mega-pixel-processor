@@ -209,6 +209,7 @@ fn is_clean_pipe_close(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionMode;
     use std::io::Cursor;
 
     const WORKER_VERSION: &str = "0.1.0";
@@ -225,6 +226,7 @@ mod tests {
             shm_name: "/mpp-ipc-test".to_string(),
             slot_bytes: 4096,
             slots: 2,
+            mode: SessionMode::Write,
         }
     }
 

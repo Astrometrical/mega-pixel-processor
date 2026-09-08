@@ -21,8 +21,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::protocol::{
-    BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, read_frame, tag,
-    write_frame,
+    BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, SessionMode,
+    read_frame, tag, write_frame,
 };
 use crate::shm::ShmSegment;
 
@@ -296,6 +296,7 @@ impl Session {
             shm_name: shm_name.clone(),
             slot_bytes: advertised_slot_bytes,
             slots: cfg.slots,
+            mode: SessionMode::Write,
         };
         let payload = serde_json::to_vec(&init).map_err(|e| format!("encoding Init: {e}"))?;
         write_frame(&mut stdin, tag::INIT, &payload)
