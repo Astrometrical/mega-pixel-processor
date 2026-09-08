@@ -1,37 +1,51 @@
-# mpp PixInsight integration: the BigTIFF file-format module
+# mpp PixInsight integration: the BigTIFF/TIFF file-format module
 
-This directory contains a **write-only** PixInsight Class Library (PCL) file
-format module, `BigTIFF-pxm.so` (`.dylib` on macOS, `.dll` on Windows), that
-lets PixInsight save images directly as BigTIFF (`.btf`, `.tf8`) — past
-classic TIFF's 4 GB limit — without going through `mpp`'s CLI. It exists so
-PixInsight users get the same BigTIFF export `mpp convert` already provides,
-from inside PixInsight's own Save/Save As dialogs.
+This directory contains a **read+write** PixInsight Class Library (PCL) file
+format module, `BigTIFF-pxm.so` (`.dylib` on macOS, `.dll` on Windows), named
+`BigTIFF` and identifying itself as `"BigTIFF/TIFF (read+write, Astrometrical
+Mega Pixel Processor)"`. It:
 
-It is **not** a general-purpose TIFF reader/writer: no import support, no
-format-options dialog, no ICC/thumbnail/property passthrough in v1. See
-"Out of scope" below and `docs/DESIGN.md`'s phase-2 entry for what's
-deferred to a later phase.
+- **Writes** BigTIFF (`.btf`, `.tf8`, `.big.tiff`, `.big.tif`) from inside
+  PixInsight's own Save/Save As dialogs — past classic TIFF's 4 GB limit,
+  without going through `mpp`'s CLI (phase 2).
+- **Reads** whole-image TIFF and BigTIFF files with the same four
+  extensions (phase 3) back into PixInsight, including plain (non-Big)
+  stripped/tiled TIFFs the module didn't itself write — the general
+  streaming reader in `mpp-core` decodes any TIFF-family file in the
+  supported sample/colour subset, not just the module's own output.
+
+It is **not** a general-purpose TIFF format module: no format-options
+dialog, no ICC/thumbnail/FITS-keyword/property passthrough, no palette/
+CMYK/YCbCr/multiband or signed/complex-sample input, and — deliberately —
+no claim on the `.tif`/`.tiff` extensions themselves (that would conflict
+with PixInsight's own stock TIFF module). See "Out of scope" below and
+`docs/DESIGN.md`'s phase-2/phase-3 entries for what's deferred to a later
+phase.
 
 ## Architecture
 
 ```
-PixInsight core
-      |  MetaFileFormat / FileFormatImplementation calls
-      v
+PixInsight core                              PixInsight core
+      |  Save/Save As (write)                      |  Open (read)
+      v                                             v
 integration/pixinsight/module/   (BigTIFF-pxm.so — PCL-linked shim, C++20)
   BigTiffFormat   -- format identity/capabilities (MetaFileFormat)
-  BigTiffInstance -- per-file write session (FileFormatImplementation)
-      |  normalizes every WriteSamples buffer to f32 in [0,1],
-      |  splits it into <= band_rows chunks
-      v
+  BigTiffInstance -- per-file session (FileFormatImplementation)
+      |  write: normalizes every WriteSamples          |  read: Open()+ReadImage,
+      |  buffer to f32 in [0,1], splits into            |  AllocateData + PixelData
+      |  <= band_rows chunks                            |  fills straight from bands
+      v                                                  v
 integration/pixinsight/host/     (libmpp_host — PCL-free static lib, C++17)
-  mpp::WriteSession  -- shm segment + child-process lifecycle + wire framing
-      |  POSIX shm + pipes (mpp_shm/mpp_os) carrying docs/pi-protocol.md frames
-      v
+  mpp::WriteSession  -- host pushes Band, worker acks    mpp::ReadSession -- worker pushes
+      |  shm segment + child-process lifecycle +         |  ReadBand, host acks — inverted
+      |  wire framing (mpp_shm/mpp_os,                   |  slot ownership vs. write
+      |  docs/pi-protocol.md frames)                     |  (docs/pi-protocol.md §9)
+      v                                                  v
 mpp-ipc-worker                   (Rust binary, built by `cargo build -p mpp-ipc-worker`)
-      |  decodes bands, encodes BigTIFF
-      v
-output.btf
+      |  write: encodes BigTIFF          |  read: decodes TIFF/BigTIFF (mpp-core's
+      |                                  |  streaming reader) into native bands
+      v                                  v
+output.btf                        pixels back in PixInsight
 ```
 
 The module is the *only* PCL-linked code in this tree. `host/` builds and
@@ -41,7 +55,11 @@ pipes, and the wire protocol; PCL awareness lives entirely in `module/`.
 The worker is a separate Rust process, found by the module at runtime next
 to its own binary (via `dladdr` on POSIX / `GetModuleFileNameW` on Windows,
 the same pattern MergeMosaic's `mmm-pxm` module uses), not linked into the
-`.so` at all.
+`.so` at all. `mpp::WriteSession` and `mpp::ReadSession` (`host/mpp_host.h`)
+are the two host-side session types `BigTiffInstance` drives, one per
+direction; both speak the same protocol v2 wire format
+(`docs/pi-protocol.md`), just with slot ownership inverted for reads (§9 of
+that document).
 
 Supported PixInsight versions: **1.9.0 and newer**. The module's declared
 core-API floor is baked in from the PCL revision it links (see
@@ -62,7 +80,7 @@ pin, so the module stays C++20 uniformly rather than varying the standard
 per pin. The module's makefile documents this; `host/`'s CMake build is
 unaffected.
 
-## Sample-format mapping
+## Write: sample-format mapping
 
 Every `WriteSamples` buffer is normalized to `f32` in `[0, 1]` before it is
 pushed as a band, independently of what output sample format was negotiated
@@ -80,6 +98,49 @@ Complex and signed-integer sample formats are rejected with a `pcl::Error`.
 Only grayscale (1 channel) and RGB (3 channels) images are supported; alpha
 channels cannot be stored (`CanStoreAlphaChannels() == false`) because the
 wire protocol (`docs/pi-protocol.md` §5) only accepts `channels == 1` or `3`.
+
+## Read support
+
+`BigTiffFormat::CanRead()` is `true`; `CanReadIncrementally()` is
+`false` **explicitly** — the core drives an interactive Open through
+whole-image `ReadImage`, not `ReadSamples`, so `BigTiffInstance::Open()`
+returns one `ImageDescription` (`PCL_FILEFORMAT_API.md` §8.2) and the module
+implements only the five `ReadImage` overloads (§8.3), never `ReadSamples`.
+
+The decode itself is `mpp-core`'s streaming TIFF/BigTIFF reader
+(`crates/mpp-core/src/formats/tiff_read.rs`), driven by `mpp-ipc-worker` in
+protocol-v2 **read mode** (`docs/pi-protocol.md` §9: the worker decodes a
+band, fills the named shm slot, and announces it via `ReadBand`; the host
+consumes it and sends `ReadBandAck` to free the slot — slot ownership
+inverted from the write path). It is a general TIFF/BigTIFF importer, not
+limited to files this module itself wrote:
+
+- **Extensions**: the same four this module writes — `.big.tiff`,
+  `.big.tif`, `.btf`, `.tf8`. `.tif`/`.tiff` are deliberately **not**
+  claimed (see "Out of scope").
+- **Container**: classic TIFF or BigTIFF, stripped or tiled, the common
+  compressions the underlying `tiff` crate decodes (e.g. none/LZW/
+  Deflate/PackBits).
+- **Colour/sample support**: grayscale or RGB, with or without an alpha
+  channel (`ImageMeta.alpha`/`ImageMeta.channels`,
+  `docs/pi-protocol.md` §9.2); native `u8`/`u16`/`u32`/`f32`/`f64` samples,
+  decoded and handed to PixInsight at their **native** bit depth — unlike
+  the write path, nothing is normalized to f32 on the way in.
+- **Rejected with a clear error** (never silently mis-decoded): palette,
+  CMYK, YCbCr, Lab, and other multiband colour types; planar
+  (non-interleaved) sample storage; signed-integer samples; complex/void
+  samples; any bit depth outside the five listed above.
+- **`.big` save-rename** (write path, documented here since it directly
+  affects what a subsequent read sees): `BigTiffInstance::Create()` renames
+  a bare `.big` output path to `.big.tiff` and emits a one-line
+  `Console::WarningLn` notice (`PCL_FILEFORMAT_API.md` §8.4) — `.big` alone
+  is not a registered extension PixInsight would reopen, so the module
+  never leaves a save at a path it (or the stock TIFF module) couldn't read
+  back.
+- **`mpp-ipc-worker --probe <path>`**: a standalone CLI entry that opens a
+  file and prints its `ImageMeta` JSON (`docs/pi-protocol.md` §9.2) with no
+  shm/handshake involved — useful for checking whether a given file decodes
+  (and at what geometry/bit depth) before driving a real session.
 
 ## Build
 
@@ -181,10 +242,11 @@ is the human's manual check:
    signing").
 3. In PixInsight: **Process → Modules → Install Modules…**, point it at the
    module directory (or `BigTIFF-pxm.so` directly), restart if prompted.
-   Confirm "BigTIFF" appears under File > Save As > format list, with the
-   description "BigTIFF (write-only, Astrometrical Mega Pixel Processor)".
-4. Open any image (any bit depth, grayscale or RGB), Save As, choose the
-   BigTIFF format, extension `.btf` or `.tf8`.
+   Confirm "BigTIFF" appears under File > Save As > format list (and under
+   File > Open's format filter), with the description "BigTIFF/TIFF
+   (read+write, Astrometrical Mega Pixel Processor)".
+4. **Write smoke**: open any image (any bit depth, grayscale or RGB), Save
+   As, choose the BigTIFF format, extension `.btf` or `.tf8`.
 5. Verify the saved file: open it in Photoshop (PS >= 26.2 opens BigTIFF)
    or round-trip it through `mpp`'s own reader (`target/release/mpp convert
    output.btf check.png` and inspect visually), and confirm the file size
@@ -192,6 +254,15 @@ is the human's manual check:
 6. Try a save that would exceed 4 GB uncompressed (a large mosaic) and
    confirm it completes — this is the whole point of the module over
    PixInsight's built-in TIFF writer.
+7. **Read smoke**: in PixInsight, File > Open a `test.big.tiff` (or
+   `.big.tif`/`.btf`/`.tf8`) file — either one saved by this module in step
+   4, or an independently-produced TIFF/BigTIFF in the supported subset
+   (see "Read support"). Confirm it opens with the correct geometry and
+   colour space, and visually verify pixel content against a known-good
+   render of the same file (e.g. `mpp convert <file> check.png`).
+8. Save a `.big` path (no further extension) and confirm PixInsight's
+   Console shows the rename warning and the file lands at `<name>.big.tiff`
+   — then confirm that renamed file re-opens via step 7's procedure.
 
 ### Known v1 limitation: abort wiring
 
@@ -286,12 +357,30 @@ narrowly to that directory:
 
 ## Out of scope (see the implementation plan for the full list)
 
-- Reading `.btf`/`.tf8` files back into PixInsight.
-- A format-options dialog (no options exposed in v1).
-- FITS-keyword / ICC-profile / XISF-property passthrough into the BigTIFF
-  container (phase-3 candidates; the WCS sidecar remains `mpp`'s own JSON
-  mechanism, not carried into this module).
-- Non-blocking abort wiring (see "Known v1 limitation" above).
+Deferred to a later phase (not implemented by this module today):
+
+- **WCS sidecar readback.** Reading a `.wcs.json` sidecar (or any other WCS
+  source) back into PixInsight FITS keywords on Open — the WCS sidecar
+  remains `mpp`'s own JSON mechanism, not read by this module.
+- **Incremental read (`ReadSamples`).** The core always decodes through
+  whole-image `ReadImage`; `mpp-core`'s reader is itself streaming/chunked
+  internally, but the module never exposes that as PCL incremental read.
+- **General TIFF-tag → FITS-keyword mapping, ICC profiles, thumbnails,
+  and image properties.** Nothing beyond geometry and pixel data is read
+  from or written to the container.
+- **Palette / CMYK / YCbCr / Lab / other multiband colour, and
+  signed-integer or complex-sample inputs.** Rejected with a clear
+  `pcl::Error` rather than mis-decoded (see "Read support").
+- **Claiming `.tif`/`.tiff`.** Deliberate: those extensions are owned by
+  PixInsight's own stock TIFF module; registering them here would conflict.
+  A future stock-TIFF-replacement phase is the only place this could change.
+- **Classic (non-Big) TIFF *writing*.** The write path only ever produces
+  BigTIFF; reading classic TIFF is supported (see "Read support"), writing
+  it is not.
+- A format-options dialog (no options exposed).
+- Non-blocking abort wiring (see "Known v1 limitation" above) — write path
+  only; there is no read-side cancellation concern since a read session has
+  no equivalent in-progress-file state to abandon.
 - Code signing and update-repository publishing: these live in the
   `astrometrical-mmm-site` sibling project (which builds the Astrometrical
   tools website and hosts the PixInsight update repositories). This repo's

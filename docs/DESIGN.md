@@ -138,18 +138,17 @@ distortion grids) do not bump it. Source of truth:
    Remaining loose ends: FITS read/write evaluation, real-data Photoshop
    smoke test (manual). Smoke test that matters: a >4 GB BigTIFF opens in
    Photoshop (PS ≥ 26.2 saves BigTIFF; opening support is older).
-2. **PixInsight file-format module** (in progress — plan A's Rust worker +
-   IPC landed; plan B's C++ PCL host module has landed through Task 5 of 7:
-   host static lib + golden `ctest` suite, the module shim itself
-   (`BigTIFF-pxm.so`, builds clean, zero-warning, no undefined `mpp::`
-   symbols), version sync, and the compliance/provenance/docs set below.
-   Remaining: CI workflow + build scripts (Task 6), closeout (Task 7)):
-   write-only "BigTIFF" format (`.btf`, `.tf8`) as a thin PCL C++ shim
-   streaming pixel bands over the shm host/worker channel (pattern proven in
-   MMM's integration/) to a Rust worker that encodes. Write-only is
-   legitimate (PI's RAW format is read-only); import can come later. Reuses
-   MMM's CI build/sign/publish scripts; the Astrometrical update repo serves
-   both packages.
+2. **PixInsight file-format module, write path (phase 2, complete):**
+   plan A's Rust worker + IPC, plan B's C++ PCL host module and the
+   `BigTIFF-pxm.so` shim itself — a write-only "BigTIFF" format (`.btf`,
+   `.tf8`) streaming pixel bands over the shm host/worker channel (pattern
+   proven in MMM's integration/) to a Rust worker that encodes. Write-only
+   was legitimate as a v1 scope (PI's RAW format is also read-only); the
+   read path landed as phase 3, below. Machine-verified (cargo gates,
+   host-lib golden `ctest`, module link/symbol gates), built by CI for all
+   four targets, smoke-tested in PixInsight itself. Reuses MMM's CI
+   build/sign/publish scripts; the Astrometrical update repo serves both
+   packages.
 
    Decisions made while landing plan B (implementation plan
    `docs/superpowers/plans/2026-08-22-pi-module-shim.md`):
@@ -205,7 +204,53 @@ distortion grids) do not bump it. Source of truth:
      worker hangs `Close()`); only the destructor path (no `Close()` ever
      ran) is non-blocking, killing and reaping the worker directly. Noted
      as a known limitation in `integration/pixinsight/README.md`.
-3. **DeepSky viewer components / platform hooks**: richer viewer (WCS
+3. **PixInsight file-format module, read path (phase 3, complete):**
+   `BigTiffFormat`/`BigTiffInstance` gained `Open()`+`ReadImage`, turning the
+   module into a general read+write TIFF/BigTIFF importer (implementation
+   plan `docs/superpowers/plans/2026-09-08-bigtiff-reader.md`, design spec
+   `docs/superpowers/specs/2026-09-08-bigtiff-reader-design.md`). New
+   extensions `.big.tiff`/`.big.tif` register alongside the existing
+   `.btf`/`.tf8`; the wire protocol bumped to v2 (`docs/pi-protocol.md` §9)
+   to carry a worker-pull read direction alongside the original host-push
+   write direction. See `integration/pixinsight/README.md`'s "Read support"
+   section for the user-facing behavior and deferred items.
+
+   Decisions locked while landing this plan:
+   - **Whole-image read only.** The core drives an interactive `File > Open`
+     through `ReadImage`, never `ReadSamples`, even with
+     `CanReadIncrementally()` returning `true` (empirically verified against
+     a real PixInsight core — see the design spec's "Findings"). The module
+     therefore leaves `CanReadIncrementally()` `false` explicitly and owns
+     the whole decode loop itself; `mpp-core`'s reader is internally
+     chunked/streaming (one strip/tile at a time, never the whole image in
+     worker memory) but that's an implementation detail invisible to PCL.
+   - **Worker read-mode is the write protocol inverted, not a new shape.**
+     Rather than design a second protocol, v2 reuses the exact `Band`/
+     `BandHeader` wire layout and the slot-pool discipline of the write path
+     (`docs/pi-protocol.md` §6-§7), just swapping who fills a slot and who
+     acks it: on read the *worker* fills and requests (`ReadBand`, tag 6),
+     the *host* consumes and acks (`ReadBandAck`, tag 132). This kept the
+     protocol change additive (new tags + one `Init` field) instead of a
+     breaking redesign, and let the host/worker read-mode code reuse the
+     write path's free-slot-pool pattern nearly verbatim.
+   - **Native fidelity on read, unlike the normalized write path.** Every
+     `WriteSamples` buffer is normalized to f32 in `[0,1]` (phase 2); reads
+     go the other way — a u16 file decodes into a `UInt16Image`, an f32 file
+     into a `pcl::Image`, with no forced conversion. `ImageMeta.bit_depth`
+     (`docs/pi-protocol.md` §9.2) reports the file's own native sample
+     format, which is why the module's `Open()` uses a geometry-probe worker
+     run (`mpp-ipc-worker --probe`) to select the matching `ReadImage`
+     overload before any pixels move.
+   - **Extension additions, not replacements.** `.big.tiff`/`.big.tif` were
+     added to close the "choosing BigTIFF in the save dialog appends `.big`,
+     which nothing can reopen" gap (design spec finding 5) — fixed on the
+     write path via a `.big`→`.big.tiff` rename (`PCL_FILEFORMAT_API.md`
+     §8.4) — and to give Photoshop and PixInsight a shared bidirectional
+     extension. `.tif`/`.tiff` remain deliberately unclaimed: PixInsight
+     refuses a second format registering an extension the stock TIFF module
+     already owns (design spec finding 1), so claiming them is scoped to a
+     future stock-TIFF-replacement phase, not this one.
+4. **DeepSky viewer components / platform hooks**: richer viewer (WCS
    readout, annotations, catalog overlays), possible hosted platform.
 
 ## Licensing constraints (important — read before phase 2)

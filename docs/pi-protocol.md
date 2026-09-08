@@ -1,4 +1,4 @@
-# mpp IPC wire protocol (v1)
+# mpp IPC wire protocol (v2)
 
 This is the contract between a host process (the PixInsight PCL module,
 Plan B) and `mpp-ipc-worker`, the Rust process that links `mpp-core` and
@@ -24,6 +24,14 @@ This protocol is a direct descendant of `mmm-ipc`'s own wire protocol
 (`~/dev/MergeMosaic/integration/pixinsight/PROTOCOL.md`) — same frame
 format, same shm-ownership rules, same versioning discipline — slimmed down
 because this direction only needs pixels pushed one way.
+
+**Version 2** (this revision) adds a second, opposite-direction flow
+alongside the original v1 write path described in §1-§8 below: a **read**
+mode in which the worker opens an existing TIFF/BigTIFF file and *pulls*
+bands from the host instead of the host pushing them. §1-§8 remain accurate
+and unchanged for a write session; §9 documents everything read-mode adds
+(`InitMessage.mode`, the `ImageMeta` frame, the `ReadBand`/`ReadBandAck`
+exchange, and the inverted slot-ownership rule that comes with it).
 
 ## 1. Overview & topology
 
@@ -93,7 +101,7 @@ Every message, on either direction of the control channel, is one frame:
   alone disambiguates which, so no separate "is this JSON" flag is needed.
 - Any tag byte not in the table for the direction it was read on is a
   protocol error on read (unknown-tag). Tag values are disjoint by
-  direction (worker tags are small integers 1–4; host tags start at 128)
+  direction (worker tags are small integers 1–6; host tags start at 128)
   purely as a debugging convenience for spotting a mixed-up direction —
   nothing in the codec relies on the ranges not overlapping, since each
   side only ever decodes frames it expects to receive.
@@ -103,17 +111,23 @@ Every message, on either direction of the control channel, is one frame:
 Constants live in `mpp-ipc::protocol`:
 
 ```rust
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 ```
+
+The tables below are the **complete, current** tag set (v1 write tags plus
+the three v2 read tags); rows added in v2 are marked as such. §9 describes
+the read-mode message flow these tags participate in; §5-§7 (`InitMessage`,
+shm, handshake/lifecycle) describe the v1 write flow only except where noted.
 
 ### Host → worker (frames the host writes to the worker's stdin)
 
-| tag | name     | payload encoding | payload |
-|----:|----------|-------------------|---------|
-| 128 | `Init`   | JSON              | `InitMessage` — must be the very first frame |
-| 129 | `Band`   | binary (20 bytes) | `channel: u32, start_row: u64, rows: u32, slot: u32` |
-| 130 | `Finish` | —                 | empty payload (`payload_len` = 0) |
-| 131 | `Cancel` | —                 | empty payload (`payload_len` = 0) |
+| tag | name           | payload encoding | payload |
+|----:|----------------|-------------------|---------|
+| 128 | `Init`         | JSON              | `InitMessage` — must be the very first frame |
+| 129 | `Band`         | binary (20 bytes) | `channel: u32, start_row: u64, rows: u32, slot: u32` |
+| 130 | `Finish`       | —                 | empty payload (`payload_len` = 0) |
+| 131 | `Cancel`       | —                 | empty payload (`payload_len` = 0) |
+| 132 | `ReadBandAck` **(v2)** | binary (4 bytes) | `slot: u32` — acks a worker `ReadBand` request: the host has finished consuming the pixel data the worker filled into this slot, which is now free for the worker to reuse; see §9 |
 
 `Band` binary layout, all fields little-endian, field order exactly as
 written (this order matters — it is not alphabetized or regrouped):
@@ -139,8 +153,10 @@ byte:   0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  1
 |----:|------------|-------------------|---------|
 |   1 | `BandAck`  | binary (4 bytes)  | `slot: u32` — slot is free for reuse |
 |   2 | `Progress` | JSON              | `ProgressMessage { rows_done: u64, rows_total: u64 }` |
-|   3 | `Done`     | JSON              | `DoneMessage { bytes_written: u64 }`, then the worker exits 0 |
+|   3 | `Done`     | JSON              | `DoneMessage { bytes_written: u64 }`, then the worker exits 0 (on a read session, `bytes_written` is always `0` and carries no meaning — see §9) |
 |   4 | `Error`    | JSON              | `ErrorMessage { message: String }`, then the worker exits nonzero |
+|   5 | `ImageMeta` **(v2)** | JSON     | `ImageMeta` — the worker's authoritative geometry for a read session, sent once right after `Init`; see §9 |
+|   6 | `ReadBand` **(v2)**  | binary (20 bytes) | `channel: u32, start_row: u64, rows: u32, slot: u32` — same `BandHeader` layout as `Band` above, direction reversed: the *worker* has already filled the named slot with this band's decoded pixel data and announces it; the *host* consumes it and acks; see §9 |
 
 `BandAck` binary layout:
 
@@ -168,6 +184,8 @@ pub struct InitMessage {
     pub shm_name: String,
     pub slot_bytes: u64,              // uniform slot size; >= max band bytes
     pub slots: u32,                   // number of input slots, >= 1
+    #[serde(default)]
+    pub mode: SessionMode,            // "write" (default) | "read" — v2
 }
 ```
 
@@ -179,7 +197,7 @@ not `{"Init": {...}}`.
 
 | field | type | notes |
 |---|---|---|
-| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `1`) |
+| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `2`) |
 | `worker_version` | string | must equal the worker binary's `CARGO_PKG_VERSION` exactly (see §8) |
 | `output_path` | string | filesystem path the worker will write the encoded output file to |
 | `width` | u64 | image width in pixels |
@@ -189,12 +207,13 @@ not `{"Init": {...}}`.
 | `shm_name` | string | name of the shm segment the host already created |
 | `slot_bytes` | u64 | size in bytes of **one** slot — must be large enough for the largest band the host will ever send; see §6's validation rule |
 | `slots` | u32 | number of slots in the segment, `>= 1` |
+| `mode` | string | **(v2)** `"write"` or `"read"` — see §9. Absent in a v1 payload, which deserializes as `"write"` for wire-compat; a v2 host always emits the field explicitly (§9.1). |
 
-Example:
+Example (write session, `mode` omitted — a v1 payload still parses this way):
 
 ```jsonc
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "worker_version": "0.1.0",
   "output_path": "/tmp/M31-mosaic.tf8",
   "width": 12000,
@@ -206,6 +225,9 @@ Example:
   "slots": 4
 }
 ```
+
+A v2 host emits `mode` explicitly either way — see §9.1 for the read-session
+form of this example.
 
 (`slot_bytes` above is sized for a 400-row band of a 12000-px-wide image:
 `400 * 12000 * 4 = 19_200_000` — in practice the host picks a band height
@@ -505,7 +527,7 @@ malformed) will misbehave against the real worker:
 
 ## 8. Versioning
 
-- **`IPC_PROTOCOL_VERSION`** (currently `1`) bumps on **any** wire-format
+- **`IPC_PROTOCOL_VERSION`** (currently `2`) bumps on **any** wire-format
   change — a new tag, a reordered/resized binary field, a renamed or
   retyped JSON field, a changed lifecycle rule that a C++ host would need
   to branch on. Bump the constant in `mpp-ipc::protocol` and this document
@@ -541,3 +563,200 @@ malformed) will misbehave against the real worker:
 | `IPC_PROTOCOL_VERSION` | change |
 |---:|---|
 | 1 | Initial write-only host-push protocol: `Init`/`Band`/`Finish`/`Cancel` in, `BandAck`/`Progress`/`Done`/`Error` out. |
+| 2 | Adds a worker-pull **read** direction alongside v1's write path (§9): `InitMessage.mode` (`"write"` default / `"read"`); worker→host `ImageMeta` (tag 5) and `ReadBand` (tag 6, reuses the `Band`/`BandHeader` binary layout, direction reversed); host→worker `ReadBandAck` (tag 132, 4-byte `slot: u32`). A v1 `Init` payload (no `mode` field) still deserializes correctly, as `"write"`. |
+
+## 9. Read mode (protocol v2)
+
+Version 2 adds a second flow, selected by `InitMessage.mode`, in which the
+**worker** opens an existing TIFF/BigTIFF file and *pulls* pixel bands from
+the host — the mirror image of the write flow in §1-§7, where the host
+pushes bands to the worker. This section is the complete contract for that
+flow; everything in §1-§3 (transport, frame format) applies unchanged to
+both directions.
+
+### 9.1 `InitMessage.mode`
+
+`InitMessage` gains one field, `mode: SessionMode` (§5 field table), which
+selects which flow this run is:
+
+- `"write"` — the v1 host-push flow described in §5-§7. This is the
+  `#[derive(Default)]` value, so a v1 `Init` JSON payload that omits `mode`
+  entirely still deserializes as `"write"` — v1 hosts remain wire-compatible
+  with a v2 worker with no changes.
+- `"read"` — the worker opens the file at `output_path` (read mode reuses
+  this field as the **input** path — there is no separate field) for
+  decoding, and pulls bands from the host as described below instead of
+  receiving `Band` frames.
+
+Example `Init` for a read session:
+
+```jsonc
+{
+  "protocol_version": 2,
+  "worker_version": "0.1.0",
+  "output_path": "/tmp/M31-mosaic.big.tiff",
+  "width": 9888,
+  "height": 6568,
+  "channels": 3,
+  "bit_depth": "f32",
+  "shm_name": "/mpp-ipc-3f2a91",
+  "slot_bytes": 19200000,
+  "slots": 4,
+  "mode": "read"
+}
+```
+
+`width`/`height`/`channels`/`bit_depth` are **not authoritative** for a read
+session — the worker never reads them to decide anything, and derives its
+own geometry straight from the file. A host will typically still have a
+best-effort value for `width`/`channels` in hand (e.g. from a prior
+`mpp-ipc-worker --probe` call, used to size `slot_bytes`, per the reference
+host's `ReadSessionConfig`), but the worker's own `ImageMeta` (§9.2) is what
+a host must actually trust. `shm_name`/`slot_bytes`/`slots` still describe
+the shm segment exactly as in a write session; the segment itself is used
+identically (§6), just filled by the worker instead of the host.
+
+### 9.2 `ImageMeta` (tag 5, worker → host)
+
+Immediately after a `Read`-mode `Init` handshake, before requesting any
+band, the worker attaches to the shm segment, opens the file, and sends one
+`ImageMeta` frame: the file's own geometry, derived from what the worker
+actually decoded rather than anything the host may have guessed in `Init`.
+
+```rust
+pub struct ImageMeta {
+    pub width: u64,
+    pub height: u64,
+    pub channels: u64,      // total channel count, including alpha
+    pub alpha: u64,         // 1 if `channels` includes an alpha channel, 0 otherwise
+    pub color_space: String, // "gray" | "rgb"
+    pub bit_depth: String,   // "u8" | "u16" | "u32" | "f32" | "f64"
+}
+```
+
+Example:
+
+```jsonc
+{
+  "width": 9888,
+  "height": 6568,
+  "channels": 3,
+  "alpha": 0,
+  "color_space": "rgb",
+  "bit_depth": "f32"
+}
+```
+
+Unlike the write path's `InitMessage.bit_depth` (an *output* format the host
+chose), `ImageMeta.bit_depth` is the file's *native* sample format — the
+worker never converts samples on read, so a host must be prepared to handle
+any of the five listed values, not just the three the write path advertises
+(`u8`/`u16`/`f32`).
+
+`mpp-ipc-worker --probe <path>` prints this same JSON shape standalone, with
+no shm/handshake involved, for host-side or manual inspection of a file's
+geometry ahead of a real read session.
+
+### 9.3 Band pull loop: `ReadBand` (tag 6) / `ReadBandAck` (tag 132)
+
+Once `ImageMeta` has been sent, the worker drives the exchange — the host
+only ever responds to a request, it never sends a band unprompted:
+
+```
+host                                          worker (read mode)
+                                               |-- attaches to shm, opens file
+                                     <---------|-- ImageMeta (tag 5)
+                                               |-- decodes one band into an
+                                               |   shm slot
+                                     <---------|-- ReadBand (tag 6): channel,
+                                               |   start_row, rows, slot
+ |-- reads shm[slot_offset(slot)..],          |
+ |   rows*width native-sample-format          |
+ |   samples of that channel                  |
+ |------------- ReadBandAck (tag 132) ------->|
+                                               |-- slot is now free to refill
+                                               |                    (repeats)
+                                     <---------|-- Done (tag 3)
+```
+
+`ReadBand`'s payload is the same 20-byte `BandHeader` layout as the write
+path's `Band` frame (§4's field table applies unchanged: `channel: u32,
+start_row: u64, rows: u32, slot: u32`) — only the direction is reversed, and
+`slot` now names a slot the *worker* has just filled, not one the host
+filled. The samples in the slot are the file's **native** sample format
+named by `ImageMeta.bit_depth` (not always `f32`, unlike the write path's
+shm convention in §6 — a read session's slot contents match whatever
+`ImageMeta` reported), native-endian, row-major, laid out identically to
+§6's "Pixel layout inside a slot" otherwise (`rows * width` samples of one
+channel, `index(r, x) = r * width + x`).
+
+`ReadBandAck`'s payload is a bare 4-byte little-endian `slot: u32` — the
+slot id the host has finished consuming, now free for the worker to reuse.
+
+**Inverted slot ownership.** This is the one rule that differs from §6's
+ownership model, and the reason read mode needs its own ack tag rather than
+reusing `BandAck`: on write, the *host* fills a slot and the *worker* acks
+it free; on read, the *worker* fills a slot and the *host* acks it free. A
+slot is "owned" by the worker from the moment it names that slot in a
+`ReadBand` frame until the matching `ReadBandAck` arrives; the worker must
+not refill that slot before the ack, and the host must not read a slot
+after it has sent that slot's `ReadBandAck`. Everything else about slot
+addressing, alignment, and concurrency (§6) applies unchanged — distinct
+slot ids still address disjoint byte ranges, so multiple `ReadBand` requests
+may be outstanding at once, up to `slots` of them.
+
+### 9.4 Completion: `Done`/`Error`, and `bytes_written`
+
+Once the worker has requested every band of every channel, it sends `Done`
+(tag 3) and exits 0, exactly as on the write path (§4, §7.3). **On a read
+session, `DoneMessage.bytes_written` is always `0` and carries no
+meaning** — there is no output file being written, so the field is present
+only because `Done` is one shared message shape for both directions; a host
+must not interpret it as a byte count, row count, or any other read-session
+statistic.
+
+`Error` (tag 4) is the worker-sent failure frame, exactly as in §4/§7:
+`ErrorMessage { message }`, then a nonzero exit. On a read session the
+worker sends it for a decode failure (a corrupt chunk, an I/O error re-
+reading the file), a link I/O failure, or — per §9.3 — a host protocol
+violation such as receiving anything other than a `ReadBandAck` while
+waiting on a free slot.
+
+Two validations a host must itself perform are **not** the worker's
+responsibility to police, and a misbehaving host will not get an `Error`
+frame for them: a conforming host validates every incoming `ReadBand`
+request's `slot` (must be `< slots`) and `rows * width * sample_bytes`
+(must be `<= slot_bytes`) itself before touching the slot, exactly
+mirroring the worker's own slot-size validation on the write path (§6's
+"the MMM trap, made loud") — a violation here is a **worker** bug (it
+should never happen against a correct decoder), and the reference host
+implementation treats it as fatal to the whole session (kill the worker,
+raise locally) rather than expecting any cooperative `Error` exchange.
+
+### 9.5 What's unchanged — and what isn't — from the write path
+
+§2 (transport), §3 (frame format), §6's shm layout/alignment/ownership-shape
+(only the *direction* of ownership inverts, per §9.3), §7.1's version-check
+half of the `Init` handshake, §7.5's host-gone rule, §7.6's post-terminal-
+frame discipline, and §8's versioning discipline all apply to a read session
+exactly as written for a write session, substituting "worker fills, host
+consumes and acks" for "host fills, worker consumes and acks" wherever §6/§7
+describe slot filling. Concretely for host-gone: if the worker's stdin
+reaches EOF while
+it is still waiting on a `ReadBandAck`, the worker's host-gone handling
+short-circuits the band-pull loop exactly as it does the write path's
+`Band` loop — no frame is written, and the worker exits nonzero.
+
+**§7.4 (`Cancel`) does *not* apply to a read session.** There is no
+cooperative abort path for read mode in this protocol version: the host
+library's `ReadSession` (unlike `WriteSession`) has no `Cancel()` method and
+never sends tag 131, and the worker's read-mode loop has no `Cancel`
+handling of its own — a stray `Cancel` frame received mid-read is treated as
+an unexpected event (a protocol error, `Error` + nonzero exit), not the
+graceful "cancelled" cleanup §7.4 describes for a write session. This is a
+deliberate scope cut, not an oversight: a read session has no
+partially-written output file to abandon the way a write session does, so
+the write path's motivating case for `Cancel` doesn't carry over. If a host
+needs to abort an in-progress read, killing the worker process is the only
+mechanism, exactly as §7.4 already describes for a write session aborted
+after `Finish`.
