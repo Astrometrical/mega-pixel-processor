@@ -127,7 +127,7 @@ distortion grids) do not bump it. Source of truth:
   (custom controls, navigator bottom-left, maxZoomPixelRatio 4,
   visibilityRatio 1). When a solution exists, center RA/Dec and pixel
   scale are baked into the page's telemetry footer at publish time (a
-  live WCS readout is phase-3 DeepSky work).
+  live WCS readout is phase-4 DeepSky work).
 - Universal viewer mode: `--mode single` / auto below 4096 px per side
   uses OSD's single-image source, no pyramid; oversize explicit-single
   warns and suggests DZI.
@@ -169,8 +169,11 @@ distortion grids) do not bump it. Source of truth:
      `integration/pixinsight/README.md`'s mapping table for the full detail.
    - **No-options v1**: no format-specific options dialog, no ICC/thumbnail/
      property storage — the module advertises only what is true; a
-     FITS-keyword/property sidecar into BigTIFF is a phase-3 candidate, and
-     the WCS sidecar stays `mpp`'s own JSON mechanism regardless.
+     FITS-keyword/property sidecar into BigTIFF remains a candidate for a
+     future, not-yet-assigned phase (phase 3, item 3 below, shipped read
+     support without it — see `integration/pixinsight/README.md`'s "Out of
+     scope" list), and the WCS sidecar stays `mpp`'s own JSON mechanism
+     regardless.
    - **Manual-smoke verification boundary**: loading the module inside
      PixInsight is deliberately *not* automated. The machine-verifiable
      boundary is compile/link/symbol gates (zero warnings, no undefined
@@ -253,21 +256,23 @@ distortion grids) do not bump it. Source of truth:
 4. **DeepSky viewer components / platform hooks**: richer viewer (WCS
    readout, annotations, catalog overlays), possible hosted platform.
 
-## Licensing constraints (important — read before phase 2)
+## Licensing constraints (important — applies to the PixInsight module, phases 2-3)
 
 - Our code: Apache-2.0.
 - **PCL License 2.0.1 (Dec 2025) added AI-use restrictions** ("expressly
   includes use via APIs, wrappers, or third-party tools"). Founding decision:
   **do not fork or even read PixInsight's TIFF module source** (or any PCL
   module implementation) in this project — AI-assisted or otherwise. The
-  phase-2 module is clean-room: designed from the BigTIFF spec, libtiff/vips
-  documentation, and the public PCL API only — the same
-  link-against-the-API posture as MMM's existing mmm-pxm module. Record this
-  provenance in the module's README when phase 2 starts.
-- PCL-linked module code (phase 2) carries the PCL license compliance set:
-  retain notices, ship the license text, the verbatim acknowledgment sentence
-  in end-user docs/NOTICE, no PixInsight/Pleiades endorsement implication,
-  and clear scoping so PCL-licensed parts are separate from Apache-2.0 code.
+  module (both its phase-2 write path and its phase-3 read path) is
+  clean-room: designed from the BigTIFF spec, libtiff/vips documentation,
+  and the public PCL API only — the same link-against-the-API posture as
+  MMM's existing mmm-pxm module. This provenance is recorded in the
+  module's README (`integration/pixinsight/README.md`).
+- PCL-linked module code (phases 2-3) carries the PCL license compliance
+  set: retain notices, ship the license text, the verbatim acknowledgment
+  sentence in end-user docs/NOTICE, no PixInsight/Pleiades endorsement
+  implication, and clear scoping so PCL-licensed parts are separate from
+  Apache-2.0 code.
 - libvips is LGPL-2.1+: dynamic linking + standard LGPL compliance
   (attribution, library sources/relink ability) when distributing binaries.
 
