@@ -13,6 +13,7 @@ mpp-core.workspace = true
 memmap2.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 mpp-ipc = { workspace = true, features = ["testkit"] }

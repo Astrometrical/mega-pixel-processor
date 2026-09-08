@@ -1,22 +1,38 @@
 //! `mpp-ipc-worker`: the PixInsight-side worker process.
 //!
-//! Reads one `Init` handshake from stdin, attaches to the shm segment the
-//! host already created, stages every `Band` the host sends into a
-//! memory-mapped scratch file ([`staging::Staging`]), and — once `Finish`
-//! confirms every row of every channel arrived — streams the staged planes
-//! through [`mpp_core::formats::tiff::write_bigtiff`] and reports `Done`.
-//! `Cancel` (or the host disappearing before `Finish`) tears down cleanly
-//! instead. See `docs/pi-protocol.md` for the full wire contract this
-//! implements; `run` below follows its §7 lifecycle section arm by arm.
+//! Two directions, selected by `Init.mode` (`docs/pi-protocol.md`'s v2
+//! addition):
+//!
+//! - [`SessionMode::Write`] (the original v1 flow, [`run_write`]): the
+//!   worker attaches to the host's shm segment, stages every `Band` the
+//!   host sends into a memory-mapped scratch file ([`staging::Staging`]),
+//!   and — once `Finish` confirms every row of every channel arrived —
+//!   streams the staged planes through
+//!   [`mpp_core::formats::tiff::write_bigtiff`] and reports `Done`. `Cancel`
+//!   (or the host disappearing before `Finish`) tears down cleanly instead.
+//! - [`SessionMode::Read`] ([`read::run_read`]): the worker opens an
+//!   existing image via [`TiffReader`], reports its geometry as
+//!   `ImageMeta`, and pulls bands out to the host over the same shm
+//!   segment, direction reversed (see `read.rs`'s module docs).
+//!
+//! See `docs/pi-protocol.md` for the full wire contract this implements;
+//! [`run_write`] follows its §7 lifecycle section arm by arm.
+//!
+//! A `--probe <path>` CLI entry (checked before the stdin handshake, in
+//! [`main`]) opens `path` and prints its [`ImageMeta`](mpp_ipc::protocol::ImageMeta)
+//! as standalone JSON — a debugging aid for inspecting a file's geometry
+//! without spinning up a full host session.
 
+mod read;
 mod staging;
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use mpp_core::formats::tiff::{BitDepth, TiffWriteOptions, write_bigtiff};
+use mpp_core::formats::tiff_read::TiffReader;
 use mpp_ipc::link::{HostEvent, HostLink};
-use mpp_ipc::protocol::InitMessage;
+use mpp_ipc::protocol::{InitMessage, SessionMode};
 use mpp_ipc::shm::ShmSegment;
 
 use staging::Staging;
@@ -27,6 +43,26 @@ use staging::Staging;
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
+    if let Some(path) = probe_path_arg() {
+        match TiffReader::open(Path::new(&path)) {
+            Ok(reader) => {
+                let meta = read::image_meta(reader.info());
+                // `serde_json::to_string` on a plain-data struct like
+                // `ImageMeta` cannot fail, so unwrap rather than threading a
+                // Result through this standalone diagnostic path.
+                println!(
+                    "{}",
+                    serde_json::to_string(&meta).expect("ImageMeta serializes to JSON")
+                );
+            }
+            Err(e) => {
+                eprintln!("mpp-ipc-worker --probe: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut link = HostLink::new(stdin.lock(), stdout.lock());
@@ -41,6 +77,17 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Returns `Some(path)` if this process was invoked as `mpp-ipc-worker
+/// --probe <path>`, checked before anything touches stdin so the probe
+/// entry never blocks waiting for an `Init` handshake that will never come.
+fn probe_path_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    if args.next()?.as_str() != "--probe" {
+        return None;
+    }
+    args.next()
 }
 
 /// What [`main`] maps to an exit code. Every variant but
@@ -60,27 +107,41 @@ enum WorkerError {
     HostGone,
 }
 
-/// Drives one worker run to completion over `link`: handshake, validate,
-/// attach shm, stage every band, encode, and report `Done`/`Error`.
+/// Reads the `Init` handshake and dispatches on [`InitMessage::mode`]:
+/// [`SessionMode::Write`] to [`run_write`] (the v1 flow), [`SessionMode::Read`]
+/// to [`read::run_read`] (the v2 worker-pull flow). Both report `Done`/`Error`
+/// over `link` themselves — this function only routes.
+fn run<R: Read, W: Write>(link: &mut HostLink<R, W>) -> Result<(), WorkerError> {
+    let init = match link.read_init(WORKER_VERSION) {
+        Ok(init) => init,
+        Err(e) => return Err(fail(link, &e.to_string())),
+    };
+    match init.mode {
+        SessionMode::Write => run_write(link, &init),
+        SessionMode::Read => read::run_read(link, &init),
+    }
+}
+
+/// Drives one write-mode run to completion over `link`: validate, attach
+/// shm, stage every band, encode, and report `Done`/`Error`.
 ///
-/// Structured as its own function (rather than inline in `main`) so the
+/// Structured as its own function (rather than inline in `run`) so the
 /// exit-code mapping in `main` stays trivial and this logic — every branch
 /// of which must send `Error` before returning, except
 /// [`WorkerError::HostGone`] — is reviewable as one linear story. Every
 /// fallible step below is written as an explicit `match`/`if let` (not
 /// `.map_err(|e| fail(link, ...))`) so it's visually obvious `link` is
 /// never captured or moved away from later steps.
-fn run<R: Read, W: Write>(link: &mut HostLink<R, W>) -> Result<(), WorkerError> {
-    let init = match link.read_init(WORKER_VERSION) {
-        Ok(init) => init,
-        Err(e) => return Err(fail(link, &e.to_string())),
-    };
-    let bit_depth = match validate_init(&init) {
+fn run_write<R: Read, W: Write>(
+    link: &mut HostLink<R, W>,
+    init: &InitMessage,
+) -> Result<(), WorkerError> {
+    let bit_depth = match validate_init(init) {
         Ok(bd) => bd,
         Err(e) => return Err(fail(link, &e)),
     };
 
-    let total_bytes = match shm_total_bytes(&init) {
+    let total_bytes = match shm_total_bytes(init) {
         Ok(n) => n,
         Err(e) => return Err(fail(link, &e)),
     };
@@ -202,6 +263,15 @@ fn run<R: Read, W: Write>(link: &mut HostLink<R, W>) -> Result<(), WorkerError> 
             Ok(HostEvent::HostGone) => {
                 cleanup(staging, &output_path);
                 return Err(WorkerError::HostGone);
+            }
+            Ok(HostEvent::ReadBandAck { slot }) => {
+                // `ReadBandAck` only makes sense on a `SessionMode::Read`
+                // session (`read::run_read` handles it there); a host
+                // sending it on a write session is a protocol violation.
+                return Err(fail(
+                    link,
+                    &format!("unexpected ReadBandAck {{ slot: {slot} }} on a write-mode session"),
+                ));
             }
             Err(e) => {
                 return Err(fail(link, &e.to_string()));

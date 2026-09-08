@@ -2,18 +2,21 @@
 //!
 //! [`HostLink`] wraps a generic `Read`/`Write` pair (the worker's real
 //! stdin/stdout in `main()`, an in-memory `Cursor`/`Vec<u8>` in tests) and
-//! exposes the handshake ([`HostLink::read_init`]), the band/finish/cancel
-//! event stream ([`HostLink::next_event`]), and the four outbound frames
-//! (`send_band_ack`, `send_progress`, `send_done`, `send_error`) described
-//! in `docs/pi-protocol.md` §5–§7. It performs no shm access, encoding, or
-//! coverage tracking itself — those live one level up in the worker's main
-//! loop, which drives `HostLink` and reacts to each [`HostEvent`].
+//! exposes the handshake ([`HostLink::read_init`]), the event stream
+//! ([`HostLink::next_event`]) for both write-direction (`Band`, `Finish`,
+//! `Cancel`) and read-direction (`ReadBandAck`) sessions, and the worker's
+//! outbound frames — write-direction (`send_band_ack`, `send_progress`,
+//! `send_done`, `send_error`) and read-direction (`send_image_meta`,
+//! `send_read_band`) — described in `docs/pi-protocol.md` §5–§7. It performs
+//! no shm access, encoding, or coverage tracking itself — those live one
+//! level up in the worker's main loop, which drives `HostLink` and reacts to
+//! each [`HostEvent`].
 
 use std::io::{self, Read, Write};
 
 use crate::protocol::{
-    BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, ProgressMessage,
-    read_frame, tag, write_frame,
+    BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, ImageMeta, InitMessage,
+    ProgressMessage, read_frame, tag, write_frame,
 };
 
 /// Errors from the worker-side host link.
@@ -57,6 +60,14 @@ pub enum HostEvent {
     /// treats it like [`HostEvent::Cancel`]'s cleanup path and exits
     /// nonzero.
     HostGone,
+    /// A `ReadBandAck` frame (tag [`tag::READ_BAND_ACK`], read-direction
+    /// sessions only): the host has finished consuming the pixel data the
+    /// worker placed in shm `slot` via `send_read_band`, so the worker may
+    /// reuse `slot` for a future band.
+    ReadBandAck {
+        /// The shm slot now free for the worker to reuse.
+        slot: u32,
+    },
 }
 
 /// Worker's view of the host connection: reads control frames from
@@ -118,8 +129,8 @@ impl<R: Read, W: Write> HostLink<R, W> {
     /// rather than an error — see [`HostEvent::HostGone`]'s docs. Any
     /// other I/O failure (a truncated frame, for instance) stays
     /// `Err(LinkError::Io)`. A frame with a tag other than `Band`,
-    /// `Finish`, or `Cancel` — or a `Band` frame with a malformed
-    /// payload — is `Err(LinkError::Protocol)`.
+    /// `Finish`, `Cancel`, or `ReadBandAck` — or a `Band`/`ReadBandAck`
+    /// frame with a malformed payload — is `Err(LinkError::Protocol)`.
     pub fn next_event(&mut self) -> Result<HostEvent, LinkError> {
         let (t, payload) = match read_frame(&mut self.input) {
             Ok(frame) => frame,
@@ -139,8 +150,19 @@ impl<R: Read, W: Write> HostLink<R, W> {
             }
             tag::FINISH => Ok(HostEvent::Finish),
             tag::CANCEL => Ok(HostEvent::Cancel),
+            tag::READ_BAND_ACK => {
+                let bytes: [u8; 4] = payload.as_slice().try_into().map_err(|_| {
+                    LinkError::Protocol(format!(
+                        "malformed ReadBandAck payload: expected 4 bytes, got {}",
+                        payload.len()
+                    ))
+                })?;
+                Ok(HostEvent::ReadBandAck {
+                    slot: u32::from_le_bytes(bytes),
+                })
+            }
             other => Err(LinkError::Protocol(format!(
-                "unexpected tag {other} from host (expected Band, Finish, or Cancel)"
+                "unexpected tag {other} from host (expected Band, Finish, Cancel, or ReadBandAck)"
             ))),
         }
     }
@@ -177,6 +199,23 @@ impl<R: Read, W: Write> HostLink<R, W> {
             message: message.to_string(),
         })?;
         self.send(tag::ERROR, &payload)
+    }
+
+    /// Sends an `ImageMeta` frame (tag [`tag::IMAGE_META`], read-direction
+    /// sessions only): the worker's authoritative geometry for the image it
+    /// opened, sent once, immediately after a `Read`-mode `Init` handshake
+    /// and before any `ReadBand` request.
+    pub fn send_image_meta(&mut self, meta: &ImageMeta) -> Result<(), LinkError> {
+        let payload = encode_json(meta)?;
+        self.send(tag::IMAGE_META, &payload)
+    }
+
+    /// Sends a `ReadBand` frame (tag [`tag::READ_BAND`], read-direction
+    /// sessions only): the worker has copied one band of pixel data into
+    /// shm `hdr.slot` and asks the host to consume it, replying with
+    /// [`HostEvent::ReadBandAck`] once `hdr.slot` is free for reuse.
+    pub fn send_read_band(&mut self, hdr: &BandHeader) -> Result<(), LinkError> {
+        self.send(tag::READ_BAND, &hdr.to_bytes())
     }
 
     /// Writes one frame to `output` and flushes it so the host observes
@@ -430,6 +469,60 @@ mod tests {
                 message: "cancelled".to_string()
             }
         );
+    }
+
+    #[test]
+    fn send_image_meta_writes_tagged_json_frame() {
+        let mut link = HostLink::new(Cursor::new(Vec::new()), Vec::new());
+        let meta = ImageMeta {
+            width: 9888,
+            height: 6568,
+            channels: 3,
+            alpha: 0,
+            color_space: "rgb".to_string(),
+            bit_depth: "u16".to_string(),
+        };
+        link.send_image_meta(&meta).unwrap();
+        let mut out = Cursor::new(link.output.clone());
+        let (t, payload) = read_frame(&mut out).unwrap();
+        assert_eq!(t, tag::IMAGE_META);
+        let decoded: ImageMeta = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn send_read_band_writes_tagged_band_frame() {
+        let mut link = HostLink::new(Cursor::new(Vec::new()), Vec::new());
+        let hdr = BandHeader {
+            channel: 2,
+            start_row: 40,
+            rows: 8,
+            slot: 1,
+        };
+        link.send_read_band(&hdr).unwrap();
+        let mut out = Cursor::new(link.output.clone());
+        let (t, payload) = read_frame(&mut out).unwrap();
+        assert_eq!(t, tag::READ_BAND);
+        assert_eq!(BandHeader::from_bytes(&payload), Some(hdr));
+    }
+
+    #[test]
+    fn next_event_decodes_read_band_ack() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, tag::READ_BAND_ACK, &7u32.to_le_bytes()).unwrap();
+        let mut link = link_over(buf);
+        assert_eq!(
+            link.next_event().unwrap(),
+            HostEvent::ReadBandAck { slot: 7 }
+        );
+    }
+
+    #[test]
+    fn next_event_rejects_malformed_read_band_ack_payload() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, tag::READ_BAND_ACK, &[1, 2, 3]).unwrap();
+        let mut link = link_over(buf);
+        assert!(matches!(link.next_event(), Err(LinkError::Protocol(_))));
     }
 
     #[test]
