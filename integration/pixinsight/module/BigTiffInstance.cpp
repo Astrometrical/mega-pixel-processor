@@ -10,6 +10,7 @@
 
 #include "BigTiffFormat.h"
 
+#include <pcl/Console.h>
 #include <pcl/Exception.h>
 #include <pcl/File.h>
 
@@ -20,6 +21,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -130,11 +132,76 @@ BigTiffInstance::~BigTiffInstance() = default;
 
 ImageDescriptionArray BigTiffInstance::Open( const String& filePath, const IsoString& hints )
 {
-   (void)filePath;
-   (void)hints;
-   // Unknowns §2: the non-overridden base behavior is undocumented -- make
-   // write-only explicit rather than inherit an unknown default.
-   throw Error( "BigTIFF: this implementation is write-only; reading .btf/.tf8 files is not supported." );
+   (void)hints;   // no hint vocabulary in v1 (Unknowns §10)
+
+   if ( open_ )
+      throw Error( "BigTIFF: internal error: Open() called on an instance that is already open." );
+
+   // Resolve the worker now so a missing installation fails the open
+   // immediately; the same resolved path is reused by the ReadImage session.
+   worker_path_ = ResolveWorkerPath();
+
+   // Geometry probe (design "Two-phase worker interaction" phase 1): a
+   // lightweight header-only read that reports {width,height,channels,alpha,
+   // color_space,bit_depth} JSON and exits. This does not create any shm or
+   // spawn a full read session -- opening the file twice (probe here, decode
+   // in ReadImage) is cheap and keeps Open() side-effect-light.
+   mpp::ImageMeta meta;
+   try
+   {
+      meta = mpp::ReadSession::Probe( worker_path_, std::string( filePath.ToUTF8().c_str() ) );
+   }
+   catch ( const mpp::HostError& e )
+   {
+      throw Error( String( "BigTIFF: " ) + String( e.what() ) );
+   }
+
+   // Map the worker's authoritative geometry -> one PCL ImageDescription
+   // (design "Sample-format & colour mapping (read)"). colorSpace is set by
+   // the colour channels (Gray vs RGB); alpha, if any, is already counted in
+   // meta.channels and imported as an extra channel.
+   ImageInfo info;
+   info.width = int( meta.width );
+   info.height = int( meta.height );
+   info.numberOfChannels = int( meta.channels );
+   info.colorSpace = ( meta.color_space == "rgb" ) ? ColorSpace::RGB : ColorSpace::Gray;
+   info.supported = true;
+
+   // Sample format from bit_depth: unsigned int -> u8/u16/u32, IEEE float ->
+   // f32/f64. Signed-integer and complex inputs are rejected upstream (in the
+   // worker/core reader); the module declares neither here.
+   ImageOptions options;
+   const bool ieeefp = ( meta.bit_depth == "f32" || meta.bit_depth == "f64" );
+   int bits;
+   if ( meta.bit_depth == "u8" )
+      bits = 8;
+   else if ( meta.bit_depth == "u16" )
+      bits = 16;
+   else if ( meta.bit_depth == "u32" || meta.bit_depth == "f32" )
+      bits = 32;
+   else if ( meta.bit_depth == "f64" )
+      bits = 64;
+   else
+      throw Error( String( "BigTIFF: unsupported sample format reported for '" ) + filePath +
+                   "': " + String( meta.bit_depth.c_str() ) );
+   options.bitsPerSample = uint8( bits );
+   options.ieeefpSampleFormat = ieeefp;
+   options.complexSample = false;
+   options.signedIntegers = false;
+
+   // Persist the declared geometry for the ReadImage overloads.
+   read_width_ = meta.width;
+   read_height_ = meta.height;
+   read_channels_ = meta.channels;
+   read_bit_depth_ = meta.bit_depth;
+   read_color_space_ = info.colorSpace;
+   path_ = filePath;
+   open_ = true;
+   read_mode_ = true;
+
+   ImageDescriptionArray descriptions;
+   descriptions.Add( ImageDescription( info, options ) );
+   return descriptions;
 }
 
 bool BigTiffInstance::IsOpen() const
@@ -170,6 +237,119 @@ void BigTiffInstance::Close()
       session_.reset();
    }
    open_ = false;
+   read_mode_ = false;   // a read instance carries no live session; just clear state
+}
+
+// ----------------------------------------------------------------------------
+
+template <class Img>
+void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
+{
+   using sample = typename Img::sample;
+
+   if ( !open_ || !read_mode_ )
+      throw Error( "BigTIFF: internal error: ReadImage() called before a successful Open()." );
+
+   // The core dispatches to the overload whose sample type matches the format
+   // declared by Open() (native fidelity); a mismatched overload should never
+   // fire. Fail loudly rather than silently reinterpret samples of the wrong
+   // width (Unknowns: the headers do not promise which overload is called).
+   if ( read_bit_depth_ != wantDepth )
+      throw Error( String().Format(
+         "BigTIFF: internal error: ReadImage() dispatched to the \"%s\" overload but the "
+         "file declares \"%s\" samples (only the matching overload should be called).",
+         wantDepth, read_bit_depth_.c_str() ) );
+
+   const int width = int( read_width_ );
+   const int height = int( read_height_ );
+   const int channels = int( read_channels_ );
+
+   // Allocate the destination in the geometry/colour space declared by Open()
+   // (design phase 2). Row order is top-down in both TIFF and PixInsight -- no
+   // flip.
+   image.AllocateData( width, height, channels, read_color_space_ );
+
+   // Size the shm slots the host provisions: ~4 MiB of native samples per
+   // band, at least one row, at most the whole image (mirrors the write path's
+   // band sizing, inverted).
+   const uint64_t sampleBytes = uint64_t( sizeof( sample ) );
+   const uint64_t kTargetBandBytes = uint64_t( 4 )*1024*1024;
+   uint64_t bandRows = kTargetBandBytes/( read_width_*sampleBytes );
+   bandRows = std::max<uint64_t>( 1, std::min<uint64_t>( bandRows, read_height_ ) );
+
+   mpp::ReadSessionConfig cfg;
+   cfg.worker_exe = worker_path_;
+   cfg.input_path = std::string( path_.ToUTF8().c_str() );
+   cfg.band_rows = uint32_t( bandRows );
+   cfg.slots = 4;   // >= 2 recommended (mpp_host.h); 4 keeps bands in flight
+   cfg.sample_bytes = sampleBytes;
+   cfg.width = read_width_;
+   cfg.channels = read_channels_;
+
+   try
+   {
+      // Constructing the session spawns the worker (read mode) and reads its
+      // authoritative ImageMeta; on any failure the ctor kills+reaps before
+      // throwing.
+      mpp::ReadSession rs( cfg );
+
+      // Cross-check the session's authoritative geometry against Open()'s
+      // probe: if the file changed on disk between the two opens, the
+      // destination we just allocated would not match the incoming bands.
+      const mpp::ImageMeta& m = rs.Meta();
+      if ( m.width != read_width_ || m.height != read_height_ || m.channels != read_channels_ ||
+           m.bit_depth != read_bit_depth_ )
+         throw Error( "BigTIFF: the file's geometry changed between opening and reading it." );
+
+      rs.ReadAll(
+         [&]( uint32_t ch, uint64_t startRow, uint32_t rows, const void* samples )
+         {
+            // Guard against a misbehaving worker before the memcpy: an
+            // out-of-range channel or a band running past the last row would
+            // otherwise overrun the allocated image (host-side memory-safety
+            // first, mirroring WriteSession's slot-id discipline).
+            if ( ch >= uint32_t( channels ) )
+               throw mpp::HostError( "worker sent a band for a nonexistent channel" );
+            if ( startRow + rows > read_height_ )
+               throw mpp::HostError( "worker sent a band exceeding the image height" );
+
+            // Native copy: the incoming samples are already `sample`-typed,
+            // row-major, native-endian -- exactly the destination plane's
+            // layout. PixelData(ch) is the channel's first sample; offset by
+            // startRow full rows.
+            sample* dst = image.PixelData( int( ch ) ) + size_t( startRow )*size_t( width );
+            std::memcpy( dst, samples, size_t( rows )*size_t( width )*sizeof( sample ) );
+         } );
+   }
+   catch ( const mpp::HostError& e )
+   {
+      throw Error( String( "BigTIFF: " ) + String( e.what() ) );
+   }
+}
+
+void BigTiffInstance::ReadImage( pcl::Image& image )
+{
+   ReadInto( image, "f32" );
+}
+
+void BigTiffInstance::ReadImage( pcl::DImage& image )
+{
+   ReadInto( image, "f64" );
+}
+
+void BigTiffInstance::ReadImage( UInt8Image& image )
+{
+   ReadInto( image, "u8" );
+}
+
+void BigTiffInstance::ReadImage( UInt16Image& image )
+{
+   ReadInto( image, "u16" );
+}
+
+void BigTiffInstance::ReadImage( UInt32Image& image )
+{
+   ReadInto( image, "u32" );
 }
 
 // ----------------------------------------------------------------------------
@@ -188,10 +368,26 @@ void BigTiffInstance::Create( const String& filePath, int numberOfImages, const 
       throw Error( String().Format( "BigTIFF: only single-image files are supported "
                                     "(%d images requested).", numberOfImages ) );
 
+   // Save-As dialog quirk (design "Findings" §5): choosing "BigTIFF" appends a
+   // bare ".big", and a ".big" file is unusable downstream (Photoshop won't
+   // take it, PI's chooser won't show it). Rewrite any path lacking a
+   // TIFF-family tail to "<path>.tiff" -- so ".big" becomes ".big.tiff" (a
+   // registered, working extension) -- and note the rename on the Console.
+   String path = filePath;
+   const bool hasTiffTail = path.EndsWithIC( ".tiff" ) || path.EndsWithIC( ".tif" ) ||
+                            path.EndsWithIC( ".btf" ) || path.EndsWithIC( ".tf8" );
+   if ( !hasTiffTail )
+   {
+      const String rewritten = path + ".tiff";
+      Console().WarningLn( "** BigTIFF: output path '" + path + "' has no TIFF-family "
+                           "extension; writing to '" + rewritten + "' instead." );
+      path = rewritten;
+   }
+
    // Resolve the worker now so a missing installation fails the save
    // immediately, before any options/image handoff.
    worker_path_ = ResolveWorkerPath();
-   path_ = filePath;   // may be relative (FileFormatImplementation.h:486-489); passed through as-is
+   path_ = path;   // may be relative (FileFormatImplementation.h:486-489); passed through as-is
    open_ = true;
 }
 

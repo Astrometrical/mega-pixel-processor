@@ -18,8 +18,11 @@ IsoString BigTiffFormat::Name() const
 
 StringList BigTiffFormat::FileExtensions() const
 {
-   // ".xxx" strings in priority order (FileFormatBase.h:89-91).
-   return StringList{ ".btf", ".tf8" };
+   // ".xxx" strings in priority order (FileFormatBase.h:89-91). The compound
+   // ".big.tiff"/".big.tif" extensions are the bidirectional Photoshop bridge
+   // (design "Findings" §1-§2); ".tif"/".tiff" are deliberately NOT claimed
+   // (registration conflicts with the stock TIFF module -- design Non-goals).
+   return StringList{ ".big.tiff", ".big.tif", ".btf", ".tf8" };
 }
 
 IsoStringList BigTiffFormat::MimeTypes() const
@@ -37,15 +40,16 @@ uint32 BigTiffFormat::Version() const
 
 String BigTiffFormat::Description() const
 {
-   return "BigTIFF (write-only, Astrometrical Mega Pixel Processor)";
+   return "BigTIFF/TIFF (read+write, Astrometrical Mega Pixel Processor)";
 }
 
 String BigTiffFormat::Implementation() const
 {
-   return "Clean-room, write-only BigTIFF encoder for very large images. "
-          "Pixel data are streamed over shared memory to the mpp-ipc-worker "
-          "process installed beside this module, which performs the actual "
-          "BigTIFF encoding. Implemented by Astrometrical's Mega Pixel "
+   return "Clean-room BigTIFF/TIFF reader and BigTIFF encoder for very large "
+          "images. Pixel data are streamed over shared memory to and from the "
+          "mpp-ipc-worker process installed beside this module, which performs "
+          "the actual TIFF/BigTIFF decoding (read) and BigTIFF encoding "
+          "(write). Implemented by Astrometrical's Mega Pixel "
           "Processor (mpp) project from the public TIFF/BigTIFF "
           "specifications and the public PCL API only; see the module's "
           "provenance README (integration/pixinsight/README.md in the mpp "
@@ -56,7 +60,17 @@ String BigTiffFormat::Implementation() const
 
 bool BigTiffFormat::CanRead() const
 {
-   return false;   // write-only by design; BigTiffInstance::Open() also throws
+   return true;   // BigTiffInstance::Open()+ReadImage decode TIFF/BigTIFF files
+}
+
+bool BigTiffFormat::CanReadIncrementally() const
+{
+   // False, explicitly: the core drives interactive opens through whole-image
+   // ReadImage, never ReadSamples, even when this returns true (empirically
+   // verified, design "Findings" §3). Advertising incremental read would only
+   // add an unused ReadSamples code path, so we own the whole-image decode
+   // loop and leave ReadSamples unimplemented.
+   return false;
 }
 
 bool BigTiffFormat::CanWrite() const

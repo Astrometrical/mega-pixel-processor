@@ -1,8 +1,13 @@
 // BigTiffInstance.h -- FileFormatImplementation subclass: one instance per
-// .btf/.tf8 file being written. Owns a mpp::WriteSession (the PCL-free host
-// driver, integration/pixinsight/host/mpp_host.h) and converts PixInsight's
-// incremental write calls into f32 [0,1] bands streamed to the
-// mpp-ipc-worker process found beside the module binary.
+// TIFF/BigTIFF file being read or written. On the write path it owns a
+// mpp::WriteSession (the PCL-free host driver,
+// integration/pixinsight/host/mpp_host.h) and converts PixInsight's
+// incremental write calls into f32 [0,1] bands streamed to the mpp-ipc-worker
+// process found beside the module binary. On the read path Open() runs a
+// lightweight geometry probe to describe the file, then each ReadImage
+// overload runs a mpp::ReadSession that decodes the file and scatters native
+// per-channel row bands into the destination image (design "Two-phase worker
+// interaction").
 //
 // Defensive-coding provenance: every "Unknowns §N" comment below refers to
 // PCL_FILEFORMAT_API.md §7 (the headers' documented behavior is not always a
@@ -33,8 +38,8 @@ class BigTiffFormat;
 
 /*!
  * \class BigTiffInstance
- * \brief Write-only BigTIFF file instance: streams pixel bands to
- *        mpp-ipc-worker over shared memory.
+ * \brief Read+write TIFF/BigTIFF file instance: streams pixel bands to and
+ *        from mpp-ipc-worker over shared memory.
  */
 class BigTiffInstance : public FileFormatImplementation
 {
@@ -54,6 +59,19 @@ public:
    bool IsOpen() const override;
    String FilePath() const override;
    void Close() override;
+
+   // -- Read-path lifecycle (PCL_FILEFORMAT_API.md §R). The core drives an
+   //    interactive open through whole-image ReadImage (never ReadSamples --
+   //    CanReadIncrementally() is false); the overload matching the geometry
+   //    declared by Open() fires, so only that one allocates + decodes, and
+   //    the others throw (defensive per the "Unknowns" discipline: the
+   //    headers do not promise which overload the core will call).
+
+   void ReadImage( pcl::Image& image ) override;
+   void ReadImage( pcl::DImage& image ) override;
+   void ReadImage( UInt8Image& image ) override;
+   void ReadImage( UInt16Image& image ) override;
+   void ReadImage( UInt32Image& image ) override;
 
    // -- Write-path lifecycle (PCL_FILEFORMAT_API.md §3.3).
 
@@ -99,9 +117,25 @@ private:
    template <class Img>
    void WriteWholeImage( const Img& image );
 
-   String path_;                  // stored at Create(); may be relative (FileFormatImplementation.h:486-489)
-   std::string worker_path_;      // resolved at Create() via dladdr (UTF-8)
-   bool open_ = false;            // Create() ran, Close() has not
+   // Whole-image read for the overload whose sample type matches the file's
+   // declared bit_depth (\a wantDepth, e.g. "u16"): verifies the dispatch,
+   // allocates \a image, runs a mpp::ReadSession, and copies each native
+   // per-channel row band into the matching channel plane at its start row.
+   // A non-matching overload throws (only the matching one should ever fire).
+   // Any mpp::HostError becomes a pcl::Error carrying the worker's message.
+   template <class Img>
+   void ReadInto( Img& image, const char* wantDepth );
+
+   String path_;                  // stored at Create()/Open(); may be relative (FileFormatImplementation.h:486-489)
+   std::string worker_path_;      // resolved at Create()/Open() via dladdr (UTF-8)
+   bool open_ = false;            // Create()/Open() ran, Close() has not
+   bool read_mode_ = false;       // Open() ran (read path) rather than Create()
+
+   // Geometry declared by Open()'s probe, consumed by the ReadImage overloads.
+   uint64_t read_width_ = 0, read_height_ = 0, read_channels_ = 0;
+   std::string read_bit_depth_;   // "u8" | "u16" | "u32" | "f32" | "f64"
+   ColorSpace::value_type read_color_space_ = ColorSpace::Gray;
+
    bool have_options_ = false;    // SetOptions() ran (Unknowns §3: it might not)
    ImageOptions options_;         // advisory sample format for the next image
    bool lossy_ = false;           // a narrowing conversion happened (Unknowns §6)

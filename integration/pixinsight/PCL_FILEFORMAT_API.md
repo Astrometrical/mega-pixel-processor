@@ -599,3 +599,90 @@ guarantee about the core's exact behavior — hence §7.3.
 10. **Hints vocabulary.** No standard hint list exists in these headers;
     hint strings are format-defined (`:506-516`). v1 ignores hints; if a
     later version adds any, they must be documented in the README.
+
+---
+
+## 8. Read-path API (Phase 3 — the module now reads)
+
+Added when `CanRead()` was flipped to `true` (BigTIFF reader). All citations
+below refer to `/opt/PixInsight/include/pcl/<file>` at PCL 2.9.4 (verified
+identical line numbers in the pinned 2.8.3 build headers,
+`$HOME/.local/pcl-build-0182/include/pcl/`, against which the module actually
+compiles). No PCL module implementation source was consulted.
+
+### 8.1 Format-level capability
+
+- `bool MetaFileFormat::CanReadIncrementally() const override`
+  (`MetaFileFormat.h:487`, default returns `false`). We override it to
+  `false` **explicitly**: the core drives interactive opens through
+  whole-image `ReadImage`, not `ReadSamples`, even when this is `true`
+  (design "Findings" §3). `CanRead()` (`MetaFileFormat.h:462`, default
+  `true`) is left/asserted `true`.
+- The instance-level `FileFormatImplementation::CanReadIncrementally() const`
+  (`FileFormatImplementation.h:393`, default returns **`true`**) is only
+  consulted when the format-level one is `true`; since ours is `false`,
+  `ReadSamples` is never called and is left unimplemented.
+
+### 8.2 `Open()` — geometry probe → `ImageDescription`
+
+- `virtual ImageDescriptionArray Open( const String& filePath,
+  const IsoString& hints )` (`FileFormatImplementation.h:192`). Returns one
+  `ImageDescription` per image in the file; a single-image format returns a
+  one-element array. On error, throw `pcl::Error` (same convention as the
+  write path, §3.2).
+- `ImageDescription( const ImageInfo& i, const ImageOptions& o,
+  const IsoString& s = IsoString() )` (`ImageDescription.h:94`) — the value
+  we `Add` to the returned `ImageDescriptionArray` (`Array::Add`,
+  `Array.h:1025`).
+- `ImageInfo` fields set from the worker's probe geometry: `width`, `height`,
+  `numberOfChannels` (includes alpha), `colorSpace`
+  (`ColorSpace::RGB`/`ColorSpace::Gray`), `supported = true` (§4.1).
+- `ImageOptions` fields set from the file's sample format:
+  `bitsPerSample` (8/16/32/64), `ieeefpSampleFormat` (true for f32/f64),
+  `complexSample = false`, `signedIntegers = false` (§4.2). The core
+  dispatches to the `ReadImage` overload matching this declared format.
+- `ColorSpace::value_type` (`ColorSpace.h:86`) is the enum stored on
+  `ImageInfo::colorSpace` (`ImageInfo.h:79` aliases it as `color_space`) and
+  passed to `AllocateData`.
+
+### 8.3 The five `ReadImage` overloads
+
+```cpp
+virtual void ReadImage( pcl::Image&   image );  // FileFormatImplementation.h:361  f32
+virtual void ReadImage( pcl::DImage&  image );  // :366                            f64
+virtual void ReadImage( UInt8Image&   image );  // :371                            u8
+virtual void ReadImage( UInt16Image&  image );  // :376                            u16
+virtual void ReadImage( UInt32Image&  image );  // :381                            u32
+```
+
+The overload matching the `bit_depth` declared in `Open()` allocates the
+destination and decodes; the others throw (defensive — the headers do not
+promise which fires; mirrors the write-path "implement all five" discipline,
+Unknowns §5). Sample-type ground truth is the same table as §3.3 step 6
+(`Image::sample = float`, `DImage::sample = double`, `UInt8/16/32Image::sample
+= uint8/uint16/uint32`).
+
+- `GenericImage& AllocateData( int width, int height,
+  int numberOfChannels = 1, color_space colorSpace = ColorSpace::Gray )`
+  (`Image.h:6484`) — allocates the destination pixel buffer. "Newly allocated
+  pixel samples are not initialized" (`Image.h:6481-6482`), which is fine
+  because the decode covers every row of every channel. Resets all selections
+  (`Image.h:6478-6479`).
+- `sample* PixelData( int channel = 0 )` (`Image.h:6721`) — "a pointer to the
+  first pixel sample in the specified channel" at (x=0,y=0)
+  (`Image.h:6713-6716`); the channel plane is contiguous row-major, so a band
+  starting at row `startRow` is written at `PixelData(ch) + startRow*width`
+  for `rows*width` samples. This is the write-mutating counterpart of the
+  `const sample* PixelData( int ) const` accessor the write path reads
+  through (`Image.h:6734`); `ScanLine( int y, int channel )` (`Image.h:6820`,
+  `= PixelData(channel) + RowOffset(y)`) is the equivalent per-row accessor,
+  not needed here since bands are whole rows.
+
+### 8.4 `.big` save-rename (write path)
+
+- `String::EndsWithIC( const_c_string t ) const` (`String.h:2976`,
+  case-insensitive) — tests the output path for a TIFF-family tail in
+  `Create()`.
+- `void Console::WarningLn( const String& s )` (`Console.h:473`) — emits the
+  one-line rename notice. `pcl::Console` is `Console.h:360`; a temporary
+  `Console()` suffices for a single message.

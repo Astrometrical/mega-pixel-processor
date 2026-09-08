@@ -1,7 +1,7 @@
-// BigTiffFormat.h -- MetaFileFormat subclass describing the write-only
-// BigTIFF (.btf/.tf8) format. Pure description/capability queries; all file
-// I/O lives in BigTiffInstance (the FileFormatImplementation this format's
-// Create() manufactures).
+// BigTiffFormat.h -- MetaFileFormat subclass describing the read+write
+// BigTIFF/TIFF (.big.tiff/.big.tif/.btf/.tf8) format. Pure description/
+// capability queries; all file I/O lives in BigTiffInstance (the
+// FileFormatImplementation this format's Create() manufactures).
 //
 // Capability truth-in-advertising rule (plan "Behavioral contract for the
 // module"): advertise only what the shim + worker actually do. See
@@ -23,7 +23,8 @@ namespace pcl
 
 /*!
  * \class BigTiffFormat
- * \brief Write-only BigTIFF format description (extensions .btf, .tf8).
+ * \brief Read+write BigTIFF/TIFF format description (extensions .big.tiff,
+ *        .big.tif, .btf, .tf8).
  */
 class BigTiffFormat : public MetaFileFormat
 {
@@ -46,7 +47,8 @@ public:
    //    load-bearing enough to deserve an explicit statement (CanRead/
    //    CanWrite) -- are overridden; everything else keeps its default.
 
-   bool CanRead() const override;                // default true  -> false (write-only)
+   bool CanRead() const override;                // default true  -> true (Open()+ReadImage read path)
+   bool CanReadIncrementally() const override;   // default false -> false (explicit; whole-image ReadImage only)
    bool CanWrite() const override;               // default true  -> true (explicit for clarity)
    bool CanWriteIncrementally() const override;  // default false -> true (WriteSamples path)
    bool CanStore32Bit() const override;          // default false -> true (u32 -> f32, precision note)
