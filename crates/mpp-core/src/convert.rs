@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::formats::tiff_write::{BitDepth, TiffWriteOptions, write_tiff};
+use crate::formats::tiff_write::{BitDepth, Compression, Container, TiffWriteOptions, write_tiff};
 use crate::formats::xisf::XisfImage;
 use crate::wcs::sidecar::{WcsSidecar, sidecar_path};
 use crate::{Error, Result};
@@ -111,6 +111,10 @@ pub struct ConvertOptions {
     pub sidecar: bool,
     /// Lossy-format quality 1–100 (vips `Q`); error on lossless formats.
     pub quality: Option<u8>,
+    /// TIFF/BigTIFF writer options. Ignored for the vips-backed formats,
+    /// which have their own saver options; `bit_depth` above is the field
+    /// both paths share.
+    pub tiff: TiffWriteOptions,
 }
 
 impl Default for ConvertOptions {
@@ -119,6 +123,7 @@ impl Default for ConvertOptions {
             bit_depth: None,
             sidecar: true,
             quality: None,
+            tiff: TiffWriteOptions::default(),
         }
     }
 }
@@ -207,7 +212,7 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
             if !format.allows(d) {
                 return Err(Error::format(
                     output,
-                    format!("{d:?} samples are not supported by {format:?} output"),
+                    format!("{d:?} bit depth is not supported by {format:?} output"),
                 ));
             }
             d
@@ -235,12 +240,14 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         ));
     }
     img.advise_sequential();
-    let tiff_opts = TiffWriteOptions {
-        bit_depth: depth,
-        ..Default::default()
-    };
     match format {
-        OutputFormat::BigTiff => write_tiff(&img, output, &tiff_opts)?,
+        OutputFormat::BigTiff => {
+            let tiff_opts = TiffWriteOptions {
+                bit_depth: depth,
+                ..opts.tiff.clone()
+            };
+            write_tiff(&img, output, &tiff_opts)?
+        }
         _ => {
             let vips_bin = crate::vips::vips_available().ok_or_else(|| {
                 Error::format(
@@ -251,6 +258,20 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
             })?;
             let tmp = interchange_path(output);
             let _guard = TempFileGuard(tmp.clone());
+            // This TIFF is a private handoff to vips, never a user-visible
+            // output: it must not honour the user's `--container` or
+            // `--compression` choice, only the resolved sample format vips
+            // needs to read back. Force BigTIFF (headroom for any image
+            // size) and no compression (vips reads every container/
+            // compression combination the writer can produce, but there is
+            // no reason to spend cycles compressing data that is about to
+            // be re-encoded).
+            let tiff_opts = TiffWriteOptions {
+                bit_depth: depth,
+                container: Container::Big,
+                compression: Compression::None,
+                ..opts.tiff.clone()
+            };
             write_tiff(&img, &tmp, &tiff_opts)?;
             let dest_spec = format!(
                 "{}{}",

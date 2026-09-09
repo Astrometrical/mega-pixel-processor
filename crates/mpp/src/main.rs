@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use mpp_core::convert::{ConvertOptions, convert};
 use mpp_core::formats::tiff::BitDepth;
+use mpp_core::formats::tiff_write::{Compression, Container, Layout, TiffWriteOptions};
 use mpp_core::publish::{PublishMode, PublishOptions, TileFormat, publish};
 
 /// Mega Pixel Processor: big astro image conversion and DZI publishing.
@@ -34,6 +35,26 @@ enum Command {
         /// Do not write the WCS sidecar even when the input is solved.
         #[arg(long)]
         no_sidecar: bool,
+        /// Block compression for TIFF output.
+        #[arg(long, value_enum, default_value_t = CompressionArg::None)]
+        compression: CompressionArg,
+        /// Deflate level 1-9 (buckets to fast/balanced/best); ignored unless
+        /// --compression deflate.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+        deflate_level: Option<u8>,
+        /// Apply the horizontal differencing predictor. Integer sample
+        /// formats only.
+        #[arg(long)]
+        predictor: bool,
+        /// Write tiles instead of strips.
+        #[arg(long)]
+        tiled: bool,
+        /// Tile edge in pixels; a power of two in 128..=1024.
+        #[arg(long, default_value_t = 256)]
+        tile_size: u32,
+        /// TIFF container variant.
+        #[arg(long, value_enum, default_value_t = ContainerArg::Auto)]
+        container: ContainerArg,
     },
     /// Publish an image as a self-hosted web viewer: DZI tile pyramid (or a
     /// single image below 4096 px) + Astrometrical-branded OpenSeadragon
@@ -66,6 +87,10 @@ enum Command {
 enum BitDepthArg {
     /// 32-bit float samples (lossless from XISF Float32).
     F32,
+    /// 64-bit float samples (BigTIFF/TIFF only).
+    F64,
+    /// 32-bit unsigned samples (BigTIFF/TIFF only; clamped to [0, 1], scaled).
+    U32,
     /// 16-bit unsigned samples (clamped to [0, 1], scaled).
     U16,
     /// 8-bit unsigned samples (clamped to [0, 1], scaled).
@@ -76,8 +101,55 @@ impl From<BitDepthArg> for BitDepth {
     fn from(v: BitDepthArg) -> Self {
         match v {
             BitDepthArg::F32 => BitDepth::F32,
+            BitDepthArg::F64 => BitDepth::F64,
+            BitDepthArg::U32 => BitDepth::U32,
             BitDepthArg::U16 => BitDepth::U16,
             BitDepthArg::U8 => BitDepth::U8,
+        }
+    }
+}
+
+/// CLI mirror of [`mpp_core::formats::tiff_write::Compression`].
+#[derive(Clone, Copy, ValueEnum)]
+enum CompressionArg {
+    /// No compression (default).
+    None,
+    /// LZW, lossless and widely supported.
+    Lzw,
+    /// Deflate/zlib, lossless, usually the smallest.
+    Deflate,
+    /// PackBits run-length encoding.
+    Packbits,
+}
+
+impl From<CompressionArg> for Compression {
+    fn from(v: CompressionArg) -> Self {
+        match v {
+            CompressionArg::None => Compression::None,
+            CompressionArg::Lzw => Compression::Lzw,
+            CompressionArg::Deflate => Compression::Deflate,
+            CompressionArg::Packbits => Compression::Packbits,
+        }
+    }
+}
+
+/// CLI mirror of [`mpp_core::formats::tiff_write::Container`].
+#[derive(Clone, Copy, ValueEnum)]
+enum ContainerArg {
+    /// Classic TIFF when the image fits, BigTIFF otherwise (default).
+    Auto,
+    /// Classic 32-bit TIFF; fails for images past 4 GB.
+    Classic,
+    /// BigTIFF, always.
+    Big,
+}
+
+impl From<ContainerArg> for Container {
+    fn from(v: ContainerArg) -> Self {
+        match v {
+            ContainerArg::Auto => Container::Auto,
+            ContainerArg::Classic => Container::Classic,
+            ContainerArg::Big => Container::Big,
         }
     }
 }
@@ -129,11 +201,30 @@ fn main() -> Result<()> {
             bit_depth,
             quality,
             no_sidecar,
+            compression,
+            deflate_level,
+            predictor,
+            tiled,
+            tile_size,
+            container,
         } => {
+            let layout = if tiled {
+                Layout::Tiles { size: tile_size }
+            } else {
+                Layout::Strips
+            };
             let opts = ConvertOptions {
                 bit_depth: bit_depth.map(Into::into),
                 sidecar: !no_sidecar,
                 quality,
+                tiff: TiffWriteOptions {
+                    container: container.into(),
+                    layout,
+                    compression: compression.into(),
+                    deflate_level,
+                    predictor,
+                    ..Default::default()
+                },
             };
             let report = convert(&input, &output, &opts)?;
             println!(
