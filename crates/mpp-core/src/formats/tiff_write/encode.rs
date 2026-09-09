@@ -1136,7 +1136,20 @@ mod tests {
         let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
         assert_eq!(dec.get_tag_u64(Tag::Compression).unwrap(), 5);
         match dec.read_image().unwrap() {
-            DecodingResult::F32(data) => assert_eq!(data.len(), 300 * 200 * 3),
+            DecodingResult::F32(data) => {
+                assert_eq!(data.len(), 300 * 200 * 3);
+                // Per-sample, not just per-length: a compressor-state leak
+                // across tiles (e.g. a stale `packed` buffer prefixing a
+                // later tile's bytes with an earlier tile's) would still
+                // decode to the right sample count but wrong pixels from
+                // the second tile onward, which a length-only check misses.
+                let total = (300 * 200 * 3) as f32;
+                for (j, &v) in data.iter().enumerate() {
+                    let (p, ch) = (j / 3, j % 3);
+                    let want = (ch * 300 * 200 + p) as f32 / total;
+                    assert!((v - want).abs() < 1e-7, "sample {j}");
+                }
+            }
             other => panic!("expected F32, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
