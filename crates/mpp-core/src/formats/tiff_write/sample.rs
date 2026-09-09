@@ -23,13 +23,29 @@ pub trait Sample: bytemuck::Pod {
 
     /// Convert a unit-range `f32` (the XISF path's sample domain) to this
     /// type, clamping out-of-range input.
+    ///
+    /// # This conversion exists twice, in two languages
+    ///
+    /// `ConvertSample()` in
+    /// `integration/pixinsight/module/BigTiffInstance.cpp` is an independent
+    /// C++ implementation of the same mapping, and the two **must agree**
+    /// sample for sample. They currently do, on all four properties that
+    /// define the mapping:
+    ///
+    /// 1. the scale is computed in `f64`, never `f32` (`u32::MAX` exceeds
+    ///    `f32`'s 24-bit mantissa);
+    /// 2. integer results round **half up** (`.round()` here on a
+    ///    non-negative value, `+ 0.5` then truncate there);
+    /// 3. out-of-range input **saturates** at `0` and the type's maximum
+    ///    rather than wrapping;
+    /// 4. `NaN` maps to `0`.
+    ///
+    /// Drift would be invisible in testing: the PixInsight module always
+    /// sets `band_format_ == bit_depth`, so bands reach the writer already
+    /// in the output type and take the verbatim path of
+    /// [`write_tiff_native`](super::write_tiff_native) — this method is
+    /// never called on the PixInsight route. Change one, change the other.
     fn from_unit_f32(v: f32) -> Self;
-
-    /// Convert this sample to the unit-range `f32` domain the converter's
-    /// XISF path uses. The inverse of [`Sample::from_unit_f32`] for the
-    /// integer types (up to rounding); a widening or narrowing cast for the
-    /// float ones.
-    fn to_unit_f32(self) -> f32;
 
     /// Append this sample's native-order bytes to `out`.
     fn push_ne(self, out: &mut Vec<u8>);
@@ -59,14 +75,6 @@ macro_rules! uint_sample {
                 scaled.round().clamp(0.0, <$t>::MAX as f64) as $t
             }
 
-            fn to_unit_f32(self) -> f32 {
-                // Divide in f64, mirroring `from_unit_f32`'s reasoning: for
-                // u32 the maximum exceeds f32's 24-bit mantissa, so the
-                // division has to happen at f64 precision before the
-                // narrowing cast back to f32.
-                (self as f64 / <$t>::MAX as f64) as f32
-            }
-
             fn push_ne(self, out: &mut Vec<u8>) {
                 out.extend_from_slice(&self.to_ne_bytes());
             }
@@ -91,10 +99,6 @@ impl Sample for f32 {
         v
     }
 
-    fn to_unit_f32(self) -> f32 {
-        self
-    }
-
     fn push_ne(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
@@ -114,10 +118,6 @@ impl Sample for f64 {
 
     fn from_unit_f32(v: f32) -> Self {
         f64::from(v)
-    }
-
-    fn to_unit_f32(self) -> f32 {
-        self as f32
     }
 
     fn push_ne(self, out: &mut Vec<u8>) {
@@ -191,14 +191,5 @@ mod tests {
         assert_eq!(0u16.wrapping_sub_sample(1), 65535);
         assert_eq!(0u32.wrapping_sub_sample(1), u32::MAX);
         assert_eq!(9u16.wrapping_sub_sample(4), 5);
-    }
-
-    #[test]
-    fn to_unit_f32_round_trips_with_from_unit_f32() {
-        assert_eq!(u16::from_unit_f32(u16::to_unit_f32(40000)), 40000);
-
-        for v in 0..=255u8 {
-            assert_eq!(u8::from_unit_f32(u8::to_unit_f32(v)), v);
-        }
     }
 }
