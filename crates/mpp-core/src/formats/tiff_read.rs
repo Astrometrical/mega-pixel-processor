@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use tiff::ColorType as TiffColorType;
 use tiff::decoder::ifd::Value;
-use tiff::decoder::{ChunkType, Decoder, DecodingResult};
+use tiff::decoder::{ChunkType, Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 
 use crate::{Error, Result};
@@ -59,6 +59,39 @@ const TAG_YCBCR_COEFFICIENTS: u16 = 529;
 /// reference pair of each of the three channels. Not in the `tiff` crate's
 /// [`Tag`] enum, so it is addressed by number.
 const TAG_REFERENCE_BLACK_WHITE: u16 = 532;
+
+/// Ceiling on an embedded ICC profile this reader will resolve into
+/// [`TiffInfo::icc_profile`], chosen to match `MAX_ICC_BYTES` in
+/// `mpp-ipc-worker` (the write path's cap on `InitMessage::icc_profile`
+/// after base64 decoding, documented in `docs/pi-protocol.md` §10) so a
+/// profile our own writer can legitimately embed always round-trips. The
+/// two crates cannot share a literal — `mpp-core` has no dependency on
+/// `mpp-ipc-worker` — so this constant exists purely to be kept in sync by
+/// hand; [`tests::a_profile_up_to_the_write_caps_size_round_trips`] guards
+/// the boundary from the read side.
+const ICC_PROFILE_MAX_BYTES: usize = 16 << 20;
+
+/// `tiff` 0.11.3's `Limits` (the decoder's default is 256 MiB) exists to
+/// bound how much a hostile header can make the decoder allocate before
+/// any of it is validated — but its `decoding_buffer_size` field also
+/// gates a BYTE/UNDEFINED-typed tag's byte count, divided by
+/// `size_of::<Value>()` (an implementation detail of the crate's own
+/// `Entry::vec_with_capacity`, not part of its public contract, hence
+/// computed here rather than hardcoded). At the crate's default that
+/// ceiling is exactly half of [`ICC_PROFILE_MAX_BYTES`] — comfortably
+/// under our own writer's sanctioned cap, so a legitimately-written large
+/// profile would silently fail to resolve. Scale `decoding_buffer_size` up
+/// (never down, so the unrelated per-chunk pixel-decode headroom this same
+/// field governs is only ever widened, never narrowed) just enough to
+/// cover [`ICC_PROFILE_MAX_BYTES`].
+fn tiff_limits() -> Limits {
+    let mut limits = Limits::default();
+    let needed = ICC_PROFILE_MAX_BYTES.saturating_mul(std::mem::size_of::<Value>());
+    if needed > limits.decoding_buffer_size {
+        limits.decoding_buffer_size = needed;
+    }
+    limits
+}
 
 /// Native sample format of a decoded TIFF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,7 +541,8 @@ impl TiffReader {
         file.rewind().map_err(|e| Error::io(path, e))?;
 
         let mut decoder = Decoder::new(PatchedReader::new(file, patch))
-            .map_err(|e| Error::format(path, format!("TIFF header: {e}")))?;
+            .map_err(|e| Error::format(path, format!("TIFF header: {e}")))?
+            .with_limits(tiff_limits());
 
         let (width, height) = decoder
             .dimensions()
@@ -683,21 +717,31 @@ impl TiffReader {
             }
         };
 
-        // Tag 34675. Absent on most astro TIFFs; `get_tag_u8_vec` errors
-        // rather than returning None when the tag is missing, so treat any
-        // failure as "no profile" rather than a file error. Written as
-        // `Type::UNDEFINED` by our own writer; the `tiff` crate's decoder
-        // (0.11.3) reads UNDEFINED into the same `Byte`/`List(Byte)` values
-        // as BYTE (see its `decoder/ifd.rs`), so `get_tag_u8_vec` handles it
-        // with no special-casing needed. This runs on `decoder` itself, so
-        // it works unchanged through the palette `PatchedReader`: that
-        // wrapper only substitutes bytes at the `PhotometricInterpretation`
-        // entry's own offset, leaving every other tag — this one included —
-        // untouched.
-        let icc_profile = decoder
-            .get_tag_u8_vec(Tag::IccProfile)
-            .ok()
-            .filter(|v| !v.is_empty());
+        // Tag 34675. Absent on most astro TIFFs, in which case there is no
+        // profile — but present-and-unreadable (a type this reader cannot
+        // treat as bytes, or a profile past `ICC_PROFILE_MAX_BYTES` even
+        // with `tiff_limits`'s widened ceiling) must fail the open by name,
+        // not silently report "no profile" — the exact class of failure
+        // `icc_profile_tag`'s docs and this reader's CMYK/Lab rejection
+        // both refuse. Written as `Type::UNDEFINED` by our own writer; the
+        // `tiff` crate's decoder (0.11.3) reads UNDEFINED into the same
+        // `Byte`/`List(Byte)` values as BYTE (see its `decoder/ifd.rs`), so
+        // `Value::into_u8_vec` handles it with no special-casing needed.
+        // This runs on `decoder` itself, so it works unchanged through the
+        // palette `PatchedReader`: that wrapper only substitutes bytes at
+        // the `PhotometricInterpretation` entry's own offset, leaving every
+        // other tag — this one included — untouched.
+        let icc_profile = match icc_profile_tag(&mut decoder) {
+            TagRead::Absent => None,
+            TagRead::Unreadable(why) => {
+                return Err(Error::format(
+                    path,
+                    format!("unsupported TIFF IccProfile tag: {why}"),
+                ));
+            }
+            TagRead::Values(bytes) if bytes.is_empty() => None,
+            TagRead::Values(bytes) => Some(bytes),
+        };
 
         let total_channels = color_channels + alpha_channels;
         // Planar storage only means anything when the *file* stores more than
@@ -938,19 +982,22 @@ fn resolve_sample_format(path: &Path, sample_format_tag: u16, bits: u8) -> Resul
     }
 }
 
-/// The three distinguishable outcomes of reading a RATIONAL-valued tag.
+/// The three distinguishable outcomes of reading a tag, generic over the
+/// value type a successful read produces.
 ///
 /// The distinction that matters is [`Self::Absent`] versus
-/// [`Self::Unreadable`]: falling back to a spec default is right for a tag
-/// the file never wrote, and wrong for one it wrote and we could not
-/// understand. Collapsing the two — as an `Option` would — is precisely the
+/// [`Self::Unreadable`]: falling back to a spec default (or, for
+/// [`icc_profile_tag`], to "no profile") is right for a tag the file never
+/// wrote, and wrong for one it wrote and we could not understand.
+/// Collapsing the two — as an `Option` would — is precisely the
 /// silent-misrepresentation failure this reader refuses CMYK to avoid.
 #[derive(Debug)]
-enum TagRead {
-    /// The tag is not in the directory; the spec default applies.
+enum TagRead<T> {
+    /// The tag is not in the directory; the spec default (or "absent")
+    /// applies.
     Absent,
     /// The tag is present and every value read cleanly.
-    Values(Vec<f32>),
+    Values(T),
     /// The tag is present but could not be made sense of. The string says
     /// how, for the error message.
     Unreadable(String),
@@ -964,7 +1011,7 @@ enum TagRead {
 /// directory entry, a value that is not RATIONAL (an SRATIONAL, say), a
 /// zero denominator — yields [`TagRead::Unreadable`], never
 /// [`TagRead::Absent`].
-fn rational_tag<R: Read + Seek>(decoder: &mut Decoder<R>, tag: u16) -> TagRead {
+fn rational_tag<R: Read + Seek>(decoder: &mut Decoder<R>, tag: u16) -> TagRead<Vec<f32>> {
     let value = match decoder.find_tag(Tag::from_u16_exhaustive(tag)) {
         Ok(Some(value)) => value,
         Ok(None) => return TagRead::Absent,
@@ -1006,6 +1053,33 @@ fn rational_tag<R: Read + Seek>(decoder: &mut Decoder<R>, tag: u16) -> TagRead {
         values.push(numerator as f32 / denominator as f32);
     }
     TagRead::Values(values)
+}
+
+/// Read tag 34675 (`IccProfile`) as raw bytes.
+///
+/// Shares [`rational_tag`]'s Absent/Unreadable distinction, extended to
+/// cover one more way a *present* tag can fail: exceeding
+/// [`ICC_PROFILE_MAX_BYTES`] (via [`tiff_limits`]'s widened but still
+/// finite `decoding_buffer_size`) surfaces from `find_tag` as an `Err`, the
+/// same as any other unreadable directory entry — there is no separate
+/// size check here, the `tiff` crate's own `LimitsExceeded` does the job.
+/// Either way, "present but unreadable" must reach the caller as a named
+/// error, never as [`TagRead::Absent`] — collapsing the two, as an early
+/// version of this function did by mapping every `Err` straight to `None`,
+/// is exactly the silent-misrepresentation failure [`rational_tag`]'s docs
+/// describe.
+fn icc_profile_tag<R: Read + Seek>(decoder: &mut Decoder<R>) -> TagRead<Vec<u8>> {
+    let value = match decoder.find_tag(Tag::IccProfile) {
+        Ok(Some(value)) => value,
+        Ok(None) => return TagRead::Absent,
+        Err(e) => {
+            return TagRead::Unreadable(format!("its directory entry could not be read: {e}"));
+        }
+    };
+    match value.into_u8_vec() {
+        Ok(bytes) => TagRead::Values(bytes),
+        Err(e) => TagRead::Unreadable(format!("it could not be read as a byte string: {e}")),
+    }
 }
 
 /// Build the `YCbCr` -> RGB inverse for this file, from its
@@ -2675,6 +2749,71 @@ mod tests {
 
         let reader = TiffReader::open(&path).unwrap();
         assert_eq!(reader.info().icc_profile.as_deref(), Some(&icc[..]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_profile_up_to_the_write_caps_size_round_trips() {
+        // Exactly `ICC_PROFILE_MAX_BYTES` (16 MiB): the top of the write
+        // path's own sanctioned cap (`MAX_ICC_BYTES` in `mpp-ipc-worker`),
+        // and well past the `tiff` crate's *default* `Limits::
+        // decoding_buffer_size`, which caps a BYTE/UNDEFINED tag at exactly
+        // half that (8 MiB) unless `tiff_limits` widens it. Proves the two
+        // caps actually agree at runtime, not just in a doc comment.
+        use crate::formats::tiff_write::{TiffWriteOptions, write_tiff};
+        let dir = tmpdir("icc-large");
+        let src = dir.join("icc.tif");
+        let icc: Vec<u8> = (0u8..=255).cycle().take(ICC_PROFILE_MAX_BYTES).collect();
+        write_tiff(
+            &synth_planar(4, 4, 1),
+            &src,
+            &TiffWriteOptions {
+                icc_profile: Some(icc.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let reader = TiffReader::open(&src).unwrap();
+        let got = reader
+            .info()
+            .icc_profile
+            .as_deref()
+            .expect("a 16 MiB profile must still be read back, not reported absent");
+        // Cheap correctness check in place of a full 16 MiB comparison:
+        // length, plus a handful of sampled offsets across the buffer.
+        assert_eq!(got.len(), icc.len());
+        for i in [0, 1, icc.len() / 2, icc.len() - 1] {
+            assert_eq!(got[i], icc[i], "byte {i} mismatch");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_present_but_unreadable_icc_tag_is_refused_by_name() {
+        // Tag 34675 written as SHORT rather than BYTE/UNDEFINED: a type
+        // `Value::into_u8_vec` cannot resolve to bytes (`Short(_).into_u8()`
+        // has no numeric coercion, however small the value). The tag is
+        // present, so this must fail `open` by name, not silently report
+        // "no profile" — collapsing the two is exactly the
+        // silent-misrepresentation failure `icc_profile_tag`'s docs and
+        // this reader's CMYK/Lab rejection both refuse.
+        let dir = tmpdir("icc-unreadable");
+        let path = dir.join("in.tif");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+        let mut image = enc.new_image::<colortype::Gray8>(4, 4).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::IccProfile, &[1u16, 2u16, 3u16][..])
+            .unwrap();
+        image.write_data(&[0u8; 16]).unwrap();
+
+        let err = TiffReader::open(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("iccprofile"),
+            "expected error to name the IccProfile tag, got: {msg}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
