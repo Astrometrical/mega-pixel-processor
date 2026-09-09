@@ -847,30 +847,52 @@ mod tests {
 
     #[test]
     #[cfg(target_endian = "little")]
-    fn an_explicit_big_container_writes_bigtiff_magic() {
-        let dir = tmpdir("big-magic");
-        let out = dir.join("out.tif");
-        let img = Synth::new(4, 4, 1);
+    fn container_choice_shows_in_the_file_header() {
+        // Supersedes the old `an_explicit_big_container_writes_bigtiff_magic`:
+        // that test covered explicit Big plus the Auto-picks-classic contrast;
+        // this one folds in the explicit Classic case too, so there is one
+        // coherent set of container tests instead of two overlapping ones.
+        let dir = tmpdir("container");
+        let img = Synth::new(8, 8, 1);
+
+        let classic = dir.join("classic.tif");
         write_tiff(
             &img,
-            &out,
+            &classic,
+            &TiffWriteOptions {
+                container: Container::Classic,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            magic(&classic),
+            [0x49, 0x49, 0x2A, 0x00],
+            "classic TIFF magic"
+        );
+
+        let big = dir.join("big.tif");
+        write_tiff(
+            &img,
+            &big,
             &TiffWriteOptions {
                 container: Container::Big,
                 ..Default::default()
             },
         )
         .unwrap();
-        assert_eq!(magic(&out), [0x49, 0x49, 0x2B, 0x00], "BigTIFF magic");
+        assert_eq!(magic(&big), [0x49, 0x49, 0x2B, 0x00], "BigTIFF magic");
 
-        // The same image under the default `Auto` is small enough for
-        // classic, which is the contrast this test exists to show.
-        let classic = dir.join("classic.tif");
-        write_tiff(&img, &classic, &TiffWriteOptions::default()).unwrap();
+        // Auto on a small image picks classic (spec finding 3: we own
+        // .tif/.tiff now, so a small save must stay universally readable).
+        let auto = dir.join("auto.tif");
+        write_tiff(&img, &auto, &TiffWriteOptions::default()).unwrap();
         assert_eq!(
-            magic(&classic),
+            magic(&auto),
             [0x49, 0x49, 0x2A, 0x00],
-            "classic TIFF magic"
+            "Auto picks classic when it fits"
         );
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1054,6 +1076,68 @@ mod tests {
                 }
             }
             other => panic!("expected U16, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tiled_output_writes_tile_tags_and_round_trips() {
+        use crate::formats::tiff_write::options::Layout;
+        let dir = tmpdir("tiles");
+        let out = dir.join("out.tif");
+        // 300x200 with 128-pixel tiles: 3 tile columns x 2 tile rows, so
+        // the right column and bottom row are both partial, including the
+        // bottom-right corner tile which is partial in both axes.
+        let img = Synth::new(300, 200, 1);
+        let opts = TiffWriteOptions {
+            layout: Layout::Tiles { size: 128 },
+            ..Default::default()
+        };
+        write_tiff(&img, &out, &opts).unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u64(Tag::TileWidth).unwrap(), 128);
+        assert_eq!(dec.get_tag_u64(Tag::TileLength).unwrap(), 128);
+        assert_eq!(dec.get_tag_u64_vec(Tag::TileOffsets).unwrap().len(), 6);
+        assert_eq!(dec.get_tag_u64_vec(Tag::TileByteCounts).unwrap().len(), 6);
+        // Every tile is full size on disk, edge tiles included.
+        for count in dec.get_tag_u64_vec(Tag::TileByteCounts).unwrap() {
+            assert_eq!(count, 128 * 128 * 4);
+        }
+        assert!(
+            dec.get_tag(Tag::StripOffsets).is_err(),
+            "no strip tags in a tiled file"
+        );
+
+        match dec.read_image().unwrap() {
+            DecodingResult::F32(data) => {
+                assert_eq!(data.len(), 300 * 200);
+                for (i, v) in data.iter().enumerate() {
+                    assert!((v - i as f32 / 60_000.0).abs() < 1e-7, "sample {i}");
+                }
+            }
+            other => panic!("expected F32, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tiled_output_compresses_per_tile() {
+        use crate::formats::tiff_write::options::{Compression, Layout};
+        let dir = tmpdir("tiles-lzw");
+        let out = dir.join("out.tif");
+        let img = Synth::new(300, 200, 3);
+        let opts = TiffWriteOptions {
+            layout: Layout::Tiles { size: 256 },
+            compression: Compression::Lzw,
+            ..Default::default()
+        };
+        write_tiff(&img, &out, &opts).unwrap();
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u64(Tag::Compression).unwrap(), 5);
+        match dec.read_image().unwrap() {
+            DecodingResult::F32(data) => assert_eq!(data.len(), 300 * 200 * 3),
+            other => panic!("expected F32, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
