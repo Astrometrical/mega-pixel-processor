@@ -9,7 +9,9 @@
 //! well as decoded pixels.
 
 pub mod options;
+pub mod sample;
 
 pub use options::{
     AlphaMode, Compression, Container, Layout, Resolution, ResolutionUnit, TiffWriteOptions,
 };
+pub use sample::Sample;
