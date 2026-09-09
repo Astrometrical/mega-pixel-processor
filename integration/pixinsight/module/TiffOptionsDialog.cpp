@@ -38,11 +38,17 @@ namespace
  * embedded NULs (Task 8), and TiffWriteOptions::validate now reports that as
  * a named error, so both are filtered out here rather than failing the save.
  * Truncation is to capacity-1 characters so the result is always
- * NUL-terminated. Doing it at harvest time means the user sees the accepted
- * text the next time the dialog is opened.
+ * NUL-terminated. This runs only from HarvestControls(), i.e. only when the
+ * user accepts the dialog: the Edit controls themselves are never rewritten,
+ * so nothing is silently removed from under a half-typed line. What the user
+ * can see instead is the length limit (Edit::SetMaxLength) and each edit's
+ * tooltip, which states the ASCII restriction.
  */
 void CopyAsciiTag( char* dst, size_t capacity, const String& src )
 {
+   if ( capacity == 0 )
+      return;   // Nowhere to write, not even the terminator.
+
    size_t n = 0;
    for ( size_type i = 0; i < src.Length() && n < capacity-1; ++i )
    {
@@ -520,14 +526,7 @@ void TiffOptionsDialog::UpdateControls()
    CompressionMethod_ComboBox.SetCurrentItem( int( m_formatOptions.compression ) );
    DeflateLevel_SpinBox.SetValue( int( m_formatOptions.deflateLevel ) );
 
-   // TIFF tag 317 is defined for integer samples only, and the engine's
-   // TiffWriteOptions::validate rejects predictor + a float sample format, so
-   // the check box goes away rather than producing an error at save time.
-   Predictor_CheckBox.SetChecked( m_formatOptions.predictor && !isFloat );
-   Predictor_CheckBox.Enable( !isFloat );
-
-   // Only Deflate consults a level.
-   DeflateLevel_SpinBox.Enable( m_formatOptions.compression == TiffCompression::Deflate );
+   Predictor_CheckBox.SetChecked( m_formatOptions.predictor );
 
    // --- Layout.
    Container_ComboBox.SetCurrentItem( int( m_formatOptions.container ) );
@@ -536,12 +535,10 @@ void TiffOptionsDialog::UpdateControls()
    Strips_RadioButton.SetChecked( !tiled );
    Tiles_RadioButton.SetChecked( tiled );
    TileSize_ComboBox.SetCurrentItem( TileSizeItemIndex( m_formatOptions.tileSize ) );
-   TileSize_ComboBox.Enable( tiled );
 
    // --- Embedded data.
    EmbedICC_CheckBox.SetChecked( m_imageOptions.embedICCProfile );
    Alpha_ComboBox.SetCurrentItem( m_imageHasAlpha ? int( m_formatOptions.alpha ) : 0 );
-   Alpha_ComboBox.Enable( m_imageHasAlpha );
 
    // --- Metadata.
    Description_Edit.SetText( String( m_formatOptions.description ) );
@@ -551,6 +548,38 @@ void TiffOptionsDialog::UpdateControls()
    XResolution_NumericEdit.SetValue( m_imageOptions.xResolution );
    YResolution_NumericEdit.SetValue( m_imageOptions.yResolution );
    ResolutionUnit_ComboBox.SetCurrentItem( m_imageOptions.metricResolution ? 1 : 0 );
+
+   UpdateEnableStates();
+}
+
+// ----------------------------------------------------------------------------
+
+void TiffOptionsDialog::UpdateEnableStates()
+{
+   // Reads the controls directly rather than round-tripping through the two
+   // option structs. That matters: a HarvestControls() here would push the
+   // three text edits through CopyAsciiTag and UpdateControls() would then
+   // write the filtered result back into them, so a description containing an
+   // accented character would lose it the moment the user clicked any radio
+   // button. Every rule below depends only on control state anyway.
+
+   // TIFF tag 317 is defined for integer samples only, and the engine's
+   // TiffWriteOptions::validate rejects predictor + a float sample format, so
+   // the check box goes away rather than producing an error at save time.
+   const bool isFloat = Float32_RadioButton.IsChecked() || Float64_RadioButton.IsChecked();
+   if ( isFloat )
+      Predictor_CheckBox.SetChecked( false );
+   Predictor_CheckBox.Enable( !isFloat );
+
+   // Only Deflate consults a level.
+   DeflateLevel_SpinBox.Enable( CompressionMethod_ComboBox.CurrentItem()
+                                 == int( TiffCompression::Deflate ) );
+
+   // Only the tiled layout consults a tile size.
+   TileSize_ComboBox.Enable( Tiles_RadioButton.IsChecked() );
+
+   // An image with no alpha channel has nothing to associate.
+   Alpha_ComboBox.Enable( m_imageHasAlpha );
 }
 
 // ----------------------------------------------------------------------------
@@ -606,8 +635,11 @@ void TiffOptionsDialog::HarvestControls()
    m_formatOptions.alpha = m_imageHasAlpha ? TiffAlpha( uint8_t( Max( 0, Alpha_ComboBox.CurrentItem() ) ) )
                                            : TiffAlpha::None;
 
-   // --- Metadata. Truncated and reduced to printable 7-bit ASCII here, where
-   // reopening the dialog shows the user exactly what will be written.
+   // --- Metadata. Truncated and reduced to printable 7-bit ASCII here, and
+   // only here: this runs when the user accepts the dialog, so the Edit
+   // controls are never rewritten while they are still being typed into. The
+   // visible cues are Edit::SetMaxLength for the length and each edit's
+   // tooltip for the ASCII restriction.
    CopyAsciiTag( m_formatOptions.description, TiffTextTagCapacity, Description_Edit.Text().Trimmed() );
    CopyAsciiTag( m_formatOptions.copyright, TiffTextTagCapacity, Copyright_Edit.Text().Trimmed() );
    CopyAsciiTag( m_formatOptions.software, TiffTextTagCapacity, Software_Edit.Text().Trimmed() );
@@ -621,30 +653,30 @@ void TiffOptionsDialog::HarvestControls()
 // Event handlers.
 // ----------------------------------------------------------------------------
 
+// Each of these changes a control that another control's availability depends
+// on, so they re-apply every enable rule from the one place that owns them.
+// They deliberately do NOT harvest: see the comment in UpdateEnableStates().
+
 void TiffOptionsDialog::e_SampleFormatClick( Button&, bool )
 {
-   // The predictor's availability depends on the sample format, so harvest
-   // the current state and re-apply every enable rule from one place.
-   HarvestControls();
-   UpdateControls();
+   UpdateEnableStates();
 }
 
 void TiffOptionsDialog::e_CompressionItemSelected( ComboBox&, int )
 {
-   HarvestControls();
-   UpdateControls();
+   UpdateEnableStates();
 }
 
 void TiffOptionsDialog::e_LayoutClick( Button&, bool )
 {
-   HarvestControls();
-   UpdateControls();
+   UpdateEnableStates();
 }
 
 void TiffOptionsDialog::e_ContainerItemSelected( ComboBox&, int )
 {
-   HarvestControls();
-   UpdateControls();
+   // No enable rule depends on the container today; wired for symmetry with
+   // the other selectors, and so a future container-dependent rule lands here.
+   UpdateEnableStates();
 }
 
 void TiffOptionsDialog::e_ButtonClick( Button& sender, bool )

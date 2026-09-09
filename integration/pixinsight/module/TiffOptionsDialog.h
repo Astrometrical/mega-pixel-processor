@@ -186,7 +186,19 @@ private:
    void UpdateControls();
 
    /*!
+    * \brief Re-applies the enable rules from the controls' own state.
+    *
+    * Called by UpdateControls() and by every handler whose control governs
+    * another control's availability. It does not harvest, so the text edits
+    * are never rewritten while the user is still typing into them.
+    */
+   void UpdateEnableStates();
+
+   /*!
     * \brief Reads every control back into m_imageOptions/m_formatOptions.
+    *
+    * Called only when the user accepts the dialog. The three TIFF text tags
+    * are truncated and reduced to printable 7-bit ASCII on the way in.
     */
    void HarvestControls();
 

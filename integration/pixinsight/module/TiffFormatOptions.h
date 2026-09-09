@@ -3,9 +3,19 @@
 //
 // PCL owns this block's lifetime across a module boundary
 // (MetaFileFormat::ValidateFormatSpecificData/DisposeFormatSpecificData),
-// so it is a POD with fixed-width fields and fixed-size character arrays:
-// no pointers, no std::string, nothing whose layout could differ between
-// the allocating and freeing side.
+// so it is STANDARD-LAYOUT and TRIVIALLY COPYABLE: fixed-width fields and
+// fixed-size character arrays, no pointers, no std::string, nothing whose
+// layout could differ between the allocating and freeing side, and nothing
+// that needs a destructor run on the side that frees it.
+//
+// Those are the two properties, asserted below; note that the struct is
+// deliberately NOT trivial and NOT a POD in the pre-C++20 sense, because the
+// default member initializers give it a non-trivial default constructor.
+// That is wanted -- the defaults are the module's contract -- and it is
+// irrelevant to crossing the boundary, where all that matters is that the
+// bytes may be memcpy'd and that destruction is a no-op. Do not "fix" a
+// failing std::is_pod_v by deleting the initializers: that would silently
+// drop every default in the struct.
 //
 // Everything the core already models -- sample format, resolution, ICC
 // embedding -- lives in pcl::ImageOptions instead; this block carries only
@@ -23,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace pcl
 {
@@ -91,8 +102,9 @@ constexpr size_t TiffTextTagCapacity = 256;
  * \struct TiffFormatOptions
  * \brief Per-save TIFF options that pcl::ImageOptions does not model.
  *
- * A POD by design: PCL, not this module, decides when the block is copied
- * and destroyed, so every field is fixed-width and self-contained.
+ * Standard-layout and trivially copyable by design: PCL, not this module,
+ * decides when the block is copied and destroyed, so every field is
+ * fixed-width and self-contained.
  */
 struct TiffFormatOptions
 {
@@ -173,6 +185,25 @@ struct TiffFormatOptions
     */
    char software[ TiffTextTagCapacity ] = {};
 };
+
+/*
+ * The two properties the module boundary actually depends on, checked at
+ * compile time because this header has no other automated gate:
+ *
+ *   - standard layout, so both sides of the boundary agree on the offset of
+ *     every field regardless of which compiler saw the definition;
+ *   - trivially copyable, so PCL may duplicate the block with a plain memcpy
+ *     and release it without running a destructor.
+ *
+ * Deliberately NOT std::is_pod_v / std::is_trivial_v: the default member
+ * initializers above make the default constructor non-trivial, which those
+ * traits reject and which the boundary does not care about. See the note at
+ * the top of this file.
+ */
+static_assert( std::is_standard_layout_v<TiffFormatOptions>,
+               "TiffFormatOptions must be standard-layout: PCL and the module must agree on field offsets." );
+static_assert( std::is_trivially_copyable_v<TiffFormatOptions>,
+               "TiffFormatOptions must be trivially copyable: PCL copies and frees the block without running our code." );
 
 // ----------------------------------------------------------------------------
 
