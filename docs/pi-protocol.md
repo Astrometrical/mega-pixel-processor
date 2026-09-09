@@ -1,4 +1,4 @@
-# mpp IPC wire protocol (v2)
+# mpp IPC wire protocol (v3)
 
 This is the contract between a host process (the PixInsight PCL module,
 Plan B) and `mpp-ipc-worker`, the Rust process that links `mpp-core` and
@@ -25,13 +25,25 @@ This protocol is a direct descendant of `mmm-ipc`'s own wire protocol
 format, same shm-ownership rules, same versioning discipline — slimmed down
 because this direction only needs pixels pushed one way.
 
-**Version 2** (this revision) adds a second, opposite-direction flow
-alongside the original v1 write path described in §1-§8 below: a **read**
-mode in which the worker opens an existing TIFF/BigTIFF file and *pulls*
-bands from the host instead of the host pushing them. §1-§8 remain accurate
-and unchanged for a write session; §9 documents everything read-mode adds
+**Version 2** adds a second, opposite-direction flow alongside the original
+v1 write path described in §1-§8 below: a **read** mode in which the worker
+opens an existing TIFF/BigTIFF file and *pulls* bands from the host instead
+of the host pushing them. §9 documents everything read-mode adds
 (`InitMessage.mode`, the `ImageMeta` frame, the `ReadBand`/`ReadBandAck`
 exchange, and the inverted slot-ownership rule that comes with it).
+
+**Version 3** (this revision) widens `InitMessage` and nothing else — no new
+tag, no changed binary layout, no changed lifecycle rule. It adds
+`band_format`, naming the sample type the host places in shm slots (before
+v3, every band crossed shm as unit-range `f32`), and fourteen fields
+carrying the TIFF writer's full option set: container, block layout and tile
+size, compression, deflate level, predictor, alpha association, an ICC
+profile, three text tags, and resolution. **`band_format` describes the shm
+payload; `bit_depth` describes the output file** — separating those two is
+the entire point of the version. Every v3 field has a wire default, so a v2
+host's `Init` payload still deserializes into exactly the v2 behaviour. §10
+is the complete v3 contract; §5's field table, §6's alignment rule and §8's
+version history are updated in place.
 
 ## 1. Overview & topology
 
@@ -180,12 +192,44 @@ pub struct InitMessage {
     pub width: u64,
     pub height: u64,
     pub channels: u64,                // 1 or 3
-    pub bit_depth: String,            // "f32" | "u16" | "u8"
+    pub bit_depth: String,            // OUTPUT FILE format: "f32"|"f64"|"u32"|"u16"|"u8"
     pub shm_name: String,
     pub slot_bytes: u64,              // uniform slot size; >= max band bytes
     pub slots: u32,                   // number of input slots, >= 1
     #[serde(default)]
     pub mode: SessionMode,            // "write" (default) | "read" — v2
+
+    // ---- v3: every field below has a wire default (§10) ----
+    #[serde(default = "default_band_format")]
+    pub band_format: String,          // SHM PAYLOAD type: "f32"|"f64"|"u32"|"u16"|"u8"
+    #[serde(default = "default_container")]
+    pub container: String,            // "auto" | "classic" | "big"
+    #[serde(default = "default_layout")]
+    pub layout: String,               // "strips" | "tiles"
+    #[serde(default = "default_tile_size")]
+    pub tile_size: u32,               // power of two, 128..=1024
+    #[serde(default = "default_compression")]
+    pub compression: String,          // "none" | "lzw" | "deflate" | "packbits"
+    #[serde(default = "default_deflate_level")]
+    pub deflate_level: u8,            // 1..=9 — default 6, NOT 0
+    #[serde(default)]
+    pub predictor: bool,
+    #[serde(default = "default_alpha")]
+    pub alpha: String,                // "none" | "unassociated" | "associated"
+    #[serde(default)]
+    pub icc_profile: String,          // base64; "" = absent
+    #[serde(default)]
+    pub description: String,          // TIFF tag 270; "" = absent
+    #[serde(default)]
+    pub copyright: String,            // TIFF tag 33432; "" = absent
+    #[serde(default)]
+    pub software: String,             // TIFF tag 305; "" = absent
+    #[serde(default)]
+    pub x_resolution: f64,            // pixels per unit; 0 = unknown
+    #[serde(default)]
+    pub y_resolution: f64,
+    #[serde(default = "default_resolution_unit")]
+    pub resolution_unit: String,      // "inch" | "cm"
 }
 ```
 
@@ -197,23 +241,41 @@ not `{"Init": {...}}`.
 
 | field | type | notes |
 |---|---|---|
-| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `2`) |
+| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `3`) |
 | `worker_version` | string | must equal the worker binary's `CARGO_PKG_VERSION` exactly (see §8) |
 | `output_path` | string | filesystem path the worker will write the encoded output file to |
 | `width` | u64 | image width in pixels |
 | `height` | u64 | image height in pixels |
-| `channels` | u64 | `1` (mono) or `3` (RGB) |
-| `bit_depth` | string | `"f32"`, `"u16"`, or `"u8"` — sample format of the *output* file; input bands over shm are always native-endian `f32` regardless of this value (see §6) |
+| `channels` | u64 | `1` (gray), `2` (gray+alpha), `3` (RGB) or `4` (RGBA); `2` and `4` require an `alpha` association |
+| `bit_depth` | string | `"f32"`, `"f64"`, `"u32"`, `"u16"` or `"u8"` — sample format of the **output file**. The shm payload's own sample type is `band_format`, a separate field (see §10); before v3 there was no such field and bands were always unit-range `f32`. |
 | `shm_name` | string | name of the shm segment the host already created |
 | `slot_bytes` | u64 | size in bytes of **one** slot — must be large enough for the largest band the host will ever send; see §6's validation rule |
 | `slots` | u32 | number of slots in the segment, `>= 1` |
 | `mode` | string | **(v2)** `"write"` or `"read"` — see §9. Absent in a v1 payload, which deserializes as `"write"` for wire-compat; a v2 host always emits the field explicitly (§9.1). |
+| `band_format` | string | **(v3)** default `"f32"`. Sample type of the pixel data the host places in **shm slots**: `"f32"`, `"f64"`, `"u32"`, `"u16"` or `"u8"`. Coupled to `bit_depth` by the rule in §10.1. |
+| `container` | string | **(v3)** default `"auto"`. `"auto"` (classic TIFF until the payload no longer fits, unless a `.btf`/`.tf8` output extension declares BigTIFF), `"classic"` or `"big"`. |
+| `layout` | string | **(v3)** default `"strips"`. `"strips"` (full-width, ~4 MiB each) or `"tiles"`. |
+| `tile_size` | u32 | **(v3)** default `256`. Tile edge in pixels, a power of two in `128..=1024`. Ignored — not validated — unless `layout` is `"tiles"`. |
+| `compression` | string | **(v3)** default `"none"`. `"none"`, `"lzw"`, `"deflate"` or `"packbits"`. |
+| `deflate_level` | u8 | **(v3)** default **`6`**, not `0`. Level `1..=9`. Ignored — not validated — unless `compression` is `"deflate"`. |
+| `predictor` | bool | **(v3)** default `false`. Horizontal differencing predictor; rejected for a floating-point `bit_depth`. |
+| `alpha` | string | **(v3)** default `"none"`. `"none"`, `"unassociated"` or `"associated"`; must agree with `channels` in both directions. |
+| `icc_profile` | string | **(v3)** default `""` (absent). Base64 (standard alphabet) ICC profile to embed; capped at 16 MiB decoded. |
+| `description` | string | **(v3)** default `""` (absent). `ImageDescription`, TIFF tag 270. |
+| `copyright` | string | **(v3)** default `""` (absent). `Copyright`, TIFF tag 33432. |
+| `software` | string | **(v3)** default `""` (absent). `Software`, TIFF tag 305. |
+| `x_resolution` | f64 | **(v3)** default `0.0`. Horizontal resolution in pixels per `resolution_unit`; `0` means unknown and writes no resolution tags. |
+| `y_resolution` | f64 | **(v3)** default `0.0`. Vertical resolution; see `x_resolution`. |
+| `resolution_unit` | string | **(v3)** default `"inch"`. `"inch"` (TIFF `ResolutionUnit = 2`) or `"cm"`. |
 
-Example (write session, `mode` omitted — a v1 payload still parses this way):
+Example 1 — the minimal payload a **v2** host sends. Every v3 field is
+absent, and each one takes the default in the table above, which is exactly
+the v1/v2 behaviour (f32 bands, strips, no compression, no alpha, no
+metadata):
 
 ```jsonc
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "worker_version": "0.1.0",
   "output_path": "/tmp/M31-mosaic.tf8",
   "width": 12000,
@@ -226,14 +288,55 @@ Example (write session, `mode` omitted — a v1 payload still parses this way):
 }
 ```
 
-A v2 host emits `mode` explicitly either way — see §9.1 for the read-session
-form of this example.
+(`slot_bytes` above is sized for a 400-row band of a 12000-px-wide image
+with `band_format` at its `"f32"` default: `400 * 12000 * 4 = 19_200_000` —
+in practice the host picks a band height that fits its own memory budget and
+computes `slot_bytes` from it — the value here is illustrative, not a fixed
+formula the worker enforces beyond the `>=` bound in §6.)
 
-(`slot_bytes` above is sized for a 400-row band of a 12000-px-wide image:
-`400 * 12000 * 4 = 19_200_000` — in practice the host picks a band height
-that fits its own memory budget and computes `slot_bytes` from it — the
-value here is illustrative, not a fixed formula the worker enforces beyond
-the `>=` bound in §6.)
+Example 2 — a **v3** write session: native `u32` samples crossing shm
+untouched, 512-pixel tiles, Deflate with a predictor, and metadata. Note
+`band_format` equal to `bit_depth`, as §10.1 requires for a non-`"f32"`
+band format, and `slot_bytes` sized in `u32` samples
+(`400 * 12000 * 4 = 19_200_000`, four bytes per sample here as well):
+
+```jsonc
+{
+  "protocol_version": 3,
+  "worker_version": "0.1.0",
+  "output_path": "/tmp/M31-mosaic.tf8",
+  "width": 12000,
+  "height": 9000,
+  "channels": 4,
+  "bit_depth": "u32",
+  "shm_name": "/mpp-ipc-3f2a91",
+  "slot_bytes": 19200000,
+  "slots": 4,
+  "mode": "write",
+  "band_format": "u32",
+  "container": "big",
+  "layout": "tiles",
+  "tile_size": 512,
+  "compression": "deflate",
+  "deflate_level": 9,
+  "predictor": true,
+  "alpha": "unassociated",
+  "icc_profile": "",
+  "description": "M31 — 4x3 mosaic",
+  "copyright": "(c) 2026",
+  "software": "mpp",
+  "x_resolution": 300.0,
+  "y_resolution": 300.0,
+  "resolution_unit": "cm"
+}
+```
+
+A v2-or-later host emits `mode` explicitly either way — see §9.1 for the
+read-session form of this example. The C++ host
+(`integration/pixinsight/host/mpp_protocol.cpp`'s `encode_init`) emits every
+v3 field on every `Init`, at its default when the caller did not set it: an
+omitted field and a field carrying its default value mean exactly the same
+thing to the worker.
 
 **Integer width.** Every numeric field above (`width`, `height`, `channels`,
 `slot_bytes` as `u64`; `protocol_version`, `slots` as `u32`) is transmitted
@@ -303,10 +406,12 @@ slot_offset(i) = slot_bytes * i        for i in [0, slots)
 (`N` = `slots`.)
 
 **Pixel layout inside a slot.** A slot filled for a `Band { channel,
-start_row, rows, slot }` frame holds `rows * width` `f32` samples of that
-one channel, **native-endian** (the segment is memory-mapped raw floats,
-not a serialized wire format — both processes are expected to run on the
-same machine/architecture), row-major, top-down:
+start_row, rows, slot }` frame holds `rows * width` samples of that one
+channel in the session's `InitMessage.band_format` type (v3; `"f32"` before
+v3 and by default, hence `sample_bytes` = 4, 8, 4, 2 or 1 for `"f32"`,
+`"f64"`, `"u32"`, `"u16"`, `"u8"`), **native-endian** (the segment is
+memory-mapped raw samples, not a serialized wire format — both processes are
+expected to run on the same machine/architecture), row-major, top-down:
 
 ```
 index(r, x) = r * width + x        for r in [0, rows), x in [0, width)
@@ -319,21 +424,27 @@ channels within one band — each `Band` frame names exactly one `(channel,
 start_row, rows)` run.
 
 **Access discipline.** Offsets are always addressed as byte offsets; reads
-and writes are done as `f32` element slices, so every offset used must be a
-multiple of 4 bytes. Because `slot_offset(i)` is always a multiple of
-`slot_bytes`, choosing `slot_bytes` as a multiple of 4 (in practice it will
-always be far larger — one band's worth of pixels) keeps every slot 4-byte
-aligned automatically, and the shm mapping's base address is itself
-page-aligned, so a 4-byte-aligned offset yields a properly aligned `f32*`
-in the worker's mmap.
+and writes are done as element slices of the `band_format` sample type, so
+every offset used must be a multiple of **the band sample width**
+(`sample_bytes` above) — not a fixed 4 bytes, as it was before v3, since a
+`"f64"` session slices 8-byte elements and a `"u16"` one slices 2-byte
+elements. Because `slot_offset(i)` is always a multiple of `slot_bytes`,
+choosing `slot_bytes` as a multiple of `sample_bytes` (in practice it will
+always be far larger — one band's worth of pixels) keeps every slot
+correctly aligned automatically, and the shm mapping's base address is
+itself page-aligned, so an aligned offset yields a properly aligned element
+pointer in the worker's mmap. The worker enforces this: a `slot_bytes` that
+is zero, or not a multiple of `sample_bytes`, is rejected at `Init`.
 
 **Slot-size validation (the MMM trap, made loud).** `slot_bytes` must
-satisfy `slot_bytes >= rows_max * width * 4`, where `rows_max` is the
-largest `rows` value the host will ever send in a `Band` frame. Concretely,
-for every `Band` frame the worker receives, it validates:
+satisfy `slot_bytes >= rows_max * width * sample_bytes`, where `rows_max` is
+the largest `rows` value the host will ever send in a `Band` frame and
+`sample_bytes` is the width of the session's `band_format` (4 for the
+`"f32"` default, so this is the pre-v3 rule unchanged for a pre-v3 host).
+Concretely, for every `Band` frame the worker receives, it validates:
 
 ```
-rows * width * 4 <= slot_bytes
+rows * width * sample_bytes <= slot_bytes
 ```
 
 before touching the slot, and if that check fails it sends `Error` (naming
@@ -527,7 +638,7 @@ malformed) will misbehave against the real worker:
 
 ## 8. Versioning
 
-- **`IPC_PROTOCOL_VERSION`** (currently `2`) bumps on **any** wire-format
+- **`IPC_PROTOCOL_VERSION`** (currently `3`) bumps on **any** wire-format
   change — a new tag, a reordered/resized binary field, a renamed or
   retyped JSON field, a changed lifecycle rule that a C++ host would need
   to branch on. Bump the constant in `mpp-ipc::protocol` and this document
@@ -564,6 +675,7 @@ malformed) will misbehave against the real worker:
 |---:|---|
 | 1 | Initial write-only host-push protocol: `Init`/`Band`/`Finish`/`Cancel` in, `BandAck`/`Progress`/`Done`/`Error` out. |
 | 2 | Adds a worker-pull **read** direction alongside v1's write path (§9): `InitMessage.mode` (`"write"` default / `"read"`); worker→host `ImageMeta` (tag 5) and `ReadBand` (tag 6, reuses the `Band`/`BandHeader` binary layout, direction reversed); host→worker `ReadBandAck` (tag 132, 4-byte `slot: u32`). A v1 `Init` payload (no `mode` field) still deserializes correctly, as `"write"`. |
+| 3 | Widens `InitMessage` **only** (§10) — additive over v2 exactly as v2 was over v1. Fifteen new `Init` fields, every one with a wire default: `band_format` (the shm payload's sample type, separate from `bit_depth`, the output file's), `container`, `layout`, `tile_size`, `compression`, `deflate_level`, `predictor`, `alpha`, `icc_profile`, `description`, `copyright`, `software`, `x_resolution`, `y_resolution`, `resolution_unit`. **No new frame tags, no change to the `Band`/`BandHeader` binary layout, no lifecycle change.** A v2 `Init` payload (none of the fifteen present) still deserializes correctly, into exactly the v2 behaviour. The one rule §6 restates: slot alignment/size is measured in the `band_format` sample width rather than a fixed 4 bytes. |
 
 ## 9. Read mode (protocol v2)
 
@@ -592,7 +704,7 @@ Example `Init` for a read session:
 
 ```jsonc
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "worker_version": "0.1.0",
   "output_path": "/tmp/M31-mosaic.tif",
   "width": 9888,
@@ -775,3 +887,103 @@ the write path's motivating case for `Cancel` doesn't carry over. If a host
 needs to abort an in-progress read, killing the worker process is the only
 mechanism, exactly as §7.4 already describes for a write session aborted
 after `Finish`.
+
+## 10. Native band formats and write options (protocol v3)
+
+Version 3 is **purely additive over v2, exactly as v2 was over v1**: fifteen
+new `InitMessage` fields, every one with a wire default. No new frame tags.
+No change to the `Band`/`BandHeader` 20-byte binary layout, or to any other
+frame's shape. No lifecycle change — the handshake, band streaming,
+`Finish`, `Cancel`, host-gone, and post-terminal-frame rules of §7 are
+untouched. A v2 host's `Init` payload, carrying none of the fifteen, still
+deserializes into precisely the v2 behaviour; §5's Example 1 is that
+payload.
+
+Two things motivated the version. First, **`f32` was the only sample type a
+band could cross shm as**, and a unit-range `f32`'s 24-bit mantissa cannot
+carry a `u32` value or a `f64` one: an image already held natively in either
+was silently degraded on its way to a file that could have stored it
+exactly. Second, the worker exposed **none** of `mpp-core`'s TIFF write
+options over the wire, so a host could not ask for tiles, compression, an
+alpha association, an ICC profile or any metadata, however plainly the user
+had asked for them.
+
+### 10.1 `band_format` vs `bit_depth`, and the rule coupling them
+
+These are two different fields describing two different things, and the
+distinction is the whole point of the version:
+
+- **`band_format` describes the shm payload** — the sample type the *host*
+  writes into slots and the worker reads back out of them (§6's "Pixel
+  layout inside a slot"). It is what `slot_bytes` is measured in.
+- **`bit_depth` describes the output file** — the sample format the worker
+  encodes into the TIFF.
+
+Before v3 there was no `band_format`: the shm payload was always unit-range
+`f32`, and `bit_depth` alone said what the file would hold, with the worker
+converting. That behaviour is still exactly what a session gets when
+`band_format` is `"f32"` (its default).
+
+**Coupling rule.** `band_format` must equal `bit_depth`, **unless**
+`band_format` is `"f32"`.
+
+The reason is not stylistic. A native (non-`"f32"`) band is written to the
+file **verbatim** — that is what makes it lossless, and it means no
+conversion is applied, or available: `mpp-core` has one converting encode
+path and its input domain is unit-range `f32`. So `"f32"` bands may target
+any `bit_depth` (the v1/v2 freedom, preserved), while a `"u16"` band can
+only produce a `"u16"` file. The worker rejects a violating `Init` up front,
+before it stages a single band — `Error` + nonzero exit, naming
+`band_format`. A mirroring host should reproduce the check locally so the
+user sees it before a process is spawned and a segment created; the
+reference C++ host does, in `WriteSession`'s constructor.
+
+| `band_format` | `bit_depth` | result |
+|---|---|---|
+| `"f32"` (default) | any of the five | accepted — the converting path, v1/v2 behaviour |
+| `"f64"`/`"u32"`/`"u16"`/`"u8"` | the same string | accepted — samples written verbatim |
+| `"f64"`/`"u32"`/`"u16"`/`"u8"` | anything else | **rejected at `Init`** |
+
+`band_format` also sets the shm sample width used by §6's alignment and
+slot-size rules: `slot_bytes` must be a nonzero multiple of that width, and
+at least one row of it (`width * sample_bytes`).
+
+### 10.2 Ignored fields are genuinely ignored
+
+`tile_size` is consulted only when `layout` is `"tiles"`; `deflate_level`
+only when `compression` is `"deflate"`. When they do not apply they are
+**not validated** — an out-of-range value in an inapplicable field can never
+fail an `Init`. This matters for hosts that carry a fixed struct of options:
+a host that always sends `tile_size: 256` on a strip session, or a
+`deflate_level` it has no UI for, must not be refused for it.
+
+The converse obligation is on the defaults. Because an omitted field and a
+field carrying its default value are indistinguishable to the worker, a
+host's own compiled-in default **must equal the wire default** in §5's
+table, or that host silently asks for something a v2 host would not have.
+`deflate_level` is the trap: the natural "unset" value for an integer field
+is `0`, and the wire default is `6`.
+
+### 10.3 What a v3 host gains, and what it must still get right
+
+The remaining thirteen fields are a straight pass-through to
+`mpp-core`'s `TiffWriteOptions`, and `TiffWriteOptions::validate` — the same
+validator the `mpp convert` CLI path goes through — rules on every
+combination, so the legality rules live in exactly one place rather than
+being restated here. The ones with cross-field consequences a host should
+know about:
+
+- `alpha` must agree with `channels` in **both** directions: `2` and `4`
+  channels require an association (`"unassociated"` or `"associated"`), and
+  `1` and `3` channels require `"none"`.
+- `predictor` is rejected for a floating-point `bit_depth` (`"f32"`,
+  `"f64"`) — horizontal differencing is defined for integer samples.
+- `container: "classic"` fails validation when the payload cannot fit
+  32-bit offsets; `"auto"` picks classic only while it fits, and a `.btf`
+  or `.tf8` output extension declares BigTIFF regardless.
+- `icc_profile` is standard-alphabet base64 and is capped at **16 MiB
+  decoded**; the reference C++ host checks that bound itself, before
+  spawning a worker, so an oversized profile is refused without an OS
+  resource ever being created.
+- `x_resolution`/`y_resolution` of `0` mean *unknown* and write no
+  resolution tags at all — `0` is a sentinel, not a resolution.

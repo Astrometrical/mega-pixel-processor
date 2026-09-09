@@ -122,3 +122,31 @@ target_link_libraries(test_bogus_ack PRIVATE mpp_host)
 target_compile_definitions(test_bogus_ack PRIVATE
   FAKE_WORKER_BOGUS_ACK_PATH="$<TARGET_FILE:fake_worker_bogus_ack>")
 add_test(NAME test_bogus_ack COMMAND test_bogus_ack)
+
+# Task 12 (protocol v3) golden suite:
+#   test_v3_init        -- pure encoder test: every v3 Init field is emitted
+#                          with the documented name/type, and a
+#                          default-constructed InitMessage encodes exactly
+#                          the wire defaults a v2 host's omitted fields
+#                          deserialize to (deflate_level 6, not 0). Needs no
+#                          worker binary.
+#   test_v2_init_compat -- the property encode_init used to prove
+#                          incidentally, now proved deliberately: an Init
+#                          carrying NONE of the fifteen v3 fields (hand-built
+#                          JSON, bypassing encode_init) still completes a
+#                          write session against the v3 worker.
+#   test_native_band    -- WriteSession::PushBandBytes over a native "u16"
+#                          band_format, round-tripped back through
+#                          ReadSession, plus the host-side v3 guards
+#                          (coupling rule, unknown format, 16 MiB ICC bound).
+add_executable(test_v3_init test/test_v3_init.cpp)
+target_link_libraries(test_v3_init PRIVATE mpp_host)
+add_test(NAME test_v3_init COMMAND test_v3_init)
+
+add_executable(test_v2_init_compat test/test_v2_init_compat.cpp)
+target_link_libraries(test_v2_init_compat PRIVATE mpp_host)
+add_test(NAME test_v2_init_compat COMMAND test_v2_init_compat)
+
+add_executable(test_native_band test/test_native_band.cpp)
+target_link_libraries(test_native_band PRIVATE mpp_host)
+add_test(NAME test_native_band COMMAND test_native_band)

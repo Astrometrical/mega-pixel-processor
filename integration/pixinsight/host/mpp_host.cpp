@@ -9,6 +9,37 @@ namespace mpp {
 
 namespace {
 
+// Largest ICC profile this host will hand a worker, decoded -- the same
+// bound the worker itself enforces (`MAX_ICC_BYTES` in
+// crates/mpp-ipc-worker/src/main.rs). Kept in sync by hand; a host-side
+// value larger than the worker's would only move the rejection later, never
+// let something through.
+constexpr size_t kMaxIccBytes = 16u << 20;
+
+// True for the five sample-format strings protocol v3 accepts for either
+// `bit_depth` (the output file) or `band_format` (the shm payload).
+bool IsKnownSampleFormat(const std::string& s) {
+  return s == "f32" || s == "f64" || s == "u32" || s == "u16" || s == "u8";
+}
+
+// Decoded byte count of a standard-alphabet base64 string, computed from its
+// length rather than by decoding it: 3 bytes per 4-character group, less the
+// padding. Only ever used for the size bound above, so it is deliberately an
+// *upper* bound -- a string with embedded whitespace or an invalid character
+// decodes to no more than this, and the worker (which actually decodes) is
+// what rejects malformed base64.
+size_t Base64DecodedSizeUpperBound(const std::string& b64) {
+  if (b64.empty()) {
+    return 0;
+  }
+  const size_t groups = (b64.size() + 3) / 4;
+  size_t padding = 0;
+  if (b64.back() == '=') {
+    padding = (b64.size() >= 2 && b64[b64.size() - 2] == '=') ? 2 : 1;
+  }
+  return groups * 3 - padding;
+}
+
 // Validates `cfg` and returns it unchanged (throwing HostError, not any
 // other exception type, so WriteSession's constructor never lets a raw
 // std::runtime_error escape). Runs as the very first step of construction
@@ -31,9 +62,38 @@ WriteSessionConfig ValidateConfig(const WriteSessionConfig& cfg) {
   if (cfg.channels == 0) {
     throw HostError("WriteSessionConfig.channels must be nonzero");
   }
-  if (cfg.bit_depth != "f32" && cfg.bit_depth != "u16" && cfg.bit_depth != "u8") {
-    throw HostError("WriteSessionConfig.bit_depth must be \"f32\", \"u16\", or \"u8\", got \"" +
-                     cfg.bit_depth + "\"");
+  // Protocol v3 widened the output sample formats to the same five the shm
+  // side accepts; `SampleBytes` is the single list both are checked against.
+  if (!IsKnownSampleFormat(cfg.bit_depth)) {
+    throw HostError(
+        "WriteSessionConfig.bit_depth must be \"f32\", \"f64\", \"u32\", \"u16\" or \"u8\", got \"" +
+        cfg.bit_depth + "\"");
+  }
+  if (!IsKnownSampleFormat(cfg.band_format)) {
+    throw HostError(
+        "WriteSessionConfig.band_format must be \"f32\", \"f64\", \"u32\", \"u16\" or \"u8\", got \"" +
+        cfg.band_format + "\"");
+  }
+  // The v3 coupling rule (docs/pi-protocol.md §10), enforced here as well as
+  // in the worker so a host bug surfaces before a process is spawned: a
+  // native (non-f32) band is written to the file verbatim, so there is no
+  // conversion available when band_format and bit_depth disagree. "f32" is
+  // the one sample domain the writer converts from, so it may target any
+  // bit_depth.
+  if (cfg.band_format != "f32" && cfg.band_format != cfg.bit_depth) {
+    throw HostError("WriteSessionConfig.band_format \"" + cfg.band_format +
+                     "\" must equal bit_depth \"" + cfg.bit_depth +
+                     "\": native bands are written to the file verbatim, and only the "
+                     "unit-range \"f32\" band format is converted");
+  }
+  // The ICC bound the worker also enforces (16 MiB decoded). Checking it
+  // here means an oversized profile is refused before a worker process is
+  // spawned and an shm segment created, and the user sees the limit named.
+  if (Base64DecodedSizeUpperBound(cfg.icc_profile_base64) > kMaxIccBytes) {
+    throw HostError("WriteSessionConfig.icc_profile_base64 decodes to about " +
+                     std::to_string(Base64DecodedSizeUpperBound(cfg.icc_profile_base64)) +
+                     " bytes, over the " + std::to_string(kMaxIccBytes) +
+                     "-byte (16 MiB) ICC profile limit");
   }
   if (cfg.band_rows == 0) {
     throw HostError("WriteSessionConfig.band_rows must be nonzero");
@@ -45,7 +105,10 @@ WriteSessionConfig ValidateConfig(const WriteSessionConfig& cfg) {
 }
 
 uint64_t ComputeSlotBytes(const WriteSessionConfig& cfg) {
-  return static_cast<uint64_t>(cfg.band_rows) * cfg.width * sizeof(float);
+  // Sized in the session's negotiated shm sample width, not sizeof(float):
+  // protocol v3's whole point is that a band need not cross shm as f32.
+  return static_cast<uint64_t>(cfg.band_rows) * cfg.width *
+         WriteSession::SampleBytes(cfg.band_format);
 }
 
 // A short shm segment name satisfying docs/pi-protocol.md §6's portable
@@ -139,6 +202,25 @@ WriteSession::WriteSession(const WriteSessionConfig& cfg)
     init.shm_name = shm_.name();
     init.slot_bytes = slot_bytes_;
     init.slots = cfg_.slots;
+    // Protocol v3 write options, carried straight through from the config
+    // (already validated by ValidateConfig for the two the host itself can
+    // check; the rest are the worker's own TiffWriteOptions::validate to
+    // rule on, so they are not second-guessed here).
+    init.band_format = cfg_.band_format;
+    init.container = cfg_.container;
+    init.layout = cfg_.layout;
+    init.tile_size = cfg_.tile_size;
+    init.compression = cfg_.compression;
+    init.deflate_level = cfg_.deflate_level;
+    init.predictor = cfg_.predictor;
+    init.alpha = cfg_.alpha;
+    init.icc_profile = cfg_.icc_profile_base64;
+    init.description = cfg_.description;
+    init.copyright = cfg_.copyright;
+    init.software = cfg_.software;
+    init.x_resolution = cfg_.x_resolution;
+    init.y_resolution = cfg_.y_resolution;
+    init.resolution_unit = cfg_.resolution_unit;
     WriteFramed(encode_init(init));
   } catch (...) {
     // The worker is alive but has not necessarily consumed/validated Init
@@ -158,24 +240,49 @@ WriteSession::~WriteSession() {
   // their own destructors, which run automatically after this body returns.
 }
 
+size_t WriteSession::SampleBytes(const std::string& band_format) {
+  if (band_format == "f32" || band_format == "u32") return 4;
+  if (band_format == "f64") return 8;
+  if (band_format == "u16") return 2;
+  if (band_format == "u8") return 1;
+  throw HostError("unknown band_format \"" + band_format +
+                   "\" (expected \"f32\", \"f64\", \"u32\", \"u16\" or \"u8\")");
+}
+
 void WriteSession::PushBand(uint32_t channel, uint64_t start_row, uint32_t rows,
                              const float* samples) {
+  // A `const float*` only describes the slot's contents on an f32 session.
+  // Accepting it on, say, a "u32" session would copy the right *number* of
+  // bytes with the wrong interpretation -- silent corruption of exactly the
+  // kind protocol v3's separate band_format exists to prevent -- so this is
+  // a hard error, not a conversion.
+  if (cfg_.band_format != "f32") {
+    throw HostError("PushBand takes an f32 buffer, but this session negotiated band_format \"" +
+                     cfg_.band_format + "\"; use PushBandBytes with a \"" + cfg_.band_format +
+                     "\" buffer instead");
+  }
+  PushBandBytes(channel, start_row, rows, samples);
+}
+
+void WriteSession::PushBandBytes(uint32_t channel, uint64_t start_row, uint32_t rows,
+                                  const void* samples) {
   if (finished_) {
     throw HostError(
-        "PushBand called after the session already reached a terminal state (Finish/Cancel/error)");
+        "PushBandBytes called after the session already reached a terminal state "
+        "(Finish/Cancel/error)");
   }
   if (channel >= cfg_.channels) {
-    throw HostError("PushBand channel " + std::to_string(channel) +
+    throw HostError("PushBandBytes channel " + std::to_string(channel) +
                      " is out of range (channels=" + std::to_string(cfg_.channels) + ")");
   }
   if (rows > cfg_.band_rows) {
-    throw HostError("PushBand rows (" + std::to_string(rows) +
+    throw HostError("PushBandBytes rows (" + std::to_string(rows) +
                      ") exceeds the configured band_rows (" + std::to_string(cfg_.band_rows) +
                      "); shm slots are sized for band_rows and a larger band would overrun the "
                      "next slot");
   }
   if (start_row > cfg_.height || rows > cfg_.height - start_row) {
-    throw HostError("PushBand rows [" + std::to_string(start_row) + ", " +
+    throw HostError("PushBandBytes rows [" + std::to_string(start_row) + ", " +
                      std::to_string(start_row) + "+" + std::to_string(rows) +
                      ") exceed the configured height (" + std::to_string(cfg_.height) + ")");
   }
@@ -185,7 +292,8 @@ void WriteSession::PushBand(uint32_t channel, uint64_t start_row, uint32_t rows,
   free_slots_.pop_front();
   slot_busy_[slot] = true;
 
-  const size_t byte_len = static_cast<size_t>(rows) * cfg_.width * sizeof(float);
+  const size_t byte_len =
+      static_cast<size_t>(rows) * cfg_.width * SampleBytes(cfg_.band_format);
   std::memcpy(shm_.base() + static_cast<uint64_t>(slot) * slot_bytes_, samples, byte_len);
 
   BandHeader hdr;

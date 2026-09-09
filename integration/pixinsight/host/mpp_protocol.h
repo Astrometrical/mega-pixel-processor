@@ -34,6 +34,15 @@ namespace mpp {
 /// contract now lives in `docs/pi-protocol.md` §9 (the wire-shape source of
 /// truth); this header mirrors the Rust definitions in
 /// `crates/mpp-ipc/src/protocol.rs` field-for-field.
+///
+/// Version 3 widens `InitMessage` only -- no new tag, no changed binary
+/// layout (docs/pi-protocol.md §10). `InitMessage::band_format` names the
+/// sample type the host places in shm slots, separating it from
+/// `InitMessage::bit_depth` (the *output file's* sample format); the rest of
+/// the v3 fields carry the TIFF writer's option set (container, layout,
+/// compression, alpha, ICC profile, text tags, resolution). Every v3 field is
+/// `#[serde(default)]` on the Rust side, so a v2 host's `Init` payload still
+/// deserializes into exactly the v2 behaviour.
 inline constexpr uint32_t kProtocolVersion = 3;
 
 /// Exact release version of the `mpp-ipc-worker` binary this host library
@@ -99,7 +108,7 @@ struct InitMessage {
   uint64_t width = 0;
   uint64_t height = 0;
   uint64_t channels = 0;
-  std::string bit_depth;  // "f32" | "u16" | "u8"
+  std::string bit_depth;  // output file format: "f32"|"f64"|"u32"|"u16"|"u8"
   std::string shm_name;
   uint64_t slot_bytes = 0;
   uint32_t slots = 0;
@@ -111,6 +120,38 @@ struct InitMessage {
   /// *deserializing* a v1 payload that omits the field defaults it to
   /// `Write` -- `encode_init` never needs to produce that shape itself).
   std::string mode = "write";
+
+  // ---- protocol v3 -----------------------------------------------------
+  // Every field below is `#[serde(default)]` on the Rust side, so a v2 host
+  // that omits them all still gets exactly the v2 behaviour. The defaults
+  // spelled out here are therefore not free choices: each one must equal the
+  // value `mpp_ipc::protocol::InitMessage`'s serde default produces, or this
+  // host would silently ask for something a v2 host did not. (`deflate_level`
+  // is the trap: the natural C++ "unset" default of 0 is NOT the wire
+  // default, which is 6.)
+  //
+  // `band_format` describes the **shm payload** -- the sample type the host
+  // writes into slots -- while `bit_depth` describes the **output file**.
+  // Coupling rule (docs/pi-protocol.md §10, enforced by the worker and
+  // mirrored by `WriteSession`): `band_format` must equal `bit_depth` unless
+  // `band_format` is `"f32"`, the one domain the writer converts from. A
+  // native (non-f32) band is written to the file verbatim, so there is no
+  // conversion available if the two disagree.
+  std::string band_format = "f32";  ///< **(v3)** shm sample type: "f32"|"f64"|"u8"|"u16"|"u32"
+  std::string container = "auto";   ///< **(v3)** "auto"|"classic"|"big"
+  std::string layout = "strips";    ///< **(v3)** "strips"|"tiles"
+  uint32_t tile_size = 256;         ///< **(v3)** tile edge; power of two 128..1024
+  std::string compression = "none"; ///< **(v3)** "none"|"lzw"|"deflate"|"packbits"
+  uint8_t deflate_level = 6;        ///< **(v3)** 1-9; ignored unless compression == "deflate"
+  bool predictor = false;           ///< **(v3)** horizontal predictor; integer formats only
+  std::string alpha = "none";       ///< **(v3)** "none"|"unassociated"|"associated"
+  std::string icc_profile;          ///< **(v3)** base64 ICC blob, empty when absent
+  std::string description;          ///< **(v3)** TIFF tag 270 (ImageDescription)
+  std::string copyright;            ///< **(v3)** TIFF tag 33432 (Copyright)
+  std::string software;             ///< **(v3)** TIFF tag 305 (Software)
+  double x_resolution = 0.0;        ///< **(v3)** pixels per unit; 0 = unknown
+  double y_resolution = 0.0;        ///< **(v3)** pixels per unit; 0 = unknown
+  std::string resolution_unit = "inch";  ///< **(v3)** "inch"|"cm"
 };
 
 /// Host -> worker `Band` frame payload (tag `HostTag::Band`): names one
