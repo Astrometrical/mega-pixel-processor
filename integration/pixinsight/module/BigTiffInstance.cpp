@@ -382,10 +382,20 @@ void BigTiffInstance::Close()
    // profile stashed for a save that never happened would otherwise be
    // embedded in the next one, and a stale read blob would be reported for
    // a file that has none.
+   //
+   // lossy_ belongs here for the same reason and one of its own:
+   // WasLossyWrite() reports on "the last file write operation in this file"
+   // (FileFormatImplementation.h:792), so it is per-file state by
+   // definition, and an instance driven through a second Create() must start
+   // it over. Leaving it set would make one narrowing save poison every
+   // later exact save on the same instance -- routinely observable since the
+   // flag started covering ordinary conversions like f32 -> u16, not just
+   // the exotic ones.
    icc_profile_.clear();
    read_icc_base64_.clear();
    band_format_.clear();
    discarded_channel_ = -1;
+   lossy_ = false;
 }
 
 // ----------------------------------------------------------------------------
