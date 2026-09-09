@@ -125,6 +125,10 @@ pub struct TiffInfo {
     pub alpha_channels: u32,
     /// Native sample format shared by every channel.
     pub sample_format: SampleFormat,
+    /// Embedded ICC colour profile (tag 34675), if any. `None` covers both
+    /// a file with no such tag and one whose tag is present but empty;
+    /// either way there is no profile to hand back.
+    pub icc_profile: Option<Vec<u8>>,
 }
 
 impl TiffInfo {
@@ -679,6 +683,22 @@ impl TiffReader {
             }
         };
 
+        // Tag 34675. Absent on most astro TIFFs; `get_tag_u8_vec` errors
+        // rather than returning None when the tag is missing, so treat any
+        // failure as "no profile" rather than a file error. Written as
+        // `Type::UNDEFINED` by our own writer; the `tiff` crate's decoder
+        // (0.11.3) reads UNDEFINED into the same `Byte`/`List(Byte)` values
+        // as BYTE (see its `decoder/ifd.rs`), so `get_tag_u8_vec` handles it
+        // with no special-casing needed. This runs on `decoder` itself, so
+        // it works unchanged through the palette `PatchedReader`: that
+        // wrapper only substitutes bytes at the `PhotometricInterpretation`
+        // entry's own offset, leaving every other tag — this one included —
+        // untouched.
+        let icc_profile = decoder
+            .get_tag_u8_vec(Tag::IccProfile)
+            .ok()
+            .filter(|v| !v.is_empty());
+
         let total_channels = color_channels + alpha_channels;
         // Planar storage only means anything when the *file* stores more than
         // one sample per pixel, which is exactly the `Transform::Direct` case:
@@ -695,6 +715,7 @@ impl TiffReader {
             color_channels,
             alpha_channels,
             sample_format,
+            icc_profile,
         };
 
         Ok(TiffReader {
@@ -2537,6 +2558,123 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out, pixels);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A minimal in-memory `PlanarRows<f32>` source for tests that only
+    /// care about metadata (an embedded ICC profile) and not pixel content.
+    /// Every row is the same all-zero slice, reused across channels/rows.
+    struct SynthPlanar {
+        w: u64,
+        h: u64,
+        c: u64,
+        zero_row: Vec<f32>,
+    }
+
+    impl crate::formats::PlanarRows<f32> for SynthPlanar {
+        fn width(&self) -> u64 {
+            self.w
+        }
+        fn height(&self) -> u64 {
+            self.h
+        }
+        fn channels(&self) -> u64 {
+            self.c
+        }
+        fn row(&self, _c: u64, _y: u64) -> &[f32] {
+            &self.zero_row
+        }
+    }
+
+    fn synth_planar(w: u64, h: u64, c: u64) -> SynthPlanar {
+        SynthPlanar {
+            w,
+            h,
+            c,
+            zero_row: vec![0.0; w as usize],
+        }
+    }
+
+    #[test]
+    fn an_embedded_icc_profile_is_read_back() {
+        use crate::formats::tiff_write::{TiffWriteOptions, write_tiff};
+        let dir = tmpdir("icc");
+        let src = dir.join("icc.tif");
+        let icc: Vec<u8> = (0u8..=255).cycle().take(3000).collect();
+        // Round-trip through our own writer: what we embed, we must read.
+        write_tiff(
+            &synth_planar(4, 4, 1),
+            &src,
+            &TiffWriteOptions {
+                icc_profile: Some(icc.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let reader = TiffReader::open(&src).unwrap();
+        assert_eq!(reader.info().icc_profile.as_deref(), Some(&icc[..]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_without_a_profile_reports_none() {
+        use crate::formats::tiff_write::{TiffWriteOptions, write_tiff};
+        let dir = tmpdir("noicc");
+        let src = dir.join("plain.tif");
+        write_tiff(&synth_planar(4, 4, 1), &src, &TiffWriteOptions::default()).unwrap();
+        assert!(TiffReader::open(&src).unwrap().info().icc_profile.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_embedded_icc_profile_is_read_back_from_a_palette_file() {
+        // The palette read path decodes through `PatchedReader`, which
+        // substitutes bytes only at the `PhotometricInterpretation` entry's
+        // own file offset. Prove the ICC tag — stored at a completely
+        // different offset — still comes through unaffected for a palette
+        // image, since that reader is otherwise deliberately restrictive
+        // (see `open`'s palette branch).
+        use tiff::encoder::{TiffEncoder, TiffKindStandard};
+
+        let dir = tmpdir("icc-palette");
+        let path = dir.join("in.tif");
+        let icc: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut enc: TiffEncoder<_, TiffKindStandard> =
+            TiffEncoder::new_generic(&mut file).unwrap();
+        let mut d = enc.image_directory().unwrap();
+
+        let indices: Vec<u8> = (0u8..8).collect();
+        let offset = d.write_data(&indices[..]).unwrap();
+        let map = palette_color_map();
+
+        d.write_tag(Tag::ImageWidth, 4u32).unwrap();
+        d.write_tag(Tag::ImageLength, 2u32).unwrap();
+        d.write_tag(Tag::BitsPerSample, &[8u16][..]).unwrap();
+        d.write_tag(Tag::SamplesPerPixel, 1u16).unwrap();
+        d.write_tag(Tag::PhotometricInterpretation, 3u16).unwrap(); // palette
+        d.write_tag(Tag::Compression, 1u16).unwrap();
+        d.write_tag(Tag::PlanarConfiguration, 1u16).unwrap();
+        d.write_tag(Tag::RowsPerStrip, 2u32).unwrap();
+        d.write_tag(Tag::StripOffsets, &[offset as u32][..])
+            .unwrap();
+        d.write_tag(Tag::StripByteCounts, &[8u32][..]).unwrap();
+        d.write_tag(Tag::ColorMap, &map[..]).unwrap();
+        // Same UNDEFINED-typed entry construction as the real writer (see
+        // `tiff_write::encode`'s `write_entry_bytes` + `extend_from`
+        // pattern): `impl TiffValue for [u8]` would label it BYTE instead.
+        let entry = d
+            .write_entry_bytes(tiff::tags::Type::UNDEFINED, &icc[..])
+            .unwrap();
+        let mut extra = tiff::Directory::empty();
+        extra.extend([(Tag::IccProfile, entry)]);
+        d.extend_from(&extra);
+        d.finish().unwrap();
+
+        let reader = TiffReader::open(&path).unwrap();
+        assert_eq!(reader.info().icc_profile.as_deref(), Some(&icc[..]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

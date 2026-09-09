@@ -204,6 +204,10 @@ struct ImageMeta {
   uint64_t alpha = 0;     // 1 if `channels` includes an alpha channel, 0 otherwise
   std::string color_space;  // "gray" | "rgb"
   std::string bit_depth;    // "u8" | "u16" | "u32" | "f32" | "f64"
+  std::string icc_profile;  ///< **(v3)** base64 ICC blob the worker found embedded in the
+                             ///< file, empty when absent. Optional on the wire: an older
+                             ///< worker's `ImageMeta` JSON has no such field at all, and
+                             ///< `ParseImageMeta` defaults it to empty rather than throwing.
 };
 
 /// Parses an `ImageMeta` JSON payload (as sent worker->host on tag

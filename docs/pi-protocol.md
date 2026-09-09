@@ -675,7 +675,7 @@ malformed) will misbehave against the real worker:
 |---:|---|
 | 1 | Initial write-only host-push protocol: `Init`/`Band`/`Finish`/`Cancel` in, `BandAck`/`Progress`/`Done`/`Error` out. |
 | 2 | Adds a worker-pull **read** direction alongside v1's write path (§9): `InitMessage.mode` (`"write"` default / `"read"`); worker→host `ImageMeta` (tag 5) and `ReadBand` (tag 6, reuses the `Band`/`BandHeader` binary layout, direction reversed); host→worker `ReadBandAck` (tag 132, 4-byte `slot: u32`). A v1 `Init` payload (no `mode` field) still deserializes correctly, as `"write"`. |
-| 3 | Widens `InitMessage` **only** (§10) — additive over v2 exactly as v2 was over v1. Fifteen new `Init` fields, every one with a wire default: `band_format` (the shm payload's sample type, separate from `bit_depth`, the output file's), `container`, `layout`, `tile_size`, `compression`, `deflate_level`, `predictor`, `alpha`, `icc_profile`, `description`, `copyright`, `software`, `x_resolution`, `y_resolution`, `resolution_unit`. **No new frame tags, no change to the `Band`/`BandHeader` binary layout, no lifecycle change.** A v2 `Init` payload (none of the fifteen present) still deserializes correctly, into exactly the v2 behaviour. The one rule §6 restates: slot alignment/size is measured in the `band_format` sample width rather than a fixed 4 bytes. |
+| 3 | Widens `InitMessage` (§10) — additive over v2 exactly as v2 was over v1. Fifteen new `Init` fields, every one with a wire default: `band_format` (the shm payload's sample type, separate from `bit_depth`, the output file's), `container`, `layout`, `tile_size`, `compression`, `deflate_level`, `predictor`, `alpha`, `icc_profile`, `description`, `copyright`, `software`, `x_resolution`, `y_resolution`, `resolution_unit`. **No new frame tags, no change to the `Band`/`BandHeader` binary layout, no lifecycle change.** A v2 `Init` payload (none of the fifteen present) still deserializes correctly, into exactly the v2 behaviour. The one rule §6 restates: slot alignment/size is measured in the `band_format` sample width rather than a fixed 4 bytes. A later, still-v3 change widens `ImageMeta` (§9.2) the same way: one new field, `icc_profile`, `#[serde(default)]`, no version bump — the read-side mirror of `InitMessage.icc_profile` above. |
 
 ## 9. Read mode (protocol v2)
 
@@ -743,6 +743,7 @@ pub struct ImageMeta {
     pub alpha: u64,         // 1 if `channels` includes an alpha channel, 0 otherwise
     pub color_space: String, // "gray" | "rgb"
     pub bit_depth: String,   // "u8" | "u16" | "u32" | "f32" | "f64"
+    pub icc_profile: String, // base64; "" = absent (default)
 }
 ```
 
@@ -755,7 +756,8 @@ Example:
   "channels": 3,
   "alpha": 0,
   "color_space": "rgb",
-  "bit_depth": "f32"
+  "bit_depth": "f32",
+  "icc_profile": ""
 }
 ```
 
@@ -764,6 +766,13 @@ chose), `ImageMeta.bit_depth` is the file's *native* sample format — the
 worker never converts samples on read, so a host must be prepared to handle
 any of the five listed values, not just the three the write path advertises
 (`u8`/`u16`/`f32`).
+
+`icc_profile` is the mirror image of `InitMessage.icc_profile` (§10): the
+same standard-alphabet base64 encoding, but here it is the worker reporting
+what it found embedded in the file (TIFF tag 34675), not the host asserting
+what to write. Most astro TIFFs carry no profile, so `""` is the common
+case. `#[serde(default)]`, so a worker built before this field existed still
+produces an `ImageMeta` a current host can parse, just always reporting `""`.
 
 `mpp-ipc-worker --probe <path>` prints this same JSON shape standalone, with
 no shm/handshake involved, for host-side or manual inspection of a file's

@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use base64::Engine as _;
 use mpp_core::formats::tiff_read::{ColorClass, TiffInfo, TiffReader};
 use mpp_ipc::link::{HostEvent, HostLink};
 use mpp_ipc::protocol::{BandHeader, ImageMeta, InitMessage};
@@ -41,6 +42,11 @@ pub fn image_meta(info: &TiffInfo) -> ImageMeta {
         }
         .to_string(),
         bit_depth: info.sample_format.wire_name().to_string(),
+        icc_profile: info
+            .icc_profile
+            .as_deref()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+            .unwrap_or_default(),
     }
 }
 

@@ -482,6 +482,7 @@ mod tests {
             alpha: 0,
             color_space: "rgb".to_string(),
             bit_depth: "u16".to_string(),
+            icc_profile: String::new(),
         };
         link.send_image_meta(&meta).unwrap();
         let mut out = Cursor::new(link.output.clone());

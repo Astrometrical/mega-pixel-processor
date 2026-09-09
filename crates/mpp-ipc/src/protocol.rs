@@ -348,6 +348,13 @@ pub struct ImageMeta {
     pub color_space: String,
     /// Sample format: `"u8"`, `"u16"`, `"u32"`, `"f32"`, or `"f64"`.
     pub bit_depth: String,
+    /// **(v3)** Base64-encoded embedded ICC profile, empty when the file
+    /// has none. Mirrors [`InitMessage::icc_profile`]'s encoding, in the
+    /// other direction: the worker read this off the file rather than the
+    /// host asserting it. `#[serde(default)]` so an older worker's
+    /// `ImageMeta` (no such field at all) still parses.
+    #[serde(default)]
+    pub icc_profile: String,
 }
 
 /// Host→worker `Band` frame payload (tag [`tag::BAND`]): names one
@@ -759,10 +766,24 @@ mod tests {
             alpha: 0,
             color_space: "rgb".into(),
             bit_depth: "f32".into(),
+            icc_profile: "AAEC".into(),
         };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains("\"width\":9888") && j.contains("\"color_space\":\"rgb\""));
         assert_eq!(serde_json::from_str::<ImageMeta>(&j).unwrap(), m);
+    }
+
+    #[test]
+    fn image_meta_without_icc_profile_still_parses() {
+        // Wire compatibility: an older worker's `ImageMeta` JSON has no
+        // `icc_profile` field at all; `#[serde(default)]` must still parse
+        // it, defaulting to an empty (no-profile) string.
+        let j = serde_json::json!({
+            "width": 4, "height": 4, "channels": 1, "alpha": 0,
+            "color_space": "gray", "bit_depth": "u8",
+        });
+        let m: ImageMeta = serde_json::from_value(j).unwrap();
+        assert_eq!(m.icc_profile, "");
     }
 
     #[test]

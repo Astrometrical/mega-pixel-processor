@@ -66,6 +66,22 @@ void check_protocol_constants_and_parse() {
       meta.color_space != "rgb" || meta.bit_depth != "f32") {
     fail("ParseImageMeta produced unexpected fields from a literal ImageMeta JSON payload");
   }
+  // No `icc_profile` key at all -- an older worker's payload, predating the
+  // field. Must default to empty rather than throw (Task 14's wire-
+  // compatibility rule, the read-side mirror of InitMessage's own v3
+  // fields).
+  if (!meta.icc_profile.empty()) {
+    fail("ParseImageMeta must default icc_profile to empty when the field is absent");
+  }
+
+  // A current worker's payload, with an embedded profile reported.
+  const std::string json_with_icc =
+      R"({"width":4,"height":4,"channels":1,"alpha":0,"color_space":"gray","bit_depth":"u8",)"
+      R"("icc_profile":"AAEC"})";
+  mpp::ImageMeta meta_with_icc = mpp::ParseImageMeta(json_with_icc);
+  if (meta_with_icc.icc_profile != "AAEC") {
+    fail("ParseImageMeta did not carry icc_profile through from a literal ImageMeta JSON payload");
+  }
 }
 
 }  // namespace

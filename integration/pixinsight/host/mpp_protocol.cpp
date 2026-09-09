@@ -146,6 +146,11 @@ ImageMeta ParseImageMeta(const std::string& json) {
   meta.alpha = j.at("alpha").get<uint64_t>();
   meta.color_space = j.at("color_space").get<std::string>();
   meta.bit_depth = j.at("bit_depth").get<std::string>();
+  // (v3) Additive and optional: an older worker's ImageMeta JSON predates
+  // this field entirely, so default rather than `.at()` -- the same
+  // wire-compatibility rule InitMessage's own v3 fields follow, applied in
+  // the worker->host direction.
+  meta.icc_profile = j.value("icc_profile", std::string());
   return meta;
 }
 
