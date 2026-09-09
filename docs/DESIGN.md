@@ -139,7 +139,7 @@ distortion grids) do not bump it. Source of truth:
   (custom controls, navigator bottom-left, maxZoomPixelRatio 4,
   visibilityRatio 1). When a solution exists, center RA/Dec and pixel
   scale are baked into the page's telemetry footer at publish time (a
-  live WCS readout is phase-4 DeepSky work).
+  live WCS readout is phase-5 DeepSky work).
 - Universal viewer mode: `--mode single` / auto below 4096 px per side
   uses OSD's single-image source, no pyramid; oversize explicit-single
   warns and suggests DZI.
@@ -224,8 +224,9 @@ distortion grids) do not bump it. Source of truth:
    module into a general read+write TIFF/BigTIFF importer (implementation
    plan `docs/superpowers/plans/2026-09-08-bigtiff-reader.md`, design spec
    `docs/superpowers/specs/2026-09-08-bigtiff-reader-design.md`). New
-   extensions `.big.tiff`/`.big.tif` register alongside the existing
-   `.btf`/`.tf8`; the wire protocol bumped to v2 (`docs/pi-protocol.md` §9)
+   extensions `.big.tiff`/`.big.tif` registered alongside the existing
+   `.btf`/`.tf8` (both since withdrawn — see phase 4); the wire protocol
+   bumped to v2 (`docs/pi-protocol.md` §9)
    to carry a worker-pull read direction alongside the original host-push
    write direction. See `integration/pixinsight/README.md`'s "Read support"
    section for the user-facing behavior and deferred items.
@@ -256,16 +257,34 @@ distortion grids) do not bump it. Source of truth:
      format, which is why the module's `Open()` uses a geometry-probe worker
      run (`mpp-ipc-worker --probe`) to select the matching `ReadImage`
      overload before any pixels move.
-   - **Extension additions, not replacements.** `.big.tiff`/`.big.tif` were
-     added to close the "choosing BigTIFF in the save dialog appends `.big`,
-     which nothing can reopen" gap (design spec finding 5) — fixed on the
-     write path via a `.big`→`.big.tiff` rename (`PCL_FILEFORMAT_API.md`
-     §8.4) — and to give Photoshop and PixInsight a shared bidirectional
-     extension. `.tif`/`.tiff` remain deliberately unclaimed: PixInsight
-     refuses a second format registering an extension the stock TIFF module
-     already owns (design spec finding 1), so claiming them is scoped to a
-     future stock-TIFF-replacement phase, not this one.
-4. **DeepSky viewer components / platform hooks**: richer viewer (WCS
+   - **Extension additions, since superseded.** `.big.tiff`/`.big.tif` were
+     added during phase 3 to close the "choosing BigTIFF in the save dialog
+     appends `.big`, which nothing can reopen" gap (design spec finding 5)
+     and to give Photoshop and PixInsight a shared bidirectional extension.
+     Both were **withdrawn** afterwards — see "Stock TIFF replacement"
+     below.
+4. **Stock TIFF replacement (decided 2026-09-09, implementation pending):**
+   the module now claims `.tif`/`.tiff` outright and **replaces** PixInsight's
+   stock TIFF module, which must be uninstalled first (design spec finding 1:
+   the core refuses a second format claiming an owned extension). The swap is
+   reversible through Manage Modules / Install Modules; the procedure and its
+   costs are in `integration/pixinsight/README.md`, "Replacing the stock TIFF
+   module".
+
+   Forced by a Save As dialog behavior found while debugging a
+   "BigTIFF is missing from the format list" report: the dialog drops a
+   TIFF-family format whose extensions collide with those of the format
+   currently selected as the default. The compound `.big.tiff`/`.big.tif`
+   collided with the stock module's `*.tif`/`*.tiff`, so BigTIFF vanished
+   whenever TIFF was the default — for windows loaded from a `.big.tiff`, and
+   for non-file-backed windows after any TIFF save. Narrowing to
+   `.btf`/`.tf8` fixed the dialog but broke the Photoshop bridge, since
+   Photoshop recognises TIFF only by a `.tif`/`.tiff` tail. **No extension
+   set satisfies both while the stock module is installed**, so coexistence
+   was abandoned. Full investigation, including the hypotheses falsified
+   along the way, plus the parity gap this creates: `docs/tiff-parity.md`.
+
+5. **DeepSky viewer components / platform hooks**: richer viewer (WCS
    readout, annotations, catalog overlays), possible hosted platform.
 
 ## Licensing constraints (important — applies to the PixInsight module, phases 2-3)

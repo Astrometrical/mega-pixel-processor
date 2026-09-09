@@ -368,11 +368,18 @@ void BigTiffInstance::Create( const String& filePath, int numberOfImages, const 
       throw Error( String().Format( "BigTIFF: only single-image files are supported "
                                     "(%d images requested).", numberOfImages ) );
 
-   // Save-As dialog quirk (design "Findings" §5): choosing "BigTIFF" appends a
-   // bare ".big", and a ".big" file is unusable downstream (Photoshop won't
-   // take it, PI's chooser won't show it). Rewrite any path lacking a
-   // TIFF-family tail to "<path>.tiff" -- so ".big" becomes ".big.tiff" (a
-   // registered, working extension) -- and note the rename on the Console.
+   // Safety net: never leave a save at a path nothing downstream can reopen.
+   // Rewrite any path lacking a TIFF-family tail to "<path>.tiff" and note the
+   // rename on the Console.
+   //
+   // Historically this fired constantly: while ".big.tiff" was
+   // FileExtensions()[0], choosing this format in Save As appended a bare
+   // ".big" (design spec finding 5 -- the dialog splits a compound extension
+   // at the first dot), and a ".big" file is unusable downstream (Photoshop
+   // won't take it, PI's chooser won't show it). Now that ".tif" leads and the
+   // compound extensions are gone (see BigTiffFormat::FileExtensions()), the
+   // dialog appends ".tif" and this branch should not be reached from a normal
+   // save -- it is kept for paths typed by hand or supplied by a script.
    String path = filePath;
    const bool hasTiffTail = path.EndsWithIC( ".tiff" ) || path.EndsWithIC( ".tif" ) ||
                             path.EndsWithIC( ".btf" ) || path.EndsWithIC( ".tf8" );

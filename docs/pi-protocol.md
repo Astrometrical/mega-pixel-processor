@@ -594,7 +594,7 @@ Example `Init` for a read session:
 {
   "protocol_version": 2,
   "worker_version": "0.1.0",
-  "output_path": "/tmp/M31-mosaic.big.tiff",
+  "output_path": "/tmp/M31-mosaic.tif",
   "width": 9888,
   "height": 6568,
   "channels": 3,

@@ -16,7 +16,7 @@ the module's identity, binary name, or install layout is BigTIFF-specific.
 
 The `BigTIFF` format:
 
-- **Writes** BigTIFF (`.btf`, `.tf8`, `.big.tiff`, `.big.tif`) from inside
+- **Writes** BigTIFF (`.tif`, `.tiff`, `.btf`, `.tf8`) from inside
   PixInsight's own Save/Save As dialogs — past classic TIFF's 4 GB limit,
   without going through `mpp`'s CLI (phase 2).
 - **Reads** whole-image TIFF and BigTIFF files with the same four
@@ -25,13 +25,17 @@ The `BigTIFF` format:
   streaming reader in `mpp-core` decodes any TIFF-family file in the
   supported sample/colour subset, not just the module's own output.
 
-`BigTIFF` is **not** a general-purpose TIFF format: no format-options
-dialog, no ICC/thumbnail/FITS-keyword/property passthrough, no palette/
-CMYK/YCbCr/multiband or signed/complex-sample input, and — deliberately —
-no claim on the `.tif`/`.tiff` extensions themselves (that would conflict
-with PixInsight's own stock TIFF module). See "Out of scope" below and
-`docs/DESIGN.md`'s phase-2/phase-3 entries for what's deferred to a later
-phase.
+`BigTIFF` **claims `.tif`/`.tiff` and replaces PixInsight's stock TIFF
+module** — the two cannot coexist, and the stock module must be uninstalled
+first. See "Replacing the stock TIFF module" below for the procedure, how to
+revert, and what you give up.
+
+It is **not yet** a full replacement for what the stock module does: no
+format-options dialog, no compression (output is always uncompressed), no
+alpha channels, no ICC/thumbnail/FITS-keyword/property passthrough, and no
+palette/CMYK/YCbCr/multiband or signed/complex-sample input. `docs/tiff-parity.md`
+is the gap analysis against the stock module's own options dialog; see also
+"Out of scope" below and `docs/DESIGN.md`'s phase entries.
 
 ## Architecture
 
@@ -146,9 +150,9 @@ consumes it and sends `ReadBandAck` to free the slot — slot ownership
 inverted from the write path). It is a general TIFF/BigTIFF importer, not
 limited to files this module itself wrote:
 
-- **Extensions**: the same four this module writes — `.big.tiff`,
-  `.big.tif`, `.btf`, `.tf8`. `.tif`/`.tiff` are deliberately **not**
-  claimed (see "Out of scope").
+- **Extensions**: the same four this module writes — `.tif`, `.tiff`,
+  `.btf`, `.tf8`. Claiming `.tif`/`.tiff` means this module **replaces**
+  PixInsight's stock TIFF module; see "Replacing the stock TIFF module".
 - **Container**: classic TIFF or BigTIFF, stripped or tiled, the common
   compressions the underlying `tiff` crate decodes (e.g. none/LZW/
   Deflate/PackBits).
@@ -161,13 +165,14 @@ limited to files this module itself wrote:
   CMYK, YCbCr, Lab, and other multiband colour types; planar
   (non-interleaved) sample storage; signed-integer samples; complex/void
   samples; any bit depth outside the five listed above.
-- **`.big` save-rename** (write path, documented here since it directly
-  affects what a subsequent read sees): `BigTiffInstance::Create()` renames
-  a bare `.big` output path to `.big.tiff` and emits a one-line
-  `Console::WarningLn` notice (`PCL_FILEFORMAT_API.md` §8.4) — `.big` alone
-  is not a registered extension PixInsight would reopen, so the module
-  never leaves a save at a path it (or the stock TIFF module) couldn't read
-  back.
+- **Save-rename safety net** (write path, documented here since it
+  directly affects what a subsequent read sees): `BigTiffInstance::Create()`
+  rewrites any output path lacking a TIFF-family tail to `<path>.tiff` and
+  emits a one-line `Console::WarningLn` notice (`PCL_FILEFORMAT_API.md`
+  §8.4), so the module never leaves a save at a path it couldn't read back.
+  With `.tif` leading the extension list the Save As dialog appends `.tif`
+  and this no longer fires on a normal save; it remains for hand-typed and
+  script-supplied paths.
 - **`mpp-ipc-worker --probe <path>`**: a standalone CLI entry that opens a
   file and prints its `ImageMeta` JSON (`docs/pi-protocol.md` §9.2) with no
   shm/handshake involved — useful for checking whether a given file decodes
@@ -253,6 +258,42 @@ If the worker is missing, `BigTiffInstance::Create()` throws a `pcl::Error`
 naming the exact expected path and the `cargo build` command to produce it,
 rather than failing silently or hanging.
 
+## Replacing the stock TIFF module
+
+This module's `BigTIFF` format claims `.tif`/`.tiff`, which PixInsight's
+bundled TIFF module already owns. **The two cannot coexist**: the core
+refuses to register a second format claiming an extension another format
+owns, so `BigTIFF` will silently fail to appear unless the stock module is
+uninstalled first.
+
+**To swap:**
+
+1. **Process → Modules → Manage Modules…**, select the stock TIFF module
+   (`TIFF-pxm.so` in PixInsight's `bin/`), uninstall it, and restart
+   PixInsight when prompted. Uninstall through the UI rather than deleting
+   the file — the file is your way back.
+2. **Process → Modules → Install Modules…**, point it at this module (see
+   "Install layout"), restart.
+3. Confirm the `BigTIFF` format now appears in File > Save As and File >
+   Open with `.tif`/`.tiff` routed to it.
+
+**To revert**, uninstall this module and reinstall `TIFF-pxm.so` from
+PixInsight's `bin/` the same way. Both `TIFF-pxm.so` and its `TIFF-pxm.xsgn`
+signature file must be present for the stock module to reinstall, so don't
+delete either.
+
+**If you install this module without uninstalling the stock one first**,
+nothing breaks — the format just won't register. Uninstall the stock TIFF
+module and restart, and it appears.
+
+**What you give up while swapped.** This module is not yet at parity with
+the stock TIFF module. Output is always uncompressed (no Deflate/LZW), `u32`
+and `f64` saves are narrowed to `f32`, alpha channels are refused, and ICC
+profiles, TIFF text tags and resolution are not written. On read, palette,
+CMYK, YCbCr, Lab, multiband, planar and signed-integer files are rejected
+with a clear error rather than mis-decoded. `docs/tiff-parity.md` tracks the
+full gap.
+
 ## Manual smoke procedure
 
 Loading the module inside PixInsight and driving it from the GUI is **not**
@@ -271,15 +312,21 @@ is the human's manual check:
    bundled SigningKeys script, per MergeMosaic's documented procedure
    (`~/dev/MergeMosaic/integration/pixinsight/module/README.md`, "Code
    signing").
-3. In PixInsight: **Process → Modules → Install Modules…**, point it at the
-   module directory (or `mpp-pxm.so` directly), restart if prompted.
+3. Uninstall the stock TIFF module first (see "Replacing the stock TIFF
+   module") — without this the `BigTIFF` format will not register at all.
+   Then in PixInsight: **Process → Modules → Install Modules…**, point it at
+   the module directory (or `mpp-pxm.so` directly), restart if prompted.
    Confirm "MegaPixelProcessor" appears under Process > Modules with the
    description "Mega Pixel Processor: file format support for
    astronomically large images", and that its "BigTIFF" format appears
    under File > Save As > format list (and under File > Open's format
    filter) described as "Mega Pixel Processor: BigTIFF/TIFF (read+write)".
 4. **Write smoke**: open any image (any bit depth, grayscale or RGB), Save
-   As, choose the BigTIFF format, extension `.btf` or `.tf8`.
+   As, choose the BigTIFF format — the dialog appends `.tif`. Check the
+   format also appears for a *non-file-backed* window (duplicate a view, or
+   use any process that creates one) and for a window loaded from a TIFF:
+   both were the cases the old compound extensions broke (see
+   `docs/tiff-parity.md`).
 5. Verify the saved file: open it in Photoshop (PS >= 26.2 opens BigTIFF)
    or round-trip it through `mpp`'s own reader (`target/release/mpp convert
    output.btf check.png` and inspect visually), and confirm the file size
@@ -287,15 +334,16 @@ is the human's manual check:
 6. Try a save that would exceed 4 GB uncompressed (a large mosaic) and
    confirm it completes — this is the whole point of the module over
    PixInsight's built-in TIFF writer.
-7. **Read smoke**: in PixInsight, File > Open a `test.big.tiff` (or
-   `.big.tif`/`.btf`/`.tf8`) file — either one saved by this module in step
+7. **Read smoke**: in PixInsight, File > Open a `.tif` (or
+   `.tiff`/`.btf`/`.tf8`) file — either one saved by this module in step
    4, or an independently-produced TIFF/BigTIFF in the supported subset
    (see "Read support"). Confirm it opens with the correct geometry and
    colour space, and visually verify pixel content against a known-good
    render of the same file (e.g. `mpp convert <file> check.png`).
-8. Save a `.big` path (no further extension) and confirm PixInsight's
-   Console shows the rename warning and the file lands at `<name>.big.tiff`
-   — then confirm that renamed file re-opens via step 7's procedure.
+8. Type an output path with no TIFF-family extension and confirm
+   PixInsight's Console shows the rename warning and the file lands at
+   `<name>.tiff` — then confirm that renamed file re-opens via step 7's
+   procedure.
 
 ### Known v1 limitation: abort wiring
 
@@ -404,9 +452,13 @@ Deferred to a later phase (not implemented by this module today):
 - **Palette / CMYK / YCbCr / Lab / other multiband colour, and
   signed-integer or complex-sample inputs.** Rejected with a clear
   `pcl::Error` rather than mis-decoded (see "Read support").
-- **Claiming `.tif`/`.tiff`.** Deliberate: those extensions are owned by
-  PixInsight's own stock TIFF module; registering them here would conflict.
-  A future stock-TIFF-replacement phase is the only place this could change.
+- **Parity with the stock TIFF module.** Now that this module claims
+  `.tif`/`.tiff` and displaces the stock one, the gaps below stop being
+  merely deferred and become regressions for anyone who swaps: no
+  compression options (Deflate/LZW), no true `u32`/`f64` output (both are
+  narrowed to `f32`), no alpha, no ICC profile, no Image Description /
+  Copyright / Software tags, no resolution, and no tiled output. Scoped in
+  `docs/tiff-parity.md`.
 - **Classic (non-Big) TIFF *writing*.** The write path only ever produces
   BigTIFF; reading classic TIFF is supported (see "Read support"), writing
   it is not.

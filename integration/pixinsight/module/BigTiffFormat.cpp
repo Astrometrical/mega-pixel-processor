@@ -18,11 +18,30 @@ IsoString BigTiffFormat::Name() const
 
 StringList BigTiffFormat::FileExtensions() const
 {
-   // ".xxx" strings in priority order (FileFormatBase.h:89-91). The compound
-   // ".big.tiff"/".big.tif" extensions are the bidirectional Photoshop bridge
-   // (design "Findings" §1-§2); ".tif"/".tiff" are deliberately NOT claimed
-   // (registration conflicts with the stock TIFF module -- design Non-goals).
-   return StringList{ ".big.tiff", ".big.tif", ".btf", ".tf8" };
+   // ".xxx" strings in priority order (FileFormatBase.h:89-91).
+   //
+   // This format CLAIMS ".tif"/".tiff" and REPLACES PixInsight's stock TIFF
+   // module, which must be uninstalled before this module is installed
+   // (design spec finding 1: the core refuses a second format claiming an
+   // extension another format already owns). See the module README's
+   // "Replacing the stock TIFF module" for the procedure and how to revert.
+   //
+   // Why we own them rather than coexist -- the full investigation is in
+   // docs/tiff-parity.md, "Why we're here". In short: the Save As dialog
+   // drops a TIFF-family format whose extensions collide with those of the
+   // format currently selected as the default. Our former compound
+   // ".big.tiff"/".big.tif" collided with the stock module's *.tif/*.tiff,
+   // so this format vanished from the list whenever TIFF was the default --
+   // for windows loaded from a .big.tiff, and for non-file-backed windows
+   // after any TIFF save. Narrowing to ".btf"/".tf8" fixed the dialog but
+   // broke the Photoshop bridge, since Photoshop recognises TIFF only by a
+   // .tif/.tiff tail. No extension set satisfies both while the stock module
+   // is installed; owning .tif/.tiff satisfies both at once.
+   //
+   // ".big.tiff"/".big.tif" are deliberately NOT claimed any more: owning the
+   // ".tiff" tail routes existing files here regardless, and re-adding a
+   // compound extension would reintroduce the collision described above.
+   return StringList{ ".tif", ".tiff", ".btf", ".tf8" };
 }
 
 IsoStringList BigTiffFormat::MimeTypes() const

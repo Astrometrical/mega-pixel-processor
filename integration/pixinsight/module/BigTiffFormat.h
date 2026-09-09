@@ -1,5 +1,5 @@
 // BigTiffFormat.h -- MetaFileFormat subclass describing the read+write
-// BigTIFF/TIFF (.big.tiff/.big.tif/.btf/.tf8) format. Pure description/
+// BigTIFF/TIFF (.tif/.tiff/.btf/.tf8) format. Pure description/
 // capability queries; all file I/O lives in BigTiffInstance (the
 // FileFormatImplementation this format's Create() manufactures).
 //
@@ -28,8 +28,12 @@ namespace pcl
 
 /*!
  * \class BigTiffFormat
- * \brief Read+write BigTIFF/TIFF format description (extensions .big.tiff,
- *        .big.tif, .btf, .tf8).
+ * \brief Read+write BigTIFF/TIFF format description (extensions .tif,
+ *        .tiff, .btf, .tf8).
+ *
+ * This format claims .tif/.tiff and replaces PixInsight's stock TIFF
+ * module, which must be uninstalled first; see FileExtensions() in the .cpp
+ * for why, and the module README for the swap/revert procedure.
  */
 class BigTiffFormat : public MetaFileFormat
 {

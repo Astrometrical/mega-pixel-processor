@@ -186,7 +186,9 @@ virtual FileFormatImplementation* Create() const = 0;     // MetaFileFormat.h:84
 - `Name()`: the format identifier — "unique, valid C identifiers. Examples:
   'FITS', 'TIFF', 'JPEG2000'" (`FileFormatBase.h:81-83`). Ours: `"BigTIFF"`.
 - `FileExtensions()`: "a sequence of '.xxx...x' strings in priority order"
-  (`FileFormatBase.h:89-91`). Ours: `{ ".btf", ".tf8" }`. Return type
+  (`FileFormatBase.h:89-91`). Ours: `{ ".tif", ".tiff", ".btf", ".tf8" }` —
+  claiming `.tif`/`.tiff` replaces the stock TIFF module, which must be
+  uninstalled first (see the module README). Return type
   `StringList = Array<String>` (`StringList.h:47`).
 - `Create()`: factory returning a **new** `FileFormatImplementation`
   instance for each file operation (`MetaFileFormat.h:835-845`).
