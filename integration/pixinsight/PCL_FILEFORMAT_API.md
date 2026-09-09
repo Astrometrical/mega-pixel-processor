@@ -1,4 +1,4 @@
-# PCL File-Format API Reference — for the mpp BigTIFF module (clean-room)
+# PCL File-Format API Reference — for the Mega Pixel Processor module (clean-room)
 
 ## License scoping and provenance (read this first)
 
@@ -100,7 +100,7 @@ PCL_MODULE_EXPORT int32 InstallPixInsightModule( int32 mode );
   (gcc: same + `externally_visible`). It forces the C symbol out of a
   `-fvisibility=hidden` build.
 
-**Verification gate for Task 4:** `nm -D --defined-only BigTIFF-pxm.so` must
+**Verification gate for Task 4:** `nm -D --defined-only mpp-pxm.so` must
 show `InstallPixInsightModule`, `IdentifyPixInsightModule`, and
 `InitializePixInsightModule` as exported symbols (the latter two come from
 linking `libPCL-pxi.a`).

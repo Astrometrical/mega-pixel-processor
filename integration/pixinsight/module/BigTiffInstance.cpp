@@ -84,13 +84,13 @@ std::string ResolveWorkerPath()
    if ( !File::Exists( worker ) )
       throw Error( "BigTIFF: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mpp-ipc-worker` and copy "
-                   "`mpp-ipc-worker.exe` beside BigTIFF-pxm.dll." );
+                   "`mpp-ipc-worker.exe` beside mpp-pxm.dll." );
 #else
    String worker = dir + "mpp-ipc-worker";
    if ( !File::Exists( worker ) )
       throw Error( "BigTIFF: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mpp-ipc-worker` and copy "
-                   "`mpp-ipc-worker` beside BigTIFF-pxm.so." );
+                   "`mpp-ipc-worker` beside mpp-pxm.so." );
 #endif
    return std::string( worker.ToUTF8().c_str() );
 }

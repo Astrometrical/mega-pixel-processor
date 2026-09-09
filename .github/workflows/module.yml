@@ -1,4 +1,4 @@
-# Builds the PixInsight module (BigTIFF-pxm) + mpp-ipc-worker against the
+# Builds the PixInsight module (mpp-pxm) + mpp-ipc-worker against the
 # pinned open-source PCL, with NO PixInsight on the runner. All four
 # targets -- Linux (x64), macOS (arm64 + x64), and Windows (x64) -- are
 # live, required build+test jobs. macOS needs both arches: pre-1.9.4
@@ -6,7 +6,7 @@
 # x64 builds still ship (see ci/pcl-pin.env's compatibility policy).
 #
 # Adapted from MergeMosaic's .github/workflows/module.yml (mmm-pxm ->
-# BigTIFF-pxm, mmm-ipc-worker -> mpp-ipc-worker, mmm-core/mmm-ipc-worker ->
+# mpp-pxm, mmm-ipc-worker -> mpp-ipc-worker, mmm-core/mmm-ipc-worker ->
 # mpp-ipc/mpp-ipc-worker crates, the pcl-ci build steps call mpp's own
 # integration/pixinsight/ci/build-pcl*.{sh,ps1} scripts). Deliberately
 # SIMPLER than MergeMosaic's current workflow: no update-repository package

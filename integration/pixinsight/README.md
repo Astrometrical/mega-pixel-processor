@@ -1,9 +1,20 @@
-# mpp PixInsight integration: the BigTIFF/TIFF file-format module
+# mpp PixInsight integration: the Mega Pixel Processor module
 
-This directory contains a **read+write** PixInsight Class Library (PCL) file
-format module, `BigTIFF-pxm.so` (`.dylib` on macOS, `.dll` on Windows), named
-`BigTIFF` and identifying itself as `"BigTIFF/TIFF (read+write, Astrometrical
-Mega Pixel Processor)"`. It:
+This directory contains the **Mega Pixel Processor** PixInsight Class Library
+(PCL) module, `mpp-pxm.so` (`.dylib` on macOS, `.dll` on Windows). It
+registers with the core as `MegaPixelProcessor` and appears in
+**Process → Modules** as *"Mega Pixel Processor: file format support for
+astronomically large images"*.
+
+Mega Pixel Processor is a **file-format module**: the formats it provides are
+registered individually beneath it, each with its own extensions,
+capabilities, and description. Today it provides **one** format, `BigTIFF` —
+read+write BigTIFF/TIFF, shown in PixInsight's format lists as *"Mega Pixel
+Processor: BigTIFF/TIFF (read+write)"*. Further formats are added as siblings
+under the same module (see "Module and format naming" below); nothing about
+the module's identity, binary name, or install layout is BigTIFF-specific.
+
+The `BigTIFF` format:
 
 - **Writes** BigTIFF (`.btf`, `.tf8`, `.big.tiff`, `.big.tif`) from inside
   PixInsight's own Save/Save As dialogs — past classic TIFF's 4 GB limit,
@@ -14,7 +25,7 @@ Mega Pixel Processor)"`. It:
   streaming reader in `mpp-core` decodes any TIFF-family file in the
   supported sample/colour subset, not just the module's own output.
 
-It is **not** a general-purpose TIFF format module: no format-options
+`BigTIFF` is **not** a general-purpose TIFF format: no format-options
 dialog, no ICC/thumbnail/FITS-keyword/property passthrough, no palette/
 CMYK/YCbCr/multiband or signed/complex-sample input, and — deliberately —
 no claim on the `.tif`/`.tiff` extensions themselves (that would conflict
@@ -28,7 +39,7 @@ phase.
 PixInsight core                              PixInsight core
       |  Save/Save As (write)                      |  Open (read)
       v                                             v
-integration/pixinsight/module/   (BigTIFF-pxm.so — PCL-linked shim, C++20)
+integration/pixinsight/module/   (mpp-pxm.so — PCL-linked shim, C++20)
   BigTiffFormat   -- format identity/capabilities (MetaFileFormat)
   BigTiffInstance -- per-file session (FileFormatImplementation)
       |  write: normalizes every WriteSamples          |  read: Open()+ReadImage,
@@ -79,6 +90,26 @@ do compile as C++17, but the macOS-arm64 leg builds from the 2.10.x arm64
 pin, so the module stays C++20 uniformly rather than varying the standard
 per pin. The module's makefile documents this; `host/`'s CMake build is
 unaffected.
+
+## Module and format naming
+
+The module and the formats it provides are separate identities, and the code
+keeps them separate so that adding a format is purely additive:
+
+| Layer | Name | Where |
+|---|---|---|
+| Binary | `mpp-pxm.{so,dylib,dll}` | `module/makefile-x64` (`TARGET`), `module/CMakeLists.txt` (Windows) |
+| Module (PCL `MetaModule`) | `MegaPixelProcessor` | `module/Mpp.cpp` (`MppModule`); version in `module/MppVersion.h` |
+| Format (PCL `MetaFileFormat`) | `BigTIFF` | `module/BigTiffFormat.{h,cpp}` + `module/BigTiffInstance.{h,cpp}` |
+
+Module-level code is named `Mpp*`; each **file format** is a sibling
+`<Format>Format` / `<Format>Instance` pair named for the format itself, not
+for the product. That matches PixInsight's own convention — a format id names
+the container (`TIFF`, `XISF`, `FITS`) while the vendor identity lives in the
+module and in each format's `Description()`. A second format is added by
+writing a new pair and constructing it in `InstallPixInsightModule`
+(`module/Mpp.cpp`) alongside `BigTiffFormat`; the binary name, module
+identity, CI jobs, staging layout, and install procedure below are unaffected.
 
 ## Write: sample-format mapping
 
@@ -180,7 +211,7 @@ integration/pixinsight/ci/build-module-windows.ps1 `
   -PclInc <pcl-prefix>/include -PclLib <pcl-prefix>/lib -Stage stage
 ```
 
-This produces `integration/pixinsight/module/BigTIFF-pxm.so`. The host
+This produces `integration/pixinsight/module/mpp-pxm.so`. The host
 library (`host/`) has its own build (`cmake -S integration/pixinsight/host
 -B <build-dir> && cmake --build <build-dir>`) used only for its golden CTest
 suite in this repo's regular gates — the module's makefile compiles the
@@ -189,15 +220,15 @@ artifact is never installed.
 
 Build gates enforced on this machine and re-checked at every commit that
 touches this tree: zero `-Wall -Wextra` warnings; `nm -D -u -C
-BigTIFF-pxm.so | grep -c "mpp::"` is `0` (no undefined `mpp::` symbols — the
-host lib linked in fully); `nm -D --defined-only -C BigTIFF-pxm.so | grep -i
+mpp-pxm.so | grep -c "mpp::"` is `0` (no undefined `mpp::` symbols — the
+host lib linked in fully); `nm -D --defined-only -C mpp-pxm.so | grep -i
 PixInsightModule` shows the three exported entry points
 (`IdentifyPixInsightModule`, `InitializePixInsightModule`,
 `InstallPixInsightModule`).
 
 The module is **unsigned** by this build. PixInsight >= 1.9 refuses to load
 unsigned modules; `make sign` (see the makefile) produces a local
-`BigTIFF-pxm.xsgn` from a locally-generated signing identity, sufficient for
+`mpp-pxm.xsgn` from a locally-generated signing identity, sufficient for
 loading on the machine that generated it. Distributing to other machines
 needs a Pleiades Certified-Developer signing certificate — out of scope
 here (see MergeMosaic's own module, which has the identical dormant
@@ -214,7 +245,7 @@ the module binary** — install both side by side:
 
 ```
 <module-dir>/
-  BigTIFF-pxm.so          # or .dylib / .dll
+  mpp-pxm.so          # or .dylib / .dll
   mpp-ipc-worker           # or mpp-ipc-worker.exe
 ```
 
@@ -241,10 +272,12 @@ is the human's manual check:
    (`~/dev/MergeMosaic/integration/pixinsight/module/README.md`, "Code
    signing").
 3. In PixInsight: **Process → Modules → Install Modules…**, point it at the
-   module directory (or `BigTIFF-pxm.so` directly), restart if prompted.
-   Confirm "BigTIFF" appears under File > Save As > format list (and under
-   File > Open's format filter), with the description "BigTIFF/TIFF
-   (read+write, Astrometrical Mega Pixel Processor)".
+   module directory (or `mpp-pxm.so` directly), restart if prompted.
+   Confirm "MegaPixelProcessor" appears under Process > Modules with the
+   description "Mega Pixel Processor: file format support for
+   astronomically large images", and that its "BigTIFF" format appears
+   under File > Save As > format list (and under File > Open's format
+   filter) described as "Mega Pixel Processor: BigTIFF/TIFF (read+write)".
 4. **Write smoke**: open any image (any bit depth, grayscale or RGB), Save
    As, choose the BigTIFF format, extension `.btf` or `.tf8`.
 5. Verify the saved file: open it in Photoshop (PS >= 26.2 opens BigTIFF)
@@ -327,7 +360,7 @@ This repository is Apache-2.0 (see `/LICENSE`, `/NOTICE`). Building and
 distributing `module/`'s build products introduces one exception, scoped
 narrowly to that directory:
 
-- **`integration/pixinsight/module/` (`BigTIFF-pxm.so` and its build
+- **`integration/pixinsight/module/` (`mpp-pxm.so` and its build
   products only)** links against PCL (`libPCL-pxi.a`) and PCL's public
   headers. Distributing that binary is subject to the **PixInsight Class
   Library License, Version 2.0.1** — retained notices, the required
@@ -339,7 +372,7 @@ narrowly to that directory:
   condition 2 requires the conditions/restriction/disclaimer to be
   reproduced in the documentation accompanying a binary redistribution, so
   this repository ships the text rather than only pointing at it). Any
-  distributed package containing `BigTIFF-pxm.so` should include
+  distributed package containing `mpp-pxm.so` should include
   `LICENSE-PCL` alongside it (the Task 6 CI staging step does this). The
   same text is also published at
   https://pixinsight.com/license/PCL-License-2.0.html and ships with every

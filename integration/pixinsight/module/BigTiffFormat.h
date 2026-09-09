@@ -3,6 +3,11 @@
 // capability queries; all file I/O lives in BigTiffInstance (the
 // FileFormatImplementation this format's Create() manufactures).
 //
+// This is ONE of the formats the Mega Pixel Processor module (MppModule,
+// Mpp.cpp) provides -- the first, not the module's identity. Each further
+// format is a sibling <Format>Format/<Format>Instance pair registered the
+// same way; see Mpp.cpp's naming-convention note.
+//
 // Capability truth-in-advertising rule (plan "Behavioral contract for the
 // module"): advertise only what the shim + worker actually do. See
 // PCL_FILEFORMAT_API.md §2.1 for the full capability table with the PCL

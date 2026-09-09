@@ -12,6 +12,12 @@
 // (MetaObject tree -- see PCL_FILEFORMAT_API.md §1.3 and Unknowns §7.1: the
 // MetaModule is created strictly before the MetaFileFormat).
 //
+// Naming convention: module-level identity is Mpp* (this file, MppModule,
+// MppVersion.h); each *file format* the module provides is its own
+// MetaFileFormat/FileFormatImplementation pair named for that format
+// (BigTiffFormat/BigTiffInstance today). Additional formats are added as
+// sibling pairs, each constructed below alongside BigTiffFormat.
+//
 // Clean-room note: written from the public PCL headers, the project's
 // PCL_FILEFORMAT_API.md reference, and MergeMosaic's own mmm.cpp (our code).
 // No PCL module implementation source was consulted.
@@ -54,8 +60,9 @@ public:
 
    String Description() const override
    {
-      return "Mega Pixel Processor: write-only BigTIFF (.btf/.tf8) file format support "
-             "for very large astro images.";
+      return "Mega Pixel Processor: file format support for astronomically large "
+             "images. Provides the BigTIFF/TIFF format (read+write); further "
+             "formats register under this module as they are added.";
    }
 
    String Company() const override
@@ -93,6 +100,7 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
 
    if ( mode == pcl::InstallMode::FullInstall )
       new pcl::BigTiffFormat;   // self-registers under pcl::Module
+                                // (further formats: one `new` each, here)
 
    return 0;
 }

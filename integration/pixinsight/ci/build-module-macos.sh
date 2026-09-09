@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the PCL module (BigTIFF-pxm.dylib) + mpp-ipc-worker on macOS, run the
+# Build the PCL module (mpp-pxm.dylib) + mpp-ipc-worker on macOS, run the
 # module build gates, run the host CTest golden suite, and stage the
 # unsigned artifact payload.
 #
@@ -72,7 +72,7 @@ echo "PCL_API_Version confirmed 0x${PCL_API_VERSION_HEX} at $API_HDR"
 echo "=== [2/7] make clean ==="
 make -C "$MODULE_DIR" clean
 
-echo "=== [3/7] build BigTIFF-pxm.dylib ==="
+echo "=== [3/7] build mpp-pxm.dylib ==="
 build_log="$(mktemp)"
 trap 'rm -f "$build_log"' EXIT
 make -C "$MODULE_DIR" "${MAKE_ARGS[@]}" MPP_MACOS_ARCH="$ARCH" 2>&1 | tee "$build_log"
@@ -83,14 +83,14 @@ if grep -q 'warning:' "$build_log"; then
   exit 1
 fi
 
-DYLIB="$MODULE_DIR/BigTIFF-pxm.dylib"
-[ -f "$DYLIB" ] || { echo "BigTIFF-pxm.dylib not built" >&2; exit 1; }
+DYLIB="$MODULE_DIR/mpp-pxm.dylib"
+[ -f "$DYLIB" ] || { echo "mpp-pxm.dylib not built" >&2; exit 1; }
 
 echo "=== [4/7] nm gates ==="
 # Host objects must be linked in: any undefined mpp:: symbol means they
 # weren't (MMM's build-module-macos.sh phrasing, mechanically renamed).
 if nm -u "$DYLIB" | grep -E ' _?_ZN3mpp' ; then
-  echo "ERROR: undefined mpp:: symbols in BigTIFF-pxm.dylib (host objects not linked)" >&2
+  echo "ERROR: undefined mpp:: symbols in mpp-pxm.dylib (host objects not linked)" >&2
   exit 1
 fi
 echo "no undefined mpp:: symbols in $DYLIB"
@@ -98,7 +98,7 @@ echo "no undefined mpp:: symbols in $DYLIB"
 # A wrong-arch dylib would install fine and then silently fail to load in an
 # arch-mismatched core; assert the slice matches the requested arch.
 GOT="$(lipo -archs "$DYLIB")"
-[ "$GOT" = "$LIPO_ARCH" ] || { echo "ERROR: BigTIFF-pxm.dylib arch '$GOT' != expected '$LIPO_ARCH'" >&2; exit 1; }
+[ "$GOT" = "$LIPO_ARCH" ] || { echo "ERROR: mpp-pxm.dylib arch '$GOT' != expected '$LIPO_ARCH'" >&2; exit 1; }
 
 # PCL entry points must be exported (Task 4's gate; BSD nm has no
 # --defined-only, so filter on the "T"/"t" (text/code, defined) symbol type).
@@ -128,7 +128,7 @@ DOC_SRC="$REPO_ROOT/integration/pixinsight"
 [ -f "$DOC_SRC/LICENSE-PCL" ] || { echo "PCL license text missing at $DOC_SRC/LICENSE-PCL" >&2; exit 1; }
 
 mkdir -p "$STAGE/bin" "$STAGE/doc"
-cp -f "$DYLIB" "$STAGE/bin/BigTIFF-pxm.dylib"
+cp -f "$DYLIB" "$STAGE/bin/mpp-pxm.dylib"
 cp -f "$WORKER" "$STAGE/bin/mpp-ipc-worker"
 cp -f "$DOC_SRC/LICENSE-PCL" "$STAGE/bin/LICENSE-PCL"
 cp -f "$DOC_SRC/README.md" "$STAGE/doc/README.md"

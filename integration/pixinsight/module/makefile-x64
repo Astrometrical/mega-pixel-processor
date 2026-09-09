@@ -1,12 +1,12 @@
 ######################################################################
-# Mega Pixel Processor PixInsight module (BigTIFF-pxm)
+# Mega Pixel Processor PixInsight module (mpp-pxm)
 #   Linux/g++/x64 + macOS/clang++/arm64
 #
 # Modeled on MergeMosaic's integration/pixinsight/module/makefile-x64 (our
 # code). The module links libPCL-pxi.a plus the PCL-free host/ objects
 # (mpp_shm / mpp_protocol / mpp_host), compiled here into the module link so
 # the .so carries no undefined mpp:: symbols (gated by
-# `nm -D -u BigTIFF-pxm.so`). Do NOT add -Wl,--no-undefined (Linux) or
+# `nm -D -u mpp-pxm.so`). Do NOT add -Wl,--no-undefined (Linux) or
 # otherwise strip undefined symbols: the module's low-level PixInsight-core
 # symbols are resolved by the core at load time, so undefined core symbols
 # in the module are expected and correct.
@@ -55,7 +55,7 @@ ifeq ($(UNAME_S),Darwin)
     CXX := clang++
   endif
   MODULE_EXT := dylib
-  SHARED_FLAGS := -dynamiclib -install_name @rpath/BigTIFF-pxm.dylib
+  SHARED_FLAGS := -dynamiclib -install_name @rpath/mpp-pxm.dylib
   # See MMM's makefile for the full rationale: the Linux branch's
   # -D__PCL_AVX2/-D__PCL_FMA/-mavx2/-mfma/-m64/-minline-all-stringops are
   # GCC-only x86 flags and -fnon-call-exceptions is a GCC extension, so the
@@ -99,7 +99,7 @@ else
   PLATFORM_LIBS := -lPCL-pxi -lpthread -lrt
 endif
 
-TARGET   = BigTIFF-pxm.$(MODULE_EXT)
+TARGET   = mpp-pxm.$(MODULE_EXT)
 
 # PCL headers are third-party: -isystem (see header comment). The host lib
 # and its vendored json.hpp are ours/vendored; json.hpp is only included by
@@ -138,7 +138,7 @@ $(TARGET): $(OBJS)
 #
 #   make sign XSSK_FILE=$HOME/mpp-dev.xssk XSSK_PASSWORD='your-password'
 #
-# That produces BigTIFF-pxm.xsgn beside the module, which the local core
+# That produces mpp-pxm.xsgn beside the module, which the local core
 # trusts. A Pleiades Certified-Developer cert is only needed to distribute
 # to OTHER machines. (Same procedure as MergeMosaic's module.)
 PIXINSIGHT    ?= PixInsight
@@ -156,9 +156,9 @@ sign: $(TARGET)
 	  --sign-module-file="$(CURDIR)/$(TARGET)" \
 	  --xssk-file="$(XSSK_FILE)" --xssk-password="$(XSSK_PASSWORD)" \
 	  $(SIGN_EXIT)
-	@test -f "$(CURDIR)/BigTIFF-pxm.xsgn" \
-	  && echo "signed: BigTIFF-pxm.xsgn written beside the module" \
-	  || echo "note: BigTIFF-pxm.xsgn not found — check the signing output above (flags/password)."
+	@test -f "$(CURDIR)/mpp-pxm.xsgn" \
+	  && echo "signed: mpp-pxm.xsgn written beside the module" \
+	  || echo "note: mpp-pxm.xsgn not found — check the signing output above (flags/password)."
 
 # Module sources (this directory).
 $(OBJDIR)/%.o: %.cpp | $(OBJDIR)

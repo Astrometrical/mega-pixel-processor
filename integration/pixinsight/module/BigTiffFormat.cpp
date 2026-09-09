@@ -40,20 +40,23 @@ uint32 BigTiffFormat::Version() const
 
 String BigTiffFormat::Description() const
 {
-   return "BigTIFF/TIFF (read+write, Astrometrical Mega Pixel Processor)";
+   // Product first, container second: this is one of the formats the Mega
+   // Pixel Processor module provides, not the module's whole identity.
+   return "Mega Pixel Processor: BigTIFF/TIFF (read+write)";
 }
 
 String BigTiffFormat::Implementation() const
 {
-   return "Clean-room BigTIFF/TIFF reader and BigTIFF encoder for very large "
-          "images. Pixel data are streamed over shared memory to and from the "
-          "mpp-ipc-worker process installed beside this module, which performs "
-          "the actual TIFF/BigTIFF decoding (read) and BigTIFF encoding "
-          "(write). Implemented by Astrometrical's Mega Pixel "
-          "Processor (mpp) project from the public TIFF/BigTIFF "
-          "specifications and the public PCL API only; see the module's "
-          "provenance README (integration/pixinsight/README.md in the mpp "
-          "source distribution). Version " MPP_MODULE_VERSION_STRING ".";
+   return "Astrometrical Mega Pixel Processor (mpp): file format support for "
+          "astronomically large images. This format is mpp's clean-room "
+          "BigTIFF/TIFF reader and BigTIFF encoder. Pixel data are streamed "
+          "over shared memory to and from the mpp-ipc-worker process "
+          "installed beside this module, which performs the actual "
+          "TIFF/BigTIFF decoding (read) and BigTIFF encoding (write). "
+          "Implemented from the public TIFF/BigTIFF specifications and the "
+          "public PCL API only; see the module's provenance README "
+          "(integration/pixinsight/README.md in the mpp source "
+          "distribution). Version " MPP_MODULE_VERSION_STRING ".";
 }
 
 // ----------------------------------------------------------------------------

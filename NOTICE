@@ -17,7 +17,7 @@ into every published output directory.
 --------------------------------------------------------------------------
 
 The optional PixInsight file-format module built from
-integration/pixinsight/module/ (BigTIFF-pxm.so / .dylib / .dll) links
+integration/pixinsight/module/ (mpp-pxm.so / .dylib / .dll) links
 against the PixInsight Class Library (PCL), Copyright (c) 2025, Pleiades
 Astrophoto S.L. All Rights Reserved, licensed under the PixInsight Class
 Library License, Version 2.0.1, 29 December 2025. The full license text is

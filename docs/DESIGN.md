@@ -39,6 +39,18 @@ being better, not on being the only place the files work.
   pun), e.g. an npm package for the OSD wrapper.
 - **Astronomic** is reserved for a possible hosted DZI platform ("Astronomic,
   by Astrometrical").
+- **PixInsight module identity is the product, not a format** (decided
+  2026-09-09): the module binary is `mpp-pxm.{so,dylib,dll}` and registers
+  as `MegaPixelProcessor` ("Mega Pixel Processor: file format support for
+  astronomically large images"). The *formats* it provides register beneath
+  it individually and are named for their container, per PixInsight's own
+  convention (`TIFF`, `XISF`, `FITS`) — today just `BigTIFF`, described as
+  "Mega Pixel Processor: BigTIFF/TIFF (read+write)". BigTIFF was the first
+  format, never the module's identity; adding a second format is additive
+  (a new `<Format>Format`/`<Format>Instance` pair constructed in
+  `InstallPixInsightModule`) and changes no binary name, CI job, or install
+  procedure. See `integration/pixinsight/README.md`, "Module and format
+  naming".
 - Rejected names, for the record: Peta Pixel * (petapixel.com), Giga Pixel *
   (Topaz Gigapixel), Prism (Syqon Prism Deep), Parser/Press (weak/ambiguous).
 
@@ -140,7 +152,7 @@ distortion grids) do not bump it. Source of truth:
    Photoshop (PS ≥ 26.2 saves BigTIFF; opening support is older).
 2. **PixInsight file-format module, write path (phase 2, complete):**
    plan A's Rust worker + IPC, plan B's C++ PCL host module and the
-   `BigTIFF-pxm.so` shim itself — a write-only "BigTIFF" format (`.btf`,
+   `mpp-pxm.so` shim itself — a write-only "BigTIFF" format (`.btf`,
    `.tf8`) streaming pixel bands over the shm host/worker channel (pattern
    proven in MMM's integration/) to a Rust worker that encodes. Write-only
    was legitimate as a v1 scope (PI's RAW format is also read-only); the

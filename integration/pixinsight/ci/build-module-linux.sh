@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the PCL module (BigTIFF-pxm.so) + mpp-ipc-worker on Linux, run the
+# Build the PCL module (mpp-pxm.so) + mpp-ipc-worker on Linux, run the
 # module build gates (PCL_API_Version gate, zero -Wall -Wextra warnings, no
 # undefined mpp:: symbols, PCL entry points exported), run the host CTest
 # golden suite, and stage the unsigned artifact payload.
@@ -15,7 +15,7 @@
 #
 # Adapted (mechanical rename + retarget) from MergeMosaic's
 # integration/pixinsight/ci/build-module-linux.sh:
-#   mmm -> mpp, mmm-pxm.so -> BigTIFF-pxm.so, mmm-ipc-worker -> mpp-ipc-worker,
+#   mmm -> mpp, mmm-pxm.so -> mpp-pxm.so, mmm-ipc-worker -> mpp-ipc-worker,
 #   mmm-core -> N/A (mpp's module gates are cargo/ctest only, no separate
 #   `cargo test` call here -- module.yml runs `cargo test -p mpp-ipc
 #   -p mpp-ipc-worker` itself, matching the Task 6 brief).
@@ -30,7 +30,7 @@
 #   doc/tools/*.html topic); staged doc content here is README.md +
 #   LICENSE-PCL instead. LICENSE-PCL is staged *twice* -- once beside the
 #   module binary in stage/bin/ (Task 5's compliance note: "a distributed
-#   package containing BigTIFF-pxm.so should include LICENSE-PCL alongside
+#   package containing mpp-pxm.so should include LICENSE-PCL alongside
 #   it") and once under stage/doc/ (this task's brief: "stage/doc/...
 #   incl. LICENSE-PCL") -- satisfying both call-outs rather than guessing
 #   which one is authoritative.
@@ -92,7 +92,7 @@ echo "PCL_API_Version confirmed 0x${PCL_API_VERSION_HEX} at $API_HDR"
 echo "=== [2/7] make clean ==="
 make -C "$MODULE_DIR" clean
 
-echo "=== [3/7] build BigTIFF-pxm.so ==="
+echo "=== [3/7] build mpp-pxm.so ==="
 build_log="$(mktemp)"
 trap 'rm -f "$build_log"' EXIT
 make -C "$MODULE_DIR" "${MAKE_ARGS[@]}" 2>&1 | tee "$build_log"
@@ -105,15 +105,15 @@ if grep -q 'warning:' "$build_log"; then
   exit 1
 fi
 
-SO="$MODULE_DIR/BigTIFF-pxm.so"
-[ -f "$SO" ] || { echo "BigTIFF-pxm.so not built" >&2; exit 1; }
+SO="$MODULE_DIR/mpp-pxm.so"
+[ -f "$SO" ] || { echo "mpp-pxm.so not built" >&2; exit 1; }
 
 echo "=== [4/7] nm gates ==="
 # The host objects (mpp_shm/mpp_protocol/mpp_host) must be linked in fully:
 # any undefined mpp:: symbol means they weren't (MMM's build-module-linux.sh
 # phrasing, mechanically renamed mmm -> mpp).
 if nm -D -u "$SO" | grep -E '_ZN3mpp|mpp::' ; then
-  echo "ERROR: undefined mpp:: symbols in BigTIFF-pxm.so (host objects not linked)" >&2
+  echo "ERROR: undefined mpp:: symbols in mpp-pxm.so (host objects not linked)" >&2
   exit 1
 fi
 echo "no undefined mpp:: symbols in $SO"
@@ -145,7 +145,7 @@ DOC_SRC="$REPO_ROOT/integration/pixinsight"
 [ -f "$DOC_SRC/LICENSE-PCL" ] || { echo "PCL license text missing at $DOC_SRC/LICENSE-PCL" >&2; exit 1; }
 
 mkdir -p "$STAGE/bin" "$STAGE/doc"
-cp -f "$SO" "$STAGE/bin/BigTIFF-pxm.so"
+cp -f "$SO" "$STAGE/bin/mpp-pxm.so"
 cp -f "$WORKER" "$STAGE/bin/mpp-ipc-worker"
 cp -f "$DOC_SRC/LICENSE-PCL" "$STAGE/bin/LICENSE-PCL"
 cp -f "$DOC_SRC/README.md" "$STAGE/doc/README.md"

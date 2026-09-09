@@ -1,4 +1,4 @@
-# Build BigTIFF-pxm.dll + mpp-ipc-worker.exe on Windows, stage the unsigned
+# Build mpp-pxm.dll + mpp-ipc-worker.exe on Windows, stage the unsigned
 # payload. Mirrors the gates of build-module-macos.sh: warning-free build,
 # the module DLL is produced, the worker builds, and both land in <Stage>/bin.
 #   build-module-windows.ps1 -PclInc <dir> -PclLib <dir> -Stage <dir>
@@ -55,8 +55,8 @@ if ($warnings) {
   throw "ERROR: MSVC warnings in module build"
 }
 
-$dll = Get-ChildItem $build -Recurse -Filter 'BigTIFF-pxm.dll' | Select-Object -First 1
-if (-not $dll) { throw 'BigTIFF-pxm.dll not built' }
+$dll = Get-ChildItem $build -Recurse -Filter 'mpp-pxm.dll' | Select-Object -First 1
+if (-not $dll) { throw 'mpp-pxm.dll not built' }
 
 Push-Location $repo
 try {
@@ -73,7 +73,7 @@ if (-not (Test-Path (Join-Path $docSrc 'README.md'))) { throw "module documentat
 if (-not (Test-Path (Join-Path $docSrc 'LICENSE-PCL'))) { throw "PCL license text missing at $docSrc/LICENSE-PCL" }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'bin'), (Join-Path $Stage 'doc') | Out-Null
-Copy-Item $dll.FullName (Join-Path $Stage 'bin/BigTIFF-pxm.dll') -Force
+Copy-Item $dll.FullName (Join-Path $Stage 'bin/mpp-pxm.dll') -Force
 Copy-Item $worker (Join-Path $Stage 'bin/mpp-ipc-worker.exe') -Force
 Copy-Item (Join-Path $docSrc 'LICENSE-PCL') (Join-Path $Stage 'bin/LICENSE-PCL') -Force
 Copy-Item (Join-Path $docSrc 'README.md') (Join-Path $Stage 'doc/README.md') -Force

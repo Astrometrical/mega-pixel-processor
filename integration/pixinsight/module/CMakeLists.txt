@@ -1,4 +1,4 @@
-# Windows-only CMake build for the mpp PixInsight module (BigTIFF-pxm.dll).
+# Windows-only CMake build for the mpp PixInsight module (mpp-pxm.dll).
 #
 # The Linux/macOS module is built by `makefile-x64` (a .so/.dylib whose
 # undefined PixInsight-core symbols are resolved by the core at load time).
@@ -7,7 +7,7 @@
 # PCL SHA (adapted from MergeMosaic's module/CMakeLists.txt -- our code,
 # whose windows leg proves this recipe against the same 2.8.3 pin):
 #
-#   * ConfigurationType DynamicLibrary  -> BigTIFF-pxm.dll
+#   * ConfigurationType DynamicLibrary  -> mpp-pxm.dll
 #   * link PCL-pxi.lib + the six vendored 3rdparty -pxi.lib + Win32 system libs
 #   * NO PixInsight-core import library exists or is needed: the module exports
 #     its entry points (via PCL_MODULE_EXPORT/__declspec(dllexport)) and
@@ -53,7 +53,7 @@ string(REGEX REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 string(REGEX REPLACE "/W[0-4]" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 
 # Source list mirrors makefile-x64 exactly (MODULE_OBJS + HOST_OBJS).
-add_library(BigTIFF-pxm SHARED
+add_library(mpp-pxm SHARED
   Mpp.cpp
   BigTiffFormat.cpp
   BigTiffInstance.cpp
@@ -61,15 +61,15 @@ add_library(BigTIFF-pxm SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/mpp_protocol.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/mpp_host.cpp)
 
-# BigTIFF-pxm.dll, no "lib" prefix (matches the .so/.dylib output name).
-set_target_properties(BigTIFF-pxm PROPERTIES PREFIX "" OUTPUT_NAME "BigTIFF-pxm" SUFFIX ".dll")
+# mpp-pxm.dll, no "lib" prefix (matches the .so/.dylib output name).
+set_target_properties(mpp-pxm PROPERTIES PREFIX "" OUTPUT_NAME "mpp-pxm" SUFFIX ".dll")
 
 # PCL headers as SYSTEM (MSVC /external:I): the pinned PCL (2.8.x, C++17-era)
 # warns from inside its own headers under C++20, which would trip the
 # warning-free gate in build-module-windows.ps1; our code stays under /W3.
-target_include_directories(BigTIFF-pxm SYSTEM PRIVATE
+target_include_directories(mpp-pxm SYSTEM PRIVATE
   ${PCLINCDIR})
-target_include_directories(BigTIFF-pxm PRIVATE
+target_include_directories(mpp-pxm PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../host
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/third_party)
 
@@ -77,19 +77,19 @@ target_include_directories(BigTIFF-pxm PRIVATE
 # compile with (WarningLevel Level3 == /W3, as the real PCL modules use).
 # C++20 comes from CMAKE_CXX_STANDARD above (do not also pass /std:c++20 here,
 # or MSVC gets the flag twice).
-target_compile_options(BigTIFF-pxm PRIVATE
+target_compile_options(mpp-pxm PRIVATE
   /permissive- /Zc:__cplusplus /EHa /arch:AVX2 /W3)
-target_compile_definitions(BigTIFF-pxm PRIVATE
+target_compile_definitions(mpp-pxm PRIVATE
   WIN32 WIN64 _WINDOWS UNICODE _UNICODE
   __PCL_WINDOWS __PCL_NO_WIN32_MINIMUM_VERSIONS __PCL_AVX2 __PCL_FMA
   _CRT_SECURE_NO_WARNINGS)
 
-target_link_directories(BigTIFF-pxm PRIVATE ${PCLLIBDIR})
+target_link_directories(mpp-pxm PRIVATE ${PCLLIBDIR})
 
 # PCL first, then the six vendored 3rdparty archives (order matters: PCL-pxi
 # depends on them), then the exact Win32 system import libs the real PCL
 # windows modules link. No PixInsight-core .lib -- see header comment.
-target_link_libraries(BigTIFF-pxm PRIVATE
+target_link_libraries(mpp-pxm PRIVATE
   PCL-pxi
   lz4-pxi zstd-pxi zlib-pxi RFC6234-pxi lcms-pxi cminpack-pxi
   kernel32 user32 gdi32 winspool comdlg32 advapi32 shell32 ole32 oleaut32

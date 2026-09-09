@@ -2,8 +2,8 @@
 
 Get big astro images out of astro software and into the world.
 
-`mpp` is a standalone command-line tool (and future PixInsight file-format
-engine) for astronomically large images:
+`mpp` is a standalone command-line tool — and a PixInsight file-format
+module — for astronomically large images:
 
 - **Convert** between XISF, FITS, TIFF/**BigTIFF**, and mainstream formats
   (PNG, JPEG, WebP, AVIF, ...) at any size — including past classic TIFF's
@@ -20,7 +20,7 @@ Part of the Astrometrical "Mega" tool family, alongside
 
 ## Status
 
-**Phase-3 (BigTIFF reader) landed:** the PixInsight file-format module, `BigTIFF-pxm.so`, is now **read+write**. PixInsight (1.9.0 and newer) can both save BigTIFF (`.btf`, `.tf8`) past the classic TIFF 4 GB limit *and* open TIFF/BigTIFF files (`.big.tiff`, `.big.tif`, `.btf`, `.tf8`) back — a general importer (stripped/tiled, common compressions, native sample fidelity), not limited to files the module itself wrote. The wire protocol between the module and its `mpp-ipc-worker` process bumped to v2 to add the worker-pull read direction alongside the original host-push write direction (`docs/pi-protocol.md` §9). See [integration/pixinsight/README.md](integration/pixinsight/README.md)'s "Read support" section for what's covered and what's deferred (WCS sidecar readback, incremental read, palette/CMYK inputs, claiming `.tif`/`.tiff`).
+**Phase-3 (BigTIFF reader) landed:** the **Mega Pixel Processor** PixInsight file-format module (`mpp-pxm.so`, registered as `MegaPixelProcessor`) is now **read+write** in its first format, `BigTIFF`. PixInsight (1.9.0 and newer) can both save BigTIFF (`.btf`, `.tf8`) past the classic TIFF 4 GB limit *and* open TIFF/BigTIFF files (`.big.tiff`, `.big.tif`, `.btf`, `.tf8`) back — a general importer (stripped/tiled, common compressions, native sample fidelity), not limited to files the module itself wrote. The wire protocol between the module and its `mpp-ipc-worker` process bumped to v2 to add the worker-pull read direction alongside the original host-push write direction (`docs/pi-protocol.md` §9). See [integration/pixinsight/README.md](integration/pixinsight/README.md)'s "Read support" section for what's covered and what's deferred (WCS sidecar readback, incremental read, palette/CMYK inputs, claiming `.tif`/`.tiff`).
 
 **Phase-2 (Plan B) complete:** the write-only groundwork above — machine-verified (all cargo gates green; host library CTest golden suite; module `.so` builds clean, zero `-Wall -Wextra` warnings, links fully with no undefined `mpp::` symbols; version-sync test guards protocol agreement), built by CI for all four targets (linux-x64, macos-arm64/x64, windows-x64), and smoke-tested in PixInsight itself (Windows 1.9.4, Linux 1.9.3). Distributed via an Astrometrical PixInsight update repository (signing + publishing live in the astrometrical-mmm-site sibling project; this repo's CI stages the unsigned artifacts that pipeline consumes). See [integration/pixinsight/README.md](integration/pixinsight/README.md) for build, install, and manual-test instructions.
 
