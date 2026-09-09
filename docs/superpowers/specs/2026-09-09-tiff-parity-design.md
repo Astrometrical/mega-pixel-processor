@@ -125,9 +125,23 @@ One encode loop serves both layouts:
 2. Apply the horizontal predictor when configured.
 3. Compress through a `Compressor`, chosen once from the options.
 4. `DirectoryEncoder::write_data()` the compressed bytes; record the returned
-   offset and the byte count. Pad to an even offset before each block so
-   every offset is word-aligned.
+   offset and the byte count.
 5. After the last chunk, write the tag set and `finish()`.
+
+Strip and tile data are written back-to-back with no inter-block padding,
+matching the `tiff` crate's own strip writer: TIFF's word-alignment rule
+applies to IFD entries and their out-of-line values, which `write_tag()` and
+`DirectoryEncoder`'s own `pad_word_boundary()` already handle, not to pixel
+data blocks.
+
+Sample bytes are emitted in **native** byte order (`to_ne_bytes`), because
+the crate writes the file's byte-order mark from `target_endian` — `II` on a
+little-endian host, `MM` on a big-endian one — so native-order samples are by
+construction the file's order.
+
+Each compressed block is independent, as TIFF requires: the crate's `Lzw` and
+`Deflate` compressors construct a fresh encoder per `write_to()` call, so a
+block never depends on its predecessor's dictionary state.
 
 Strips and tiles differ only in step 1 and in which offset/byte-count tags
 step 5 emits. Memory stays bounded by one chunk, as it is today.
@@ -338,8 +352,8 @@ Machine-verifiable, all inputs synthesized (never `test_data/`):
   column and bottom row, including the corner); classic-vs-BigTIFF magic
   bytes; `Auto` selecting each container side of the threshold; u32 and f64
   round-tripping exactly; `ExtraSamples` present and correct for 2- and
-  4-channel images; predictor rejected for float; even-offset alignment of
-  every strip/tile offset.
+  4-channel images; predictor rejected for float; every compressed block
+  decoding independently.
 - **Reader unit tests** — palette, YCbCr and planar fixtures. These are
   written by the new IFD writer itself (extended in test-only code where it
   must emit a layout the writer does not offer in production), which is what
