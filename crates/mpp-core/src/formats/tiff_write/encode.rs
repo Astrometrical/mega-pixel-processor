@@ -452,6 +452,19 @@ where
         .map_err(terr)?;
     dir.write_tag(Tag::PhotometricInterpretation, photometric(colour_channels))
         .map_err(terr)?;
+    // TIFF 6.0 §18: ExtraSamples describes every sample beyond the ones the
+    // photometric interpretation accounts for. We write at most one, the
+    // alpha channel, and its value says whether the colour channels are
+    // premultiplied by it.
+    match opts.alpha {
+        AlphaMode::None => {}
+        AlphaMode::Associated => dir
+            .write_tag(Tag::ExtraSamples, &[1u16][..])
+            .map_err(terr)?,
+        AlphaMode::Unassociated => dir
+            .write_tag(Tag::ExtraSamples, &[2u16][..])
+            .map_err(terr)?,
+    }
     dir.write_tag(Tag::PlanarConfiguration, 1u16)
         .map_err(terr)?; // chunky
     dir.write_tag(Tag::Compression, compression_tag)
@@ -1117,6 +1130,152 @@ mod tests {
                 }
             }
             other => panic!("expected F32, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A planar source of an arbitrary sample type, so the wide formats can
+    /// be exercised without going through the unit-range f32 conversion.
+    struct Typed<T> {
+        w: u64,
+        h: u64,
+        c: u64,
+        planes: Vec<Vec<T>>,
+    }
+
+    impl<T: Copy> crate::formats::PlanarRows<T> for Typed<T> {
+        fn width(&self) -> u64 {
+            self.w
+        }
+        fn height(&self) -> u64 {
+            self.h
+        }
+        fn channels(&self) -> u64 {
+            self.c
+        }
+        fn row(&self, c: u64, y: u64) -> &[T] {
+            let start = (y * self.w) as usize;
+            &self.planes[c as usize][start..start + self.w as usize]
+        }
+    }
+
+    #[test]
+    fn rgba_writes_extra_samples_and_keeps_four_channels() {
+        use crate::formats::tiff_write::options::AlphaMode;
+        let dir = tmpdir("rgba");
+        for (mode, expected) in [
+            (AlphaMode::Unassociated, 2u64),
+            (AlphaMode::Associated, 1u64),
+        ] {
+            let out = dir.join(format!("{expected}.tif"));
+            let img = Synth::new(6, 5, 4);
+            let opts = TiffWriteOptions {
+                alpha: mode,
+                ..Default::default()
+            };
+            write_tiff(&img, &out, &opts).unwrap();
+
+            let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+            assert_eq!(dec.get_tag_u64(Tag::SamplesPerPixel).unwrap(), 4);
+            assert_eq!(
+                dec.get_tag_u64_vec(Tag::ExtraSamples).unwrap(),
+                vec![expected]
+            );
+            assert_eq!(dec.get_tag_u64(Tag::PhotometricInterpretation).unwrap(), 2);
+            assert_eq!(
+                dec.get_tag_u64_vec(Tag::BitsPerSample).unwrap(),
+                vec![32, 32, 32, 32]
+            );
+            match dec.read_image().unwrap() {
+                DecodingResult::F32(d) => assert_eq!(d.len(), 6 * 5 * 4),
+                other => panic!("expected F32, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gray_plus_alpha_stays_black_is_zero() {
+        use crate::formats::tiff_write::options::AlphaMode;
+        let dir = tmpdir("graya");
+        let out = dir.join("out.tif");
+        let img = Synth::new(4, 4, 2);
+        write_tiff(
+            &img,
+            &out,
+            &TiffWriteOptions {
+                alpha: AlphaMode::Unassociated,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u64(Tag::PhotometricInterpretation).unwrap(), 1);
+        assert_eq!(dec.get_tag_u64(Tag::SamplesPerPixel).unwrap(), 2);
+        assert_eq!(dec.get_tag_u64_vec(Tag::ExtraSamples).unwrap(), vec![2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn u32_samples_round_trip_exactly() {
+        // The whole point of protocol v3: a u32 source must survive
+        // unchanged, including values f32 cannot represent.
+        let dir = tmpdir("u32");
+        let out = dir.join("out.tif");
+        let values: Vec<u32> = vec![0, 1, 16_777_217, 4_000_000_001, u32::MAX, 12345];
+        let img = Typed {
+            w: 6,
+            h: 1,
+            c: 1,
+            planes: vec![values.clone()],
+        };
+        write_tiff_native(
+            &img,
+            &out,
+            &TiffWriteOptions {
+                bit_depth: BitDepth::U32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u64_vec(Tag::BitsPerSample).unwrap(), vec![32]);
+        assert_eq!(dec.get_tag_u64_vec(Tag::SampleFormat).unwrap(), vec![1]);
+        match dec.read_image().unwrap() {
+            DecodingResult::U32(d) => assert_eq!(d, values),
+            other => panic!("expected U32, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn f64_samples_round_trip_exactly() {
+        let dir = tmpdir("f64");
+        let out = dir.join("out.tif");
+        let values: Vec<f64> = vec![0.0, 1.0, std::f64::consts::PI, 1e-300, -2.5];
+        let img = Typed {
+            w: 5,
+            h: 1,
+            c: 1,
+            planes: vec![values.clone()],
+        };
+        write_tiff_native(
+            &img,
+            &out,
+            &TiffWriteOptions {
+                bit_depth: BitDepth::F64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u64_vec(Tag::BitsPerSample).unwrap(), vec![64]);
+        assert_eq!(dec.get_tag_u64_vec(Tag::SampleFormat).unwrap(), vec![3]);
+        match dec.read_image().unwrap() {
+            DecodingResult::F64(d) => assert_eq!(d, values),
+            other => panic!("expected F64, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
