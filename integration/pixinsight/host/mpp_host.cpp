@@ -16,11 +16,21 @@ namespace {
 // let something through.
 constexpr size_t kMaxIccBytes = 16u << 20;
 
-// True for the five sample-format strings protocol v3 accepts for either
-// `bit_depth` (the output file) or `band_format` (the shm payload).
-bool IsKnownSampleFormat(const std::string& s) {
-  return s == "f32" || s == "f64" || s == "u32" || s == "u16" || s == "u8";
+// THE list of the five sample-format strings protocol v3 accepts for either
+// `bit_depth` (the output file) or `band_format` (the shm payload), each
+// mapped to its byte width. 0 means "not one of them". Both the validation
+// below and the public WriteSession::SampleBytes() go through here, so the
+// five strings are enumerated exactly once in this translation unit.
+size_t SampleBytesOrZero(const std::string& s) {
+  if (s == "f32" || s == "u32") return 4;
+  if (s == "f64") return 8;
+  if (s == "u16") return 2;
+  if (s == "u8") return 1;
+  return 0;
 }
+
+// True for the five sample formats above.
+bool IsKnownSampleFormat(const std::string& s) { return SampleBytesOrZero(s) != 0; }
 
 // Decoded byte count of a standard-alphabet base64 string, computed from its
 // length rather than by decoding it: 3 bytes per 4-character group, less the
@@ -63,7 +73,8 @@ WriteSessionConfig ValidateConfig(const WriteSessionConfig& cfg) {
     throw HostError("WriteSessionConfig.channels must be nonzero");
   }
   // Protocol v3 widened the output sample formats to the same five the shm
-  // side accepts; `SampleBytes` is the single list both are checked against.
+  // side accepts; `SampleBytesOrZero` above is the single list both are
+  // checked against, and the one `WriteSession::SampleBytes` uses too.
   if (!IsKnownSampleFormat(cfg.bit_depth)) {
     throw HostError(
         "WriteSessionConfig.bit_depth must be \"f32\", \"f64\", \"u32\", \"u16\" or \"u8\", got \"" +
@@ -241,10 +252,9 @@ WriteSession::~WriteSession() {
 }
 
 size_t WriteSession::SampleBytes(const std::string& band_format) {
-  if (band_format == "f32" || band_format == "u32") return 4;
-  if (band_format == "f64") return 8;
-  if (band_format == "u16") return 2;
-  if (band_format == "u8") return 1;
+  if (const size_t n = SampleBytesOrZero(band_format)) {
+    return n;
+  }
   throw HostError("unknown band_format \"" + band_format +
                    "\" (expected \"f32\", \"f64\", \"u32\", \"u16\" or \"u8\")");
 }
