@@ -189,6 +189,19 @@ Short, and each is a decision rather than an oversight:
   — TIFF has no FITS-keyword equivalent.
 - **Signed integers, complex and void samples, arbitrary multiband.**
   Unchanged rejections.
+- **IFDs can land on an odd file offset.** TIFF 6.0 requires an IFD to start
+  on a word boundary. The writer emits the directory immediately after the
+  pixel data with no padding, so whenever the total payload is an odd number
+  of bytes the IFD offset is odd too: uncompressed `u8` output with an odd
+  sample count (a 3x3 `u8` image puts it at offset 17 classic / 25 BigTIFF),
+  or any compressed output whose block bytes happen to sum to an odd count
+  (a 7x3 `u16` PackBits image lands at 51 / 59). Wider *uncompressed* sample
+  formats always keep the payload even and are never affected. This is
+  **inherited, not introduced**: it is how the `tiff` crate's own strip
+  writer has always behaved, it predates this phase, and libtiff and Pillow
+  both read such files without complaint. Left alone deliberately — the fix
+  is a padding byte before the directory, which changes every file this
+  project has ever written.
 
 ## Not yet investigated
 

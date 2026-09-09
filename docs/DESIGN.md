@@ -396,7 +396,10 @@ distortion grids) do not bump it. Source of truth:
      72 dpi. Previously none were written and the round trip lost them.
    - `WasLossyWrite()` now reports `true` for an f32 source saved as
      `u16`/`u8`, which it did not before, and no longer reports `true` for
-     the whole `u32`/`f64` category, which is no longer narrowed.
+     the whole `u32`/`f64` category, which is no longer narrowed. It also
+     reports `true` when the save options discard the alpha channel: the
+     user asked for the drop, but a whole channel of the source is absent
+     from the file and calling that lossless would understate it.
    - A palette file reports a `u16` sample format, because `ColorMap`
      entries are 16-bit.
    - The refusals listed above (YCbCr coefficients, `ReferenceBlackWhite`,

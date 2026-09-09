@@ -191,7 +191,7 @@ pub struct InitMessage {
     pub output_path: String,
     pub width: u64,
     pub height: u64,
-    pub channels: u64,                // 1 or 3
+    pub channels: u64,                // 1..=4 (see `alpha` below)
     pub bit_depth: String,            // OUTPUT FILE format: "f32"|"f64"|"u32"|"u16"|"u8"
     pub shm_name: String,
     pub slot_bytes: u64,              // uniform slot size; >= max band bytes
@@ -266,7 +266,7 @@ not `{"Init": {...}}`.
 | `software` | string | **(v3)** default `""` (absent). `Software`, TIFF tag 305. |
 | `x_resolution` | f64 | **(v3)** default `0.0`. Horizontal resolution in pixels per `resolution_unit`; `0` means unknown and writes no resolution tags. |
 | `y_resolution` | f64 | **(v3)** default `0.0`. Vertical resolution; see `x_resolution`. |
-| `resolution_unit` | string | **(v3)** default `"inch"`. `"inch"` (TIFF `ResolutionUnit = 2`) or `"cm"`. |
+| `resolution_unit` | string | **(v3)** default `"inch"`. `"inch"` (TIFF `ResolutionUnit = 2`) or `"cm"` — those two spellings only; any other value is **refused by name**, like every other v3 string enum, rather than falling back to inch. |
 
 Example 1 — the minimal payload a **v2** host sends. Every v3 field is
 absent, and each one takes the default in the table above, which is exactly
@@ -975,7 +975,7 @@ is `0`, and the wire default is `6`.
 
 ### 10.3 What a v3 host gains, and what it must still get right
 
-The remaining thirteen fields are a straight pass-through to
+The remaining fourteen fields are a straight pass-through to
 `mpp-core`'s `TiffWriteOptions`, and `TiffWriteOptions::validate` — the same
 validator the `mpp convert` CLI path goes through — rules on every
 combination, so the legality rules live in exactly one place rather than
