@@ -66,6 +66,7 @@ public:
    bool CanStoreAlphaChannels() const override;  // default true  -> true (gray+alpha and RGBA, ExtraSamples)
    bool CanStoreResolution() const override;     // default false -> true (X/YResolution + ResolutionUnit)
    bool CanStoreICCProfiles() const override;    // default false -> true (tag 34675, both directions)
+   bool SupportsCompression() const override;    // default false -> true (LZW, Deflate, PackBits)
 
    // NOT overridden, deliberately: CanStoreKeywords() keeps its false
    // default. TIFF has no FITS-keyword equivalent -- the three text tags this

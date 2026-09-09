@@ -79,7 +79,7 @@ we ship today:
 | Stock option | What shipped |
 |---|---|
 | **Sample format** 8/16/32-bit uint, 32/64-bit float | All five, written for real. `BitDepth` covers `U8\|U16\|U32\|F32\|F64`; protocol v3's `band_format` carries the samples over shm in their native type, so `u32` and `f64` reach the encoder intact instead of being flattened through f32's 24-bit significand. `CanStore32Bit`/`CanStoreDouble` are now honest — that they were not is the violation this whole phase existed to fix |
-| **Compression** None / Deflate / LZW | None / LZW / Deflate / **PackBits** (one better than the stock dialog), plus a horizontal predictor for integer formats — refused for float data, as the TIFF spec and the `tiff` crate both require. Deflate takes a 1–9 level |
+| **Compression** None / Deflate / LZW | None / LZW / Deflate / **PackBits** (one better than the stock dialog), plus a horizontal predictor for integer formats — refused for float data, as the TIFF spec and the `tiff` crate both require. Deflate takes a 1–9 level. `SupportsCompression()` answers `true` accordingly, which `MetaFileFormat.h` requires of exactly this case ("The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true") |
 | **Embedded data** ICC profile | Written as tag 34675 on save and read back on open. `CanStoreICCProfiles()` is `true`; the blob rides base64 in the v3 `Init`, capped at 16 MiB decoded |
 | **Planar organization** | Accepted on **read** (de-interleaved into the reader's chunky band model). Not offered on write: the writer is chunky-only by choice, since planar output buys nothing here and doubles the layout matrix |
 | **Associated / premultiplied alpha** | Gray+alpha and RGBA write, with an `ExtraSamples` tag carrying the association the dialog selected. The protocol accepts `channels` in `1..=4`, with alpha and channel count validated against each other in both directions |
@@ -171,15 +171,6 @@ Short, and each is a decision rather than an oversight:
   unverified: it may decode correctly, mis-decode, or error out of the
   `tiff` crate. Either validating and refusing subsampled YCbCr, or
   supporting it properly with a fixture, is the honest fix.
-- **`SupportsCompression()` still returns `false`.** Found while writing
-  this update, and a code fix rather than a documentation one:
-  `BigTiffFormat` never overrides it, so it takes the PCL default — even
-  though the writer now emits LZW, Deflate and PackBits, which
-  `MetaFileFormat.h`'s own documentation names as "the exact kind of
-  compressions that must cause this member function to return true". It is
-  an *understatement* rather than the overstatement this phase existed to
-  fix, so nothing mis-decodes; the module simply under-advertises to any
-  core path or third-party module that consults it.
 - **CMYK and Lab on read.** Refused. Converting either to RGB faithfully
   needs ICC colour management this project does not have, and an unmanaged
   conversion would silently misrepresent pixel values. The rejection message

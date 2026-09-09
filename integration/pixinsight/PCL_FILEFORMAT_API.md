@@ -232,7 +232,7 @@ path silently narrowed both to `f32`.
 | `CanStoreRGBWS()` | 679 | `false` | `false` |
 | `CanStoreDisplayFunctions()` | 690 | `false` | `false` |
 | `CanStoreColorFilterArrays()` | 701 | `false` | `false` |
-| `SupportsCompression()` | 720 | `false` | `false` — **not overridden, and now understated**: the writer does emit LZW, Deflate and PackBits, which is exactly the case the header names ("The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true", `MetaFileFormat.h:714-716`). Flagged in the task-18 report as a defect to fix in code, not here |
+| `SupportsCompression()` | 720 | `false` | **`true`** — the writer emits LZW, Deflate and PackBits, which is exactly the case the header names ("The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true", `MetaFileFormat.h:714-716`). The same paragraph's exclusion — a format's own native scheme, as in JPEG or JPEG2000 — does not apply: pixel data here is uncompressed unless the user asks for one of the three |
 | `SupportsMultipleImages()` | 736 | `false` | `false` (then `SelectImage`/`SelectedImageIndex` are never called — `FileFormatImplementation.h:165-169`) |
 | `SupportsViewProperties()` | 762 | `false` | `false` |
 | `CanEditPreferences()` | 776 | `false` | `false`, **by decision**: no global format preferences — one per-save dialog, defaults in code. `EditPreferences()` is therefore never called (`MetaFileFormat.h:829-830`) |

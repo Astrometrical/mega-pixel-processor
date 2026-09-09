@@ -123,6 +123,38 @@ writing a new pair and constructing it in `InstallPixInsightModule`
 (`module/Mpp.cpp`) alongside `BigTiffFormat`; the binary name, module
 identity, CI jobs, staging layout, and install procedure below are unaffected.
 
+## Declared capabilities
+
+What `BigTiffFormat` tells the PixInsight core it can do. The rule this
+table exists to enforce is truth in advertising: **a `true` here must be
+genuinely delivered**, and a `false` must not understate what the code does.
+Phase 4 existed because `CanStore32Bit()`/`CanStoreDouble()` answered `true`
+while the write path silently narrowed both to `f32`.
+
+| Query | Answer | What backs it |
+|---|---|---|
+| `CanRead()` / `CanWrite()` | `true` / `true` | `Open()`+`ReadImage`, and `Create()`+`WriteSamples` |
+| `CanReadIncrementally()` | `false` | Explicit: the core drives interactive opens through whole-image `ReadImage` even when this is `true`, so `ReadSamples` is left unimplemented |
+| `CanWriteIncrementally()` | `true` | Required, or `WriteSamples()` is never called |
+| `CanStore8Bit()` / `CanStore16Bit()` | `true` | `u8`/`u16` bands and output, verbatim |
+| `CanStore32Bit()` | `true` | Native `u32` bands and 32-bit unsigned output. Advertised-but-narrowed before phase 4 |
+| `CanStoreFloat()` / `CanStoreDouble()` | `true` | Native `f32`/`f64` bands and output. `CanStoreDouble()` was likewise narrowed before phase 4 |
+| `CanStore64Bit()` | `false` | 64-bit *integer* samples; TIFF has no such sample format |
+| `CanStoreGrayscale()` / `CanStoreRGBColor()` | `true` | 1- and 3-channel output |
+| `CanStoreAlphaChannels()` | `true` | Gray+alpha and RGBA, with an `ExtraSamples` association |
+| `CanStoreResolution()` | `true` | `XResolution`/`YResolution`/`ResolutionUnit` |
+| `CanStoreICCProfiles()` | `true` | Tag 34675, written on save and read back on open |
+| `SupportsCompression()` | `true` | LZW, Deflate and PackBits over the source pixels. `MetaFileFormat.h` names exactly this case: *"The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true"* |
+| `UsesFormatSpecificData()` | `true` | The `TiffFormatOptions` block round-trips from `QueryOptions()` into `CreateImage()` |
+| `CanStoreKeywords()` | `false` | **By decision, permanently.** TIFF has no FITS-keyword equivalent; Image Description / Copyright / Software are three fixed tags, not a keyword namespace |
+| `CanEditPreferences()` | `false` | **By decision.** No global format preferences — one per-save dialog, defaults in code |
+| `CanStoreThumbnails()` / `CanStoreProperties()` / `CanStoreImageProperties()` | `false` | Deferred (`docs/DESIGN.md` phase 5) |
+| `CanStoreComplex()` / `CanStoreDComplex()` | `false` | Complex samples are rejected with a `pcl::Error` |
+
+Everything not listed keeps its `MetaFileFormat.h` default; the header
+`module/BigTiffFormat.h` annotates each override with the default it
+diverges from.
+
 ## Write: sample-format mapping
 
 Since protocol v3 the mapping is the **identity**: the sample format chosen
@@ -201,12 +233,16 @@ Two consequences worth knowing:
 - **A small `.tif` save is now a classic TIFF.** Before phase 4 every save
   this module made was a BigTIFF, including small ones wearing a `.tif`
   name, which a good deal of older software will not open.
-- **`.btf` and `.tf8` still always get BigTIFF**, whatever the size. Those
-  extensions *declare* the container rather than merely naming the family,
-  so honouring them beats the size heuristic — a classic TIFF inside a
-  `.btf` would be a file whose name lies about its contents. Choosing
-  `Classic TIFF` explicitly for an image too large for it fails at option
-  validation, before any pixels move, with an error naming the size.
+- **`.btf` and `.tf8` still get BigTIFF at any size — under `Automatic`.**
+  Those extensions *declare* the container rather than merely naming the
+  family, so honouring them beats the size heuristic: a classic TIFF inside
+  a `.btf` would be a file whose name lies about its contents. The override
+  applies **only** when the container combo is on `Automatic`, though. An
+  explicit `Classic TIFF` on a `.btf` path stays classic — you named the
+  container in so many words, and the writer does not second-guess an
+  explicit request. (Choosing `Classic TIFF` for an image *too large* for it
+  is a different matter: that fails at option validation, before any pixels
+  move, with an error naming the size.)
 
 ## Read support
 
@@ -505,10 +541,10 @@ is the quickest independent second opinion.
    compressed file is smaller than the uncompressed one. Then repeat one of
    them on an *integer* image with the horizontal predictor ticked, and
    confirm the predictor check box is **disabled** when a float sample
-   format is selected. Before phase 4 output was always uncompressed.
-   (Note `BigTiffFormat::SupportsCompression()` still returns the PCL
-   default `false` even though the writer compresses — a known
-   understatement, tracked as a code fix, not a docs one.)
+   format is selected. Before phase 4 output was always uncompressed, and
+   `BigTiffFormat::SupportsCompression()` reported `false` to match; it now
+   returns `true`, as `MetaFileFormat.h` requires of a format offering
+   LZW/ZIP over its source pixels.
 5. **[REGRESSION] Automatic picks classic TIFF for a small image.** Save a
    small image (a few MB) with the container combo on Automatic to a `.tif`
    path. Confirm the first four bytes are the *classic* magic:

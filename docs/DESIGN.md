@@ -250,14 +250,18 @@ distortion grids) do not bump it. Source of truth:
      protocol change additive (new tags + one `Init` field) instead of a
      breaking redesign, and let the host/worker read-mode code reuse the
      write path's free-slot-pool pattern nearly verbatim.
-   - **Native fidelity on read, unlike the normalized write path.** Every
-     `WriteSamples` buffer is normalized to f32 in `[0,1]` (phase 2); reads
-     go the other way — a u16 file decodes into a `UInt16Image`, an f32 file
-     into a `pcl::Image`, with no forced conversion. `ImageMeta.bit_depth`
+   - **Native fidelity on read** — the contrast this bullet originally drew,
+     against a write path that normalized everything, was *abolished by
+     phase 4*: protocol v3 made the write direction native too, so there is
+     no longer an asymmetry to contrast against. What stands, unchanged: a
+     u16 file decodes into a `UInt16Image`, an f32 file into a `pcl::Image`,
+     with no forced conversion. `ImageMeta.bit_depth`
      (`docs/pi-protocol.md` §9.2) reports the file's own native sample
      format, which is why the module's `Open()` uses a geometry-probe worker
      run (`mpp-ipc-worker --probe`) to select the matching `ReadImage`
-     overload before any pixels move.
+     overload before any pixels move. As shipped in phase 3, every
+     `WriteSamples` buffer was still normalized to f32 in `[0,1]`, which is
+     the asymmetry phase 4's `band_format` closed.
    - **Extension additions, since superseded.** `.big.tiff`/`.big.tif` were
      added during phase 3 to close the "choosing BigTIFF in the save dialog
      appends `.big`, which nothing can reopen" gap (design spec finding 5)
@@ -327,10 +331,13 @@ distortion grids) do not bump it. Source of truth:
      4 GiB (less a 16 MiB header/IFD allowance) and BigTIFF above it.
      Compression only ever shrinks the payload, so `Auto` never
      under-predicts. `.btf` and `.tf8` are container *declarations*, not
-     merely TIFF-family extensions, so they force BigTIFF at any size — a
-     classic TIFF inside a `.btf` would be a file whose name lies about its
-     contents. An explicit `Classic` on an over-large image fails at option
-     validation, before any pixels move.
+     merely TIFF-family extensions, so under `Auto` they force BigTIFF at
+     any size — a classic TIFF inside a `.btf` would be a file whose name
+     lies about its contents. The override is scoped to `Auto` alone: an
+     explicit `Container::Classic` on a `.btf` path stays classic, because
+     the caller named the container outright and the writer does not
+     second-guess an explicit request. An explicit `Classic` on an
+     over-large image fails at option validation, before any pixels move.
    - **Read policy: palette, YCbCr and planar in; CMYK and Lab out.** The
      first three unwind exactly or by spec — `ColorMap` is a lookup table,
      TIFF 6.0 §21 defines the YCbCr inverse in terms of the file's own
@@ -380,7 +387,8 @@ distortion grids) do not bump it. Source of truth:
    **User-visible behaviour changes**, recorded because they are easy to
    miss and each is a support question waiting to happen:
    - Small `.tif`/`.tiff` saves are now **classic TIFF**, where every save
-     used to be BigTIFF. `.btf`/`.tf8` still always get BigTIFF.
+     used to be BigTIFF. `.btf`/`.tf8` still get BigTIFF at any size under
+     `Auto`; an explicit `Classic` on such a path is honoured as written.
    - `u8`/`u16` output can differ from pre-phase-4 builds by 1 LSB: integer
      scaling now goes through `f64`, which is strictly more accurate.
    - Resolution tags are now written whenever both values are positive,

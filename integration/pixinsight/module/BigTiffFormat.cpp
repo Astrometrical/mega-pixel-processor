@@ -144,6 +144,20 @@ bool BigTiffFormat::CanStoreICCProfiles() const
    return true;   // tag 34675, written on save and read back on open
 }
 
+bool BigTiffFormat::SupportsCompression() const
+{
+   // The header names our exact case: "The optional ZIP and LZW compressions
+   // used in TIFF are the exact kind of compressions that must cause this
+   // member function to return true" (MetaFileFormat.h). The options dialog
+   // offers LZW, Deflate (the ZIP scheme) and PackBits, all applied to the
+   // source pixels per strip or tile, so true is the only honest answer.
+   //
+   // The exclusion in the same paragraph -- a format's own native scheme,
+   // as in JPEG or JPEG2000 -- does not apply: this format writes
+   // uncompressed pixel data unless the user asks for one of the three.
+   return true;
+}
+
 // ----------------------------------------------------------------------------
 
 bool BigTiffFormat::UsesFormatSpecificData() const
