@@ -48,10 +48,12 @@ impl OutputFormat {
         }
     }
 
-    /// Whether this container can hold samples of `depth`.
+    /// Whether this format can carry `depth`.
     pub fn allows(self, depth: BitDepth) -> bool {
         match self {
+            // BigTIFF carries every sample format the writer supports.
             Self::BigTiff => true,
+            // The vips-backed formats top out at 16-bit unsigned.
             Self::Png | Self::Jxl => matches!(depth, BitDepth::U16 | BitDepth::U8),
             Self::Jpeg | Self::Webp | Self::Avif => matches!(depth, BitDepth::U8),
         }
@@ -504,6 +506,20 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vips_formats_reject_wide_sample_formats() {
+        use crate::formats::tiff::BitDepth;
+        // BigTIFF is the only output that can carry u32 or f64 samples; the
+        // vips-backed formats top out at u16, so widening BitDepth must not
+        // silently make `--bit-depth f64 --format png` legal.
+        assert!(OutputFormat::BigTiff.allows(BitDepth::U32));
+        assert!(OutputFormat::BigTiff.allows(BitDepth::F64));
+        assert!(!OutputFormat::Png.allows(BitDepth::U32));
+        assert!(!OutputFormat::Png.allows(BitDepth::F64));
+        assert!(!OutputFormat::Jpeg.allows(BitDepth::U32));
+        assert!(!OutputFormat::Jxl.allows(BitDepth::F64));
     }
 
     #[test]

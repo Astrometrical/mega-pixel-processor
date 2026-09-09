@@ -230,7 +230,7 @@ impl Drop for Staging {
     }
 }
 
-impl PlanarRows for Staging {
+impl PlanarRows<f32> for Staging {
     fn width(&self) -> u64 {
         self.width
     }
@@ -405,9 +405,9 @@ mod tests {
         s.write_band(0, 1, &[10.0, 20.0, 30.0, 40.0]).unwrap();
         s.write_band(1, 2, &[1.0, 2.0, 3.0, 4.0]).unwrap();
 
-        assert_eq!(PlanarRows::width(&s), 4);
-        assert_eq!(PlanarRows::height(&s), 3);
-        assert_eq!(PlanarRows::channels(&s), 2);
+        assert_eq!(PlanarRows::<f32>::width(&s), 4);
+        assert_eq!(PlanarRows::<f32>::height(&s), 3);
+        assert_eq!(PlanarRows::<f32>::channels(&s), 2);
         assert_eq!(s.row(0, 1), &[10.0, 20.0, 30.0, 40.0]);
         assert_eq!(s.row(1, 2), &[1.0, 2.0, 3.0, 4.0]);
 

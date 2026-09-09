@@ -24,9 +24,14 @@ pub enum BitDepth {
     /// 32-bit IEEE float samples, passthrough from XISF Float32 (default).
     #[default]
     F32,
-    /// 16-bit unsigned samples; input clamped to [0, 1] and scaled.
+    /// 64-bit IEEE float samples. Exact for `pcl::DImage` input; from a
+    /// unit-range f32 source it simply widens.
+    F64,
+    /// 32-bit unsigned samples; unit-range input is clamped and scaled.
+    U32,
+    /// 16-bit unsigned samples; unit-range input is clamped and scaled.
     U16,
-    /// 8-bit unsigned samples; input clamped to [0, 1] and scaled.
+    /// 8-bit unsigned samples; unit-range input is clamped and scaled.
     U8,
 }
 
@@ -50,7 +55,11 @@ fn to_u8(v: f32) -> u8 {
 /// Write `img` to `path` as an uncompressed BigTIFF, streaming strip by
 /// strip in constant memory. Grayscale (1 channel) and RGB (3 channels)
 /// are supported; XISF planar planes are interleaved to TIFF chunky order.
-pub fn write_bigtiff(img: &impl PlanarRows, path: &Path, opts: &TiffWriteOptions) -> Result<()> {
+pub fn write_bigtiff(
+    img: &impl PlanarRows<f32>,
+    path: &Path,
+    opts: &TiffWriteOptions,
+) -> Result<()> {
     write_bigtiff_with_target(img, path, opts, TARGET_STRIP_BYTES)
 }
 
@@ -58,7 +67,7 @@ pub fn write_bigtiff(img: &impl PlanarRows, path: &Path, opts: &TiffWriteOptions
 /// tests can force multi-strip (including a partial last strip) output
 /// without needing a multi-gigabyte image.
 fn write_bigtiff_with_target(
-    img: &impl PlanarRows,
+    img: &impl PlanarRows<f32>,
     path: &Path,
     opts: &TiffWriteOptions,
     target_strip_bytes: u64,

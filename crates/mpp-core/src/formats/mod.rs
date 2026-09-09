@@ -8,16 +8,22 @@ pub mod tiff;
 pub mod tiff_read;
 pub mod xisf;
 
-/// A planar f32 image source the streaming writers can drain row by row.
-pub trait PlanarRows {
+/// A planar image source the streaming writers can drain row by row.
+///
+/// The type parameter is the source sample type. `XisfImage` and the DZI
+/// path use `PlanarRows<f32>`; the PixInsight worker stages whichever type
+/// the session negotiated, so it instantiates this at `u8`, `u16`, `u32`,
+/// `f32` or `f64`.
+pub trait PlanarRows<T> {
     /// Width in pixels.
     fn width(&self) -> u64;
     /// Height in pixels.
     fn height(&self) -> u64;
     /// Channel count.
     fn channels(&self) -> u64;
-    /// One row of one channel (len == width), values nominally [0, 1].
-    fn row(&self, c: u64, y: u64) -> &[f32];
+    /// One row of one channel (len == width). For `f32` sources, values are
+    /// nominally in `[0, 1]`.
+    fn row(&self, c: u64, y: u64) -> &[T];
 }
 
 /// A FITS header keyword carried through from input to output.
