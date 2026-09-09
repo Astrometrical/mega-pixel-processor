@@ -1,0 +1,73 @@
+# Workspace-wide Rust gate: fmt, clippy, rustdoc and the full test suite.
+#
+# This is the job module.yml's Rust step used to defer to ("a future
+# workspace-wide CI job owns full coverage") and that did not exist. Without
+# it nothing on any runner compiled mpp-core or mpp at all: the TIFF writer
+# suite, the palette/YCbCr/planar reader fixtures and the CLI tests were
+# local-only, and no lint ran anywhere.
+#
+# Deliberately ONE job on ubuntu, not a per-platform matrix. Everything it
+# gates is platform-independent -- formatting, lints, docs, and pure-Rust
+# encode/decode tests -- while the parts that genuinely differ per platform
+# (the PCL module build and the C++ host CTest suite) are already covered on
+# Linux, macOS-arm64/x64 and Windows by module.yml. Tripling this job's
+# runtime would buy nothing those jobs do not already own.
+#
+# Its own path filter is wider than module.yml's on purpose: module.yml
+# watches only the crates the PixInsight module links against, so before this
+# workflow a change confined to crates/mpp-core or crates/mpp triggered no CI
+# whatsoever.
+name: Rust
+
+on:
+  push:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-and-test:
+    name: lint+test (workspace, ubuntu-x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # --all-targets so tests, benches and examples are linted too, and
+      # -D warnings so a lint is a failure rather than log noise. mpp-core
+      # warns on missing_docs, so this is also the doc-comment gate.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # RUSTDOCFLAGS makes a broken intra-doc link fail the job; cargo doc
+      # only warns about them by default.
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace
+
+      - name: Tests
+        run: cargo test --workspace

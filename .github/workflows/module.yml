@@ -92,7 +92,14 @@ jobs:
             --pcl-inc "$PWD/pcl-ci/include" --pcl-lib "$PWD/pcl-ci/lib" \
             --stage "$PWD/stage"
 
-      - name: Rust tests (ipc crates; a future workspace-wide CI job owns full coverage)
+      # Deliberately narrow, and deliberately repeated on all three
+      # platforms: these are the two crates whose behaviour is
+      # platform-specific (POSIX shm vs Windows file mapping, process spawn
+      # and reaping, pipe teardown), so they are worth running on every
+      # runner. Workspace-wide coverage -- mpp-core, mpp, and the fmt/clippy/
+      # rustdoc gates -- belongs to .github/workflows/rust.yml, which runs
+      # once on ubuntu because nothing it checks varies by platform.
+      - name: Rust tests (ipc crates; .github/workflows/rust.yml owns the workspace)
         run: cargo test -p mpp-ipc -p mpp-ipc-worker
 
       - name: Write bundle provenance
@@ -179,7 +186,8 @@ jobs:
             --pcl-inc "$PWD/pcl-ci/include" --pcl-lib "$PWD/pcl-ci/lib" \
             --stage "$PWD/stage" --arch ${{ matrix.arch }}
 
-      - name: Rust tests (ipc crates)
+      # See the linux job: narrow on purpose, rust.yml owns the workspace.
+      - name: Rust tests (ipc crates; .github/workflows/rust.yml owns the workspace)
         run: cargo test -p mpp-ipc -p mpp-ipc-worker
 
       - name: Write bundle provenance
@@ -244,7 +252,8 @@ jobs:
           if (-not (Test-Path "$PWD/pcl-ci/lib/PCL-pxi.lib")) { exit 1 }
           if (-not (Test-Path "$PWD/pcl-ci/lib/lcms-pxi.lib")) { exit 1 }
 
-      - name: Rust tests (ipc crates)
+      # See the linux job: narrow on purpose, rust.yml owns the workspace.
+      - name: Rust tests (ipc crates; .github/workflows/rust.yml owns the workspace)
         run: cargo test -p mpp-ipc -p mpp-ipc-worker
 
       # Unlike linux/macos, ctest here is its own step *before* the module
