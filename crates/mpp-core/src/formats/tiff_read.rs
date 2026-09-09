@@ -409,6 +409,10 @@ impl YCbCrTransform {
         let descale = |v: u8, ch: usize, coding_range: f32| {
             let [black, white] = self.reference[ch];
             let span = white - black;
+            // `read_ycbcr_transform` refuses a zero-span channel at open
+            // time, so this guard is unreachable; it is kept so that a
+            // future caller constructing a transform directly cannot turn a
+            // degenerate reference into a division by zero.
             if span == 0.0 {
                 0.0
             } else {
@@ -913,73 +917,159 @@ fn resolve_sample_format(path: &Path, sample_format_tag: u16, bits: u8) -> Resul
     }
 }
 
-/// Read a RATIONAL-valued tag as a flat list of `f32`s, or `None` if the tag
-/// is absent. Used for `YCbCrCoefficients` and `ReferenceBlackWhite`, which
-/// the `tiff` crate models as `Value::Rational` but offers no float
-/// accessor for.
-fn rational_tag<R: Read + Seek>(decoder: &mut Decoder<R>, tag: u16) -> Option<Vec<f32>> {
-    /// One RATIONAL as a float; a zero denominator is not a number the spec
-    /// admits, so treat it as "unreadable" and fall back to the defaults.
-    fn ratio(numerator: u32, denominator: u32) -> Option<f32> {
-        (denominator != 0).then(|| numerator as f32 / denominator as f32)
-    }
+/// The three distinguishable outcomes of reading a RATIONAL-valued tag.
+///
+/// The distinction that matters is [`Self::Absent`] versus
+/// [`Self::Unreadable`]: falling back to a spec default is right for a tag
+/// the file never wrote, and wrong for one it wrote and we could not
+/// understand. Collapsing the two — as an `Option` would — is precisely the
+/// silent-misrepresentation failure this reader refuses CMYK to avoid.
+#[derive(Debug)]
+enum TagRead {
+    /// The tag is not in the directory; the spec default applies.
+    Absent,
+    /// The tag is present and every value read cleanly.
+    Values(Vec<f32>),
+    /// The tag is present but could not be made sense of. The string says
+    /// how, for the error message.
+    Unreadable(String),
+}
 
-    let value = decoder
-        .find_tag(Tag::from_u16_exhaustive(tag))
-        .ok()
-        .flatten()?;
-    match value {
-        Value::Rational(n, d) => ratio(n, d).map(|v| vec![v]),
-        Value::List(items) => items
-            .into_iter()
-            .map(|v| match v {
-                Value::Rational(n, d) => ratio(n, d),
-                _ => None,
-            })
-            .collect(),
-        _ => None,
+/// Read a RATIONAL-valued tag as a flat list of `f32`s. Used for
+/// `YCbCrCoefficients` and `ReferenceBlackWhite`, which the `tiff` crate
+/// models as `Value::Rational` but offers no float accessor for.
+///
+/// Every way this can fail on a tag that *is* present — an unreadable
+/// directory entry, a value that is not RATIONAL (an SRATIONAL, say), a
+/// zero denominator — yields [`TagRead::Unreadable`], never
+/// [`TagRead::Absent`].
+fn rational_tag<R: Read + Seek>(decoder: &mut Decoder<R>, tag: u16) -> TagRead {
+    let value = match decoder.find_tag(Tag::from_u16_exhaustive(tag)) {
+        Ok(Some(value)) => value,
+        Ok(None) => return TagRead::Absent,
+        Err(e) => {
+            return TagRead::Unreadable(format!("its directory entry could not be read: {e}"));
+        }
+    };
+
+    let rationals = match value {
+        Value::Rational(n, d) => vec![(n, d)],
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Rational(n, d) => out.push((n, d)),
+                    other => {
+                        return TagRead::Unreadable(format!(
+                            "it holds {other:?} where the spec requires RATIONAL values"
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        other => {
+            return TagRead::Unreadable(format!(
+                "it holds {other:?} where the spec requires RATIONAL values"
+            ));
+        }
+    };
+
+    let mut values = Vec::with_capacity(rationals.len());
+    for (numerator, denominator) in rationals {
+        if denominator == 0 {
+            return TagRead::Unreadable(format!(
+                "the RATIONAL {numerator}/{denominator} has a zero denominator"
+            ));
+        }
+        values.push(numerator as f32 / denominator as f32);
     }
+    TagRead::Values(values)
 }
 
 /// Build the `YCbCr` -> RGB inverse for this file, from its
 /// `YCbCrCoefficients` and `ReferenceBlackWhite` tags where present and the
 /// TIFF 6.0 defaults where not.
 ///
-/// A tag that is present but malformed (wrong length, a zero denominator, a
-/// degenerate luma set) is refused rather than quietly replaced by the
-/// default, because using the default in its place would misrepresent the
-/// pixel values just as surely as an unmanaged CMYK conversion would.
+/// A tag that is present but cannot be honoured — unreadable, not RATIONAL,
+/// a zero denominator, the wrong length, non-finite, a zero green weight, a
+/// channel with no coding range — is refused by name rather than quietly
+/// replaced by the default. Substituting a default for a value the file
+/// actually declared would misrepresent the pixel values just as surely as
+/// an unmanaged CMYK conversion would, which is the whole reason CMYK is
+/// refused.
 fn read_ycbcr_transform<R: Read + Seek>(
     path: &Path,
     decoder: &mut Decoder<R>,
 ) -> Result<YCbCrTransform> {
     let mut transform = YCbCrTransform::default();
 
-    if let Some(coefficients) = rational_tag(decoder, TAG_YCBCR_COEFFICIENTS) {
-        let ok = coefficients.len() == 3
-            && coefficients.iter().all(|c| c.is_finite())
-            && coefficients[1] != 0.0;
-        if !ok {
+    match rational_tag(decoder, TAG_YCBCR_COEFFICIENTS) {
+        TagRead::Absent => {}
+        TagRead::Unreadable(why) => {
             return Err(Error::format(
                 path,
-                format!("malformed TIFF YCbCrCoefficients tag: {coefficients:?}"),
+                format!("unsupported TIFF YCbCrCoefficients tag: {why}"),
             ));
         }
-        transform.luma = [coefficients[0], coefficients[1], coefficients[2]];
+        TagRead::Values(coefficients) => {
+            // Three finite weights, and a non-zero green weight because
+            // green is recovered by dividing by it.
+            if coefficients.len() != 3
+                || !coefficients.iter().all(|c| c.is_finite())
+                || coefficients[1] == 0.0
+            {
+                return Err(Error::format(
+                    path,
+                    format!(
+                        "unsupported TIFF YCbCrCoefficients tag {coefficients:?}: expected three \
+                         finite luma weights with a non-zero green weight"
+                    ),
+                ));
+            }
+            transform.luma = [coefficients[0], coefficients[1], coefficients[2]];
+        }
     }
 
-    if let Some(reference) = rational_tag(decoder, TAG_REFERENCE_BLACK_WHITE) {
-        if reference.len() != 6 || !reference.iter().all(|v| v.is_finite()) {
+    match rational_tag(decoder, TAG_REFERENCE_BLACK_WHITE) {
+        TagRead::Absent => {}
+        TagRead::Unreadable(why) => {
             return Err(Error::format(
                 path,
-                format!("malformed TIFF ReferenceBlackWhite tag: {reference:?}"),
+                format!("unsupported TIFF ReferenceBlackWhite tag: {why}"),
             ));
         }
-        transform.reference = [
-            [reference[0], reference[1]],
-            [reference[2], reference[3]],
-            [reference[4], reference[5]],
-        ];
+        TagRead::Values(reference) => {
+            if reference.len() != 6 || !reference.iter().all(|v| v.is_finite()) {
+                return Err(Error::format(
+                    path,
+                    format!(
+                        "unsupported TIFF ReferenceBlackWhite tag {reference:?}: expected six \
+                         finite values, a (black, white) pair per channel"
+                    ),
+                ));
+            }
+            // A channel whose black and white references are equal has no
+            // coding range: every sample of it would descale to the same
+            // number, so the file's pixels cannot be recovered at all.
+            // Reporting that beats decoding a plausible-looking black.
+            if let Some(pair) = reference.chunks_exact(2).find(|p| p[0] == p[1]) {
+                return Err(Error::format(
+                    path,
+                    format!(
+                        "unsupported TIFF ReferenceBlackWhite tag {reference:?}: a channel whose \
+                         black and white references are both {} has no coding range, so its \
+                         samples cannot be descaled",
+                        pair[0]
+                    ),
+                ));
+            }
+            transform.reference = [
+                [reference[0], reference[1]],
+                [reference[2], reference[3]],
+                [reference[4], reference[5]],
+            ];
+        }
     }
 
     Ok(transform)
@@ -1106,7 +1196,7 @@ fn convert_ycbcr(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use tiff::encoder::{TiffEncoder, colortype};
+    use tiff::encoder::{Rational, TiffEncoder, colortype};
 
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mpp-tiff-read-{tag}-{}", std::process::id()));
@@ -1603,15 +1693,7 @@ mod tests {
         let indices: Vec<u8> = (0u8..8).collect();
         let offset = dir.write_data(&indices[..]).unwrap();
 
-        // ColorMap: 3 * 256 u16 entries, R then G then B. Entry i maps to
-        // (i * 257, 1000 + 3i, 60000 - 5i) — three unrelated ramps, so a
-        // mis-read palette cannot pass as correct.
-        let mut map = vec![0u16; 3 * 256];
-        for i in 0..256usize {
-            map[i] = (i * 257) as u16;
-            map[256 + i] = (1000 + 3 * i) as u16;
-            map[512 + i] = (60000 - 5 * i) as u16;
-        }
+        let map = palette_color_map();
 
         dir.write_tag(Tag::ImageWidth, 4u32).unwrap();
         dir.write_tag(Tag::ImageLength, 2u32).unwrap();
@@ -1627,6 +1709,21 @@ mod tests {
         dir.write_tag(Tag::StripByteCounts, &[8u32][..]).unwrap();
         dir.write_tag(Tag::ColorMap, &map[..]).unwrap();
         dir.finish().unwrap();
+    }
+
+    /// The ColorMap every palette fixture shares: 3 * 256 u16 entries, R
+    /// then G then B, where entry `i` maps to
+    /// `(i * 257, 1000 + 3i, 60000 - 5i)`. Three unrelated ramps, so a
+    /// reader that confused the blocks — or skipped the lookup — cannot
+    /// pass.
+    fn palette_color_map() -> Vec<u16> {
+        let mut map = vec![0u16; 3 * 256];
+        for i in 0..256usize {
+            map[i] = (i * 257) as u16;
+            map[256 + i] = (1000 + 3 * i) as u16;
+            map[512 + i] = (60000 - 5 * i) as u16;
+        }
+        map
     }
 
     /// The pixel values [`write_palette_fixture`] encodes: index `i` at
@@ -1755,21 +1852,36 @@ mod tests {
     /// run through the forward CCIR 601-1 transform and rounded, so the
     /// reader's inverse has a known answer to land on. Test-only.
     fn write_ycbcr_fixture(path: &Path) {
-        use tiff::encoder::{TiffEncoder, TiffKindStandard};
-
-        let mut file = std::fs::File::create(path).unwrap();
-        let mut enc: TiffEncoder<_, TiffKindStandard> =
-            TiffEncoder::new_generic(&mut file).unwrap();
-        let mut dir = enc.image_directory().unwrap();
-
         #[rustfmt::skip]
-        let data: Vec<u8> = vec![
+        let data: [u8; 12] = [
              76,  85, 255, // (255,   0,   0)
             150,  44,  21, // (  0, 255,   0)
              29, 255, 107, // (  0,   0, 255)
             255, 128, 128, // (255, 255, 255)
         ];
-        let offset = dir.write_data(&data[..]).unwrap();
+        write_ycbcr_fixture_with(path, &data, None, None);
+    }
+
+    /// [`write_ycbcr_fixture`], with the two tags that parameterize TIFF
+    /// 6.0 section 21's transform written explicitly when supplied:
+    /// `YCbCrCoefficients` (three RATIONALs) and `ReferenceBlackWhite`
+    /// (six). `None` omits the tag, which is what makes the spec defaults
+    /// apply.
+    fn write_ycbcr_fixture_with(
+        path: &Path,
+        data: &[u8],
+        coefficients: Option<&[Rational]>,
+        reference: Option<&[Rational]>,
+    ) {
+        use tiff::encoder::{TiffEncoder, TiffKindStandard};
+
+        assert_eq!(data.len(), 12, "fixture is 2x2 with three samples a pixel");
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut enc: TiffEncoder<_, TiffKindStandard> =
+            TiffEncoder::new_generic(&mut file).unwrap();
+        let mut dir = enc.image_directory().unwrap();
+
+        let offset = dir.write_data(data).unwrap();
 
         dir.write_tag(Tag::ImageWidth, 2u32).unwrap();
         dir.write_tag(Tag::ImageLength, 2u32).unwrap();
@@ -1785,7 +1897,44 @@ mod tests {
         dir.write_tag(Tag::StripByteCounts, &[12u32][..]).unwrap();
         dir.write_tag(Tag::ChromaSubsampling, &[1u16, 1][..])
             .unwrap();
+        if let Some(coefficients) = coefficients {
+            dir.write_tag(
+                Tag::from_u16_exhaustive(TAG_YCBCR_COEFFICIENTS),
+                coefficients,
+            )
+            .unwrap();
+        }
+        if let Some(reference) = reference {
+            dir.write_tag(
+                Tag::from_u16_exhaustive(TAG_REFERENCE_BLACK_WHITE),
+                reference,
+            )
+            .unwrap();
+        }
         dir.finish().unwrap();
+    }
+
+    /// Rec. 709 luma weights as RATIONALs — deliberately *not* the CCIR
+    /// 601-1 defaults, so a reader that ignored the tag cannot pass.
+    fn rec709_coefficients() -> [Rational; 3] {
+        [
+            Rational { n: 2126, d: 10000 },
+            Rational { n: 7152, d: 10000 },
+            Rational { n: 722, d: 10000 },
+        ]
+    }
+
+    /// Studio-swing `ReferenceBlackWhite`: luma (16, 235), chroma (128,
+    /// 240) — again deliberately not the (0, 255) / (128, 255) defaults.
+    fn studio_reference() -> [Rational; 6] {
+        [
+            Rational { n: 16, d: 1 },
+            Rational { n: 235, d: 1 },
+            Rational { n: 128, d: 1 },
+            Rational { n: 240, d: 1 },
+            Rational { n: 128, d: 1 },
+            Rational { n: 240, d: 1 },
+        ]
     }
 
     /// Drain a reader into one `Vec<u8>` per channel, indexed by pixel.
@@ -2036,6 +2185,331 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ycbcr_honours_the_coefficient_and_reference_tags() {
+        // A file that declares Rec. 709 luma weights and studio-swing
+        // reference black/white must be decoded with *those*, not with the
+        // CCIR 601-1 defaults.
+        //
+        // The expected RGB below was computed independently of this crate,
+        // straight from TIFF 6.0 section 21:
+        //
+        //   Y  = (Yc  - RefBlack[0]) * 255 / (RefWhite[0] - RefBlack[0])
+        //   Cb = (Cbc - RefBlack[1]) * 127 / (RefWhite[1] - RefBlack[1])
+        //   Cr = (Crc - RefBlack[2]) * 127 / (RefWhite[2] - RefBlack[2])
+        //   R  = Cr * (2 - 2*LumaRed) + Y
+        //   B  = Cb * (2 - 2*LumaBlue) + Y
+        //   G  = (Y - LumaBlue*B - LumaRed*R) / LumaGreen
+        //
+        // Decoding the same four pixels with the *defaults* instead yields
+        // [220,0,17], [30,255,21], [18,1,230] and [235,235,235] — 20 to 35
+        // counts away on every pixel, so ignoring either tag fails loudly
+        // rather than by a rounding hair.
+        #[rustfmt::skip]
+        let data: [u8; 12] = [
+             63, 102, 240,
+            173,  42,  26,
+             32, 240, 118,
+            235, 128, 128,
+        ];
+        let expected = [[255u8, 1, 0], [1, 255, 2], [1, 0, 254], [255, 255, 255]];
+
+        let dir = tmpdir("ycbcr-tags");
+        let src = dir.join("ycbcr-tagged.tif");
+        write_ycbcr_fixture_with(
+            &src,
+            &data,
+            Some(&rec709_coefficients()),
+            Some(&studio_reference()),
+        );
+
+        let mut reader = TiffReader::open(&src).unwrap();
+        let planes = collect_planes(&mut reader);
+        for (pixel, want) in expected.iter().enumerate() {
+            for (ch, want) in want.iter().enumerate() {
+                assert_eq!(
+                    planes[ch][pixel], *want,
+                    "channel {ch} pixel {pixel}: the tagged transform was not applied"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ycbcr_refuses_tags_it_cannot_honour() {
+        // A tag the file *wrote* but this reader cannot make sense of must
+        // be refused by name. Silently falling back to the spec default
+        // would decode the file to plausible-looking but wrong pixels,
+        // which is exactly what refusing CMYK exists to prevent.
+        let dir = tmpdir("ycbcr-bad-tags");
+        #[rustfmt::skip]
+        let data: [u8; 12] = [63, 102, 240, 173, 42, 26, 32, 240, 118, 235, 128, 128];
+
+        // A zero denominator in YCbCrCoefficients.
+        let zero_denominator = [
+            Rational { n: 2126, d: 10000 },
+            Rational { n: 7152, d: 0 },
+            Rational { n: 722, d: 10000 },
+        ];
+        let src = dir.join("zero-denominator.tif");
+        write_ycbcr_fixture_with(&src, &data, Some(&zero_denominator), None);
+        let msg = TiffReader::open(&src).unwrap_err().to_string();
+        assert!(
+            msg.contains("YCbCrCoefficients") && msg.contains("zero denominator"),
+            "expected the zero denominator to be named, got: {msg}"
+        );
+
+        // A luma set with a zero green weight, which green is divided by.
+        let zero_green = [
+            Rational { n: 2126, d: 10000 },
+            Rational { n: 0, d: 10000 },
+            Rational { n: 722, d: 10000 },
+        ];
+        let src = dir.join("zero-green.tif");
+        write_ycbcr_fixture_with(&src, &data, Some(&zero_green), None);
+        let msg = TiffReader::open(&src).unwrap_err().to_string();
+        assert!(
+            msg.contains("YCbCrCoefficients"),
+            "expected the degenerate luma set to be refused, got: {msg}"
+        );
+
+        // The wrong number of coefficients.
+        let short_set = [Rational { n: 1, d: 2 }, Rational { n: 1, d: 2 }];
+        let src = dir.join("short-set.tif");
+        write_ycbcr_fixture_with(&src, &data, Some(&short_set), None);
+        let msg = TiffReader::open(&src).unwrap_err().to_string();
+        assert!(
+            msg.contains("YCbCrCoefficients"),
+            "expected the short coefficient list to be refused, got: {msg}"
+        );
+
+        // A ReferenceBlackWhite channel whose black and white are equal:
+        // it has no coding range, so its samples cannot be descaled.
+        let degenerate = [
+            Rational { n: 16, d: 1 },
+            Rational { n: 16, d: 1 },
+            Rational { n: 128, d: 1 },
+            Rational { n: 240, d: 1 },
+            Rational { n: 128, d: 1 },
+            Rational { n: 240, d: 1 },
+        ];
+        let src = dir.join("degenerate-reference.tif");
+        write_ycbcr_fixture_with(&src, &data, None, Some(&degenerate));
+        let msg = TiffReader::open(&src).unwrap_err().to_string();
+        assert!(
+            msg.contains("ReferenceBlackWhite") && msg.contains("coding range"),
+            "expected the degenerate reference to be named, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// [`write_palette_fixture`]'s image as a **BigTIFF** (magic 43, 8-byte
+    /// offsets, 20-byte directory entries with the value field at entry+12).
+    /// `scan_photometric` parses the directory by hand to find the
+    /// photometric tag, so its BigTIFF branch needs a BigTIFF to walk —
+    /// and BigTIFF is the format this whole project exists for.
+    fn write_palette_fixture_bigtiff(path: &Path) {
+        use tiff::encoder::{TiffEncoder, TiffKindBig};
+
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut enc: TiffEncoder<_, TiffKindBig> = TiffEncoder::new_generic(&mut file).unwrap();
+        let mut dir = enc.image_directory().unwrap();
+
+        let indices: Vec<u8> = (0u8..8).collect();
+        let offset = dir.write_data(&indices[..]).unwrap();
+        let map = palette_color_map();
+
+        dir.write_tag(Tag::ImageWidth, 4u32).unwrap();
+        dir.write_tag(Tag::ImageLength, 2u32).unwrap();
+        dir.write_tag(Tag::BitsPerSample, &[8u16][..]).unwrap();
+        dir.write_tag(Tag::SamplesPerPixel, 1u16).unwrap();
+        dir.write_tag(Tag::PhotometricInterpretation, 3u16).unwrap();
+        dir.write_tag(Tag::Compression, 1u16).unwrap();
+        dir.write_tag(Tag::PlanarConfiguration, 1u16).unwrap();
+        dir.write_tag(Tag::RowsPerStrip, 2u32).unwrap();
+        // LONG8 offsets and counts, the BigTIFF-native forms.
+        dir.write_tag(Tag::StripOffsets, &[offset][..]).unwrap();
+        dir.write_tag(Tag::StripByteCounts, &[8u64][..]).unwrap();
+        dir.write_tag(Tag::ColorMap, &map[..]).unwrap();
+        dir.finish().unwrap();
+    }
+
+    /// [`write_palette_fixture`]'s image as a **big-endian** (`MM`) classic
+    /// TIFF. The `tiff` crate's encoder only writes little-endian, so this
+    /// lays the file out byte-for-byte per TIFF 6.0: 12-byte entries sorted
+    /// ascending by tag, every scalar big-endian, and a SHORT value
+    /// left-justified in its 4-byte field.
+    ///
+    /// This exists to walk `scan_photometric`'s `MM` branch. Note the
+    /// failure mode there is fail-safe — a byte-order misread makes the
+    /// magic number fail to match, which yields "not a palette file" and
+    /// today's rejection, never a mis-decode — so this proves the branch
+    /// rather than guarding a live corruption.
+    fn write_palette_fixture_big_endian(path: &Path) {
+        struct Entry {
+            tag: u16,
+            ty: u16,
+            count: u32,
+            value: [u8; 4],
+        }
+        fn short(v: u16) -> [u8; 4] {
+            let mut b = [0u8; 4];
+            b[0..2].copy_from_slice(&v.to_be_bytes());
+            b
+        }
+        fn long(v: u32) -> [u8; 4] {
+            v.to_be_bytes()
+        }
+
+        let map = palette_color_map();
+        let indices: Vec<u8> = (0u8..8).collect();
+
+        // Tags ascending, as the spec requires. The two out-of-line values
+        // (ColorMap, the strip) are patched once their offsets are known.
+        let mut entries = vec![
+            Entry {
+                tag: 256,
+                ty: 3,
+                count: 1,
+                value: short(4),
+            }, // ImageWidth
+            Entry {
+                tag: 257,
+                ty: 3,
+                count: 1,
+                value: short(2),
+            }, // ImageLength
+            Entry {
+                tag: 258,
+                ty: 3,
+                count: 1,
+                value: short(8),
+            }, // BitsPerSample
+            Entry {
+                tag: 259,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // Compression: none
+            Entry {
+                tag: 262,
+                ty: 3,
+                count: 1,
+                value: short(3),
+            }, // Photometric: palette
+            Entry {
+                tag: 273,
+                ty: 4,
+                count: 1,
+                value: [0; 4],
+            }, // StripOffsets
+            Entry {
+                tag: 277,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // SamplesPerPixel
+            Entry {
+                tag: 278,
+                ty: 3,
+                count: 1,
+                value: short(2),
+            }, // RowsPerStrip
+            Entry {
+                tag: 279,
+                ty: 4,
+                count: 1,
+                value: long(8),
+            }, // StripByteCounts
+            Entry {
+                tag: 320,
+                ty: 3,
+                count: map.len() as u32,
+                value: [0; 4],
+            }, // ColorMap
+            Entry {
+                tag: 339,
+                ty: 3,
+                count: 1,
+                value: short(1),
+            }, // SampleFormat: uint
+        ];
+
+        let ifd_start = 8u32;
+        let ifd_bytes = 2 + entries.len() as u32 * 12 + 4;
+        let color_map_off = ifd_start + ifd_bytes;
+        let strip_off = color_map_off + map.len() as u32 * 2;
+        entries[5].value = long(strip_off);
+        entries[9].value = long(color_map_off);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MM");
+        bytes.extend_from_slice(&42u16.to_be_bytes());
+        bytes.extend_from_slice(&ifd_start.to_be_bytes());
+        assert_eq!(bytes.len() as u32, ifd_start);
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for e in &entries {
+            bytes.extend_from_slice(&e.tag.to_be_bytes());
+            bytes.extend_from_slice(&e.ty.to_be_bytes());
+            bytes.extend_from_slice(&e.count.to_be_bytes());
+            bytes.extend_from_slice(&e.value);
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // next IFD: none
+        assert_eq!(bytes.len() as u32, color_map_off);
+
+        for entry in &map {
+            bytes.extend_from_slice(&entry.to_be_bytes());
+        }
+        assert_eq!(bytes.len() as u32, strip_off);
+        bytes.extend_from_slice(&indices);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn palette_is_expanded_in_bigtiff_and_big_endian_containers() {
+        // `scan_photometric` walks the header and directory itself, so each
+        // container layout it claims to understand needs a file to walk:
+        // BigTIFF's 8-byte offsets and 20-byte entries, and `MM` byte order.
+        for (tag, name, write) in [
+            (
+                "bigtiff",
+                "pal-big.tif",
+                write_palette_fixture_bigtiff as fn(&Path),
+            ),
+            (
+                "big-endian",
+                "pal-be.tif",
+                write_palette_fixture_big_endian as fn(&Path),
+            ),
+        ] {
+            let dir = tmpdir(&format!("palette-{tag}"));
+            let src = dir.join(name);
+            write(&src);
+
+            let mut reader = TiffReader::open(&src)
+                .unwrap_or_else(|e| panic!("{tag} palette file should open: {e}"));
+            assert_eq!(reader.info().color, ColorClass::Rgb, "{tag}");
+            assert_eq!(reader.info().color_channels, 3, "{tag}");
+            assert_eq!(reader.info().sample_format, SampleFormat::U16, "{tag}");
+            assert_eq!((reader.info().width, reader.info().height), (4, 2), "{tag}");
+
+            let planes = collect_planes(&mut reader);
+            for pixel in 0..8usize {
+                let expected = palette_expected(pixel);
+                for (ch, want) in expected.iter().enumerate() {
+                    let b = pixel * 2;
+                    let got = u16::from_ne_bytes([planes[ch][b], planes[ch][b + 1]]);
+                    assert_eq!(got, *want, "{tag}: channel {ch} pixel {pixel}");
+                }
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
