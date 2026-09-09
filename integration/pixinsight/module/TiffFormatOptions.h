@@ -25,8 +25,8 @@
 // one for one (crates/mpp-ipc/src/protocol.rs, InitMessage): container
 // "auto"|"classic"|"big", layout "strips"|"tiles", compression
 // "none"|"lzw"|"deflate"|"packbits", alpha "none"|"unassociated"|
-// "associated". Task 16 does the string mapping; this header only fixes the
-// correspondence.
+// "associated". The write path (BigTiffInstance::CreateImage) does the string
+// mapping; this header only fixes the correspondence.
 
 #ifndef __TiffFormatOptions_h
 #define __TiffFormatOptions_h
@@ -184,6 +184,37 @@ struct TiffFormatOptions
     * \brief TIFF tag 305 (Software), NUL-terminated ASCII; empty when unset.
     */
    char software[ TiffTextTagCapacity ] = {};
+
+   /*!
+    * \brief True if \a data points at a block this module wrote: right magic,
+    * right version.
+    *
+    * The only way to tell one of our blocks apart from a foreign pointer PCL
+    * may hand us -- the core "knows nothing about" format-specific data and
+    * "passes them among instances, even instances of different file formats"
+    * (FileFormatImplementation.h:576-582) -- so every crossing of the module
+    * boundary checks it, in both BigTiffFormat (Validate/Dispose) and
+    * BigTiffInstance (QueryOptions/SetFormatSpecificData).
+    *
+    * The magic and version fields lead the struct, so a block written by an
+    * older or newer layout of this module is rejected here rather than
+    * misread; #version is bumped whenever a field is added.
+    *
+    * A pure predicate over this struct's own invariant, hence a static member
+    * of the struct rather than a method on either class that consults it:
+    * neither of them owns the invariant, and neither needs a back-pointer to
+    * the other to ask.
+    */
+   static bool IsValid( const void* data )
+   {
+      if ( data == nullptr )
+         return false;
+      // Reading the two leading fields is the validation itself; there is no
+      // cheaper way to identify the block, and no field beyond these two is
+      // touched until they check out.
+      const TiffFormatOptions* o = reinterpret_cast<const TiffFormatOptions*>( data );
+      return o->magic == Magic && o->version == Version;
+   }
 };
 
 /*

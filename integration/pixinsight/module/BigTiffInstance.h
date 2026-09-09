@@ -27,6 +27,7 @@
 #include <memory>
 #include <string>
 
+#include "TiffFormatOptions.h"
 #include "mpp_host.h"
 
 namespace pcl
@@ -73,10 +74,17 @@ public:
    void ReadImage( UInt16Image& image ) override;
    void ReadImage( UInt32Image& image ) override;
 
-   // -- Write-path lifecycle (PCL_FILEFORMAT_API.md §3.3).
+   // -- Write-path lifecycle (PCL_FILEFORMAT_API.md §3.3). QueryOptions()
+   //    runs first and once, before Create(): it presents TiffOptionsDialog
+   //    and returns the user's choices as the ImageOptions the core will
+   //    hand back through SetOptions() and the TiffFormatOptions block it
+   //    will hand back through SetFormatSpecificData().
 
+   bool QueryOptions( Array<ImageOptions>& options, Array<void*>& formatOptions ) override;
    void Create( const String& filePath, int numberOfImages, const IsoString& hints ) override;
    void SetOptions( const ImageOptions& options ) override;
+   void SetFormatSpecificData( const void* data ) override;
+   void* FormatSpecificData() const override;
    void CreateImage( const ImageInfo& info ) override;
    void CloseImage() override;
 
@@ -138,6 +146,16 @@ private:
 
    bool have_options_ = false;    // SetOptions() ran (Unknowns §3: it might not)
    ImageOptions options_;         // advisory sample format for the next image
+
+   // The TIFF-specific half of the same handshake, in the same idiom and for
+   // the same reason: SetFormatSpecificData() is advisory and the core is not
+   // guaranteed to call it (Unknowns §3 -- it is skipped entirely for a save
+   // driven by another module, and never called at all while
+   // BigTiffFormat::UsesFormatSpecificData() is false). The flag says whether
+   // a block actually arrived, so the write path can tell the user's choices
+   // from the struct's own defaults instead of assuming a value.
+   bool have_format_options_ = false;    // SetFormatSpecificData() ran with a valid block
+   TiffFormatOptions format_options_;    // advisory TIFF options for the next image
    bool lossy_ = false;           // a narrowing conversion happened (Unknowns §6)
    uint64_t width_ = 0, height_ = 0, channels_ = 0;   // from CreateImage()
    uint32_t band_rows_ = 0;       // rows per shm band (~4 MiB per band, min 1)

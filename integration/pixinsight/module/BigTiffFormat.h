@@ -65,6 +65,18 @@ public:
    bool CanStoreDouble() const override;         // default false -> true (f64 -> f32, lossy narrowing)
    bool CanStoreAlphaChannels() const override;  // default true  -> false (worker accepts 1 or 3 channels only)
 
+   // -- Format-specific data (MetaFileFormat.h:815-852). The core preserves
+   //    an opaque per-instance block for us -- our TiffFormatOptions -- and
+   //    round-trips it between BigTiffInstance::QueryOptions() and the
+   //    Create()/CreateImage() that follow. The core allocates nothing here:
+   //    every block originates in this module (QueryOptions or
+   //    FileFormatImplementation::FormatSpecificData) and comes back to this
+   //    module to be released.
+
+   bool UsesFormatSpecificData() const override;                     // default false -> true
+   bool ValidateFormatSpecificData( const void* data ) const override;
+   void DisposeFormatSpecificData( void* data ) const override;
+
    // -- Factory (MetaFileFormat.h:845).
 
    FileFormatImplementation* Create() const override;

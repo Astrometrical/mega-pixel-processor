@@ -4,6 +4,7 @@
 
 #include "BigTiffInstance.h"
 #include "MppVersion.h"
+#include "TiffFormatOptions.h"
 
 namespace pcl
 {
@@ -131,6 +132,44 @@ bool BigTiffFormat::CanStoreAlphaChannels() const
    // The wire protocol (docs/pi-protocol.md §5) accepts channels == 1 or 3
    // only, so alpha channels cannot be stored.
    return false;
+}
+
+// ----------------------------------------------------------------------------
+
+bool BigTiffFormat::UsesFormatSpecificData() const
+{
+   // True, so the core round-trips our TiffFormatOptions block from
+   // BigTiffInstance::QueryOptions() into the SetFormatSpecificData() that
+   // precedes Create()/CreateImage() (MetaFileFormat.h:815-828,
+   // FileFormatImplementation.h:576-605). While this returns false,
+   // SetFormatSpecificData() is never called and the TIFF-specific half of
+   // the options dialog would be discarded.
+   return true;
+}
+
+bool BigTiffFormat::ValidateFormatSpecificData( const void* data ) const
+{
+   // The core knows nothing about these blocks and passes them among
+   // instances of *different* formats, so anything reaching us here may be a
+   // foreign pointer that must not be dereferenced as our own type. The
+   // magic/version check is the whole of the test, and it lives on the struct
+   // that owns the invariant.
+   return TiffFormatOptions::IsValid( data );
+}
+
+void BigTiffFormat::DisposeFormatSpecificData( void* data ) const
+{
+   // Ownership arrives here and ends here: this is the only place a block
+   // allocated by BigTiffInstance::QueryOptions() or FormatSpecificData() is
+   // released. The new and the delete are both inside this module, so the
+   // allocator matches.
+   //
+   // Gated on IsValid for the same reason Validate is: never call delete on a
+   // pointer that is not one of ours. A block that fails the test was not
+   // allocated by us, so declining to free it cannot leak anything we own.
+   if ( !TiffFormatOptions::IsValid( data ) )
+      return;
+   delete reinterpret_cast<TiffFormatOptions*>( data );
 }
 
 // ----------------------------------------------------------------------------

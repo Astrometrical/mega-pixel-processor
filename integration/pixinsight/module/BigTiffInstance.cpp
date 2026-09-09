@@ -9,6 +9,7 @@
 #include "BigTiffInstance.h"
 
 #include "BigTiffFormat.h"
+#include "TiffOptionsDialog.h"
 
 #include <pcl/Console.h>
 #include <pcl/Exception.h>
@@ -354,6 +355,69 @@ void BigTiffInstance::ReadImage( UInt32Image& image )
 
 // ----------------------------------------------------------------------------
 
+bool BigTiffInstance::QueryOptions( Array<ImageOptions>& options, Array<void*>& formatOptions )
+{
+   // Called once, just before Create(), typically for File > Save As
+   // (FileFormatImplementation.h:461-506). Returning false aborts the save,
+   // which is exactly what cancelling the dialog must do.
+
+   // The core passes one ImageOptions per image and says formats that do not
+   // support multiple images may ignore all but the first
+   // (FileFormatImplementation.h:465-475). This format writes a single image
+   // per file, so only the first is meaningful; an empty array means the
+   // caller offered no starting point, so start from the PCL defaults.
+   const ImageOptions imageOptions = options.IsEmpty() ? ImageOptions() : options[0];
+
+   // Same for the format-specific block, with one extra step: the pointer may
+   // be null, or a foreign block from another format entirely, so it is only
+   // read after TiffFormatOptions::IsValid() confirms it is ours. Otherwise
+   // the struct's own defaults stand -- note the default container is Auto,
+   // not Big: this format owns .tif/.tiff now, so a save that fits in a
+   // classic TIFF should be one.
+   TiffFormatOptions tiffOptions;
+   if ( !formatOptions.IsEmpty() )
+   {
+      const void* existing = formatOptions[0];
+      if ( TiffFormatOptions::IsValid( existing ) )
+         tiffOptions = *reinterpret_cast<const TiffFormatOptions*>( existing );
+   }
+
+   // imageHasAlpha is unconditionally true here, and cannot be anything else:
+   // QueryOptions() runs BEFORE Create(), so no geometry has been handed to
+   // this instance yet and there is no way to ask whether this particular
+   // image carries an alpha channel. The alpha control is therefore always
+   // offered, and reconciling the user's choice with the image that actually
+   // arrives is CreateImage()'s job -- an image with no alpha channel forces
+   // the association to "none" on the wire regardless of what was chosen
+   // here, because the image, not the dialog, is the authority.
+   TiffOptionsDialog dialog( imageOptions, tiffOptions, /*imageHasAlpha=*/true );
+   if ( dialog.Execute() != StdDialogCode::Ok )
+      return false;   // aborts the save
+
+   options.Clear();
+   options.Add( dialog.GetImageOptions() );
+
+   // Ownership: this block is allocated here and released by
+   // BigTiffFormat::DisposeFormatSpecificData(), both inside this module. The
+   // unique_ptr covers the window in which Add() could throw; on success the
+   // core owns the raw pointer and we must not touch it again.
+   //
+   // Any pointer already in the array is deliberately NOT deleted: nothing in
+   // the API transfers ownership of an incoming block to us (only
+   // DisposeFormatSpecificData does that), so freeing one here risks a
+   // double-free in the core, which is far worse than the at-most-one small
+   // block a core that does not dispose it would strand.
+   std::unique_ptr<TiffFormatOptions> block(
+      new TiffFormatOptions( dialog.GetFormatOptions() ) );
+   formatOptions.Clear();
+   formatOptions.Add( block.get() );
+   (void)block.release();
+
+   return true;
+}
+
+// ----------------------------------------------------------------------------
+
 void BigTiffInstance::Create( const String& filePath, int numberOfImages, const IsoString& hints )
 {
    (void)hints;   // no hint vocabulary in v1 (Unknowns §10)
@@ -404,6 +468,40 @@ void BigTiffInstance::SetOptions( const ImageOptions& options )
    // mapped when the authoritative geometry arrives in CreateImage().
    options_ = options;
    have_options_ = true;
+}
+
+void BigTiffInstance::SetFormatSpecificData( const void* data )
+{
+   // Advisory, exactly like SetOptions(): stored here, applied when the
+   // authoritative geometry arrives in CreateImage().
+   //
+   // The core promises to call BigTiffFormat::ValidateFormatSpecificData()
+   // first and to skip this call if that returns false
+   // (FileFormatImplementation.h:600-604), but the same block also reaches us
+   // through intermodule communication, so the identity test is repeated here
+   // rather than assumed. A block that fails it leaves have_format_options_
+   // false and the defaults in force.
+   if ( TiffFormatOptions::IsValid( data ) )
+   {
+      format_options_ = *reinterpret_cast<const TiffFormatOptions*>( data );
+      have_format_options_ = true;
+   }
+}
+
+void* BigTiffInstance::FormatSpecificData() const
+{
+   // A fresh copy for the caller, who becomes its owner and releases it
+   // through BigTiffFormat::DisposeFormatSpecificData(); this instance keeps
+   // format_options_. Returning the address of the member instead would hand
+   // out a pointer into an object the core does not own and would outlive
+   // nothing -- the core would eventually delete a member of this instance.
+   //
+   // nullptr when nothing was set is the documented "no such data have been
+   // retrieved" answer (FileFormatImplementation.h:214-221). The read path
+   // never sets these options, so an opened file reports none.
+   if ( !have_format_options_ )
+      return nullptr;
+   return new TiffFormatOptions( format_options_ );
 }
 
 void BigTiffInstance::CreateImage( const ImageInfo& info )
