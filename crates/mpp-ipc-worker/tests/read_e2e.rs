@@ -129,6 +129,7 @@ impl ReadSession {
             slot_bytes,
             slots,
             mode: SessionMode::Read,
+            ..Default::default()
         };
         let payload = serde_json::to_vec(&init).unwrap();
         write_frame(&mut stdin, tag::INIT, &payload).expect("write Init frame");
@@ -393,6 +394,79 @@ fn read_session_rejects_unreadable_file() {
 
     let status = session.child.wait().expect("wait on worker");
     assert!(!status.success(), "a rejected read Init must exit nonzero");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A minimal `PlanarRows<f32>` source: `w * h` all-zero pixels on `c`
+/// channels. Only used to get a file on disk through the real
+/// `mpp_core::formats::tiff_write` writer — this test cares about the
+/// embedded ICC profile carried in `ImageMeta`, not pixel content.
+struct ZeroPlanar {
+    w: u64,
+    h: u64,
+    c: u64,
+    zero_row: Vec<f32>,
+}
+
+impl mpp_core::formats::PlanarRows<f32> for ZeroPlanar {
+    fn width(&self) -> u64 {
+        self.w
+    }
+    fn height(&self) -> u64 {
+        self.h
+    }
+    fn channels(&self) -> u64 {
+        self.c
+    }
+    fn row(&self, _c: u64, _y: u64) -> &[f32] {
+        &self.zero_row
+    }
+}
+
+/// End-to-end: a file written (by our own writer) with an embedded ICC
+/// profile must have that exact profile come back out through a real
+/// worker's `ImageMeta`, base64-decoded. Proves the read path's ICC
+/// support all the way across the IPC boundary, not just inside
+/// `TiffReader` (already covered by `mpp-core`'s own unit tests).
+#[test]
+fn image_meta_carries_the_embedded_icc_profile_to_the_host() {
+    use base64::Engine as _;
+    use mpp_core::formats::tiff_write::{TiffWriteOptions, write_tiff};
+
+    let dir = tmpdir("icc");
+    let path = dir.join("icc.tif");
+    let icc: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+    let img = ZeroPlanar {
+        w: 4,
+        h: 4,
+        c: 1,
+        zero_row: vec![0.0; 4],
+    };
+    write_tiff(
+        &img,
+        &path,
+        &TiffWriteOptions {
+            icc_profile: Some(icc.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut session = ReadSession::start(&path, 4096, 4);
+    let meta = session.expect_image_meta();
+    assert!(
+        !meta.icc_profile.is_empty(),
+        "expected a non-empty base64 icc_profile field"
+    );
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&meta.icc_profile)
+        .expect("icc_profile is valid base64");
+    assert_eq!(decoded, icc);
+
+    // Drain to a clean exit rather than leaving the child dangling.
+    let _ = session.drain_bands(4, 4, 4 * 4 * 4);
+    session.expect_exit_success();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -129,10 +129,14 @@ One encode loop serves both layouts:
 5. After the last chunk, write the tag set and `finish()`.
 
 Strip and tile data are written back-to-back with no inter-block padding,
-matching the `tiff` crate's own strip writer: TIFF's word-alignment rule
-applies to IFD entries and their out-of-line values, which `write_tag()` and
-`DirectoryEncoder`'s own `pad_word_boundary()` already handle, not to pixel
-data blocks.
+matching the `tiff` crate's own strip writer. Note that this leaves one
+TIFF 6.0 conformance gap the crate already has and this writer inherits: the
+IFD itself is written immediately after the pixel data, so an odd total
+payload puts the IFD at an odd offset, which the spec forbids. `write_tag()`
+and `DirectoryEncoder::pad_word_boundary()` align an entry's *out-of-line
+values*, not the directory's own start offset. Measured: a 3x3 u8 image puts
+the IFD at offset 17 (classic) / 25 (BigTIFF). Out of scope to fix here —
+see "Remaining gaps" in `docs/tiff-parity.md`.
 
 Sample bytes are emitted in **native** byte order (`to_ne_bytes`), because
 the crate writes the file's byte-order mark from `target_endian` — `II` on a
@@ -296,8 +300,9 @@ if it arrives late the instance throws rather than silently dropping it.
 with an identity mapping: `bitsPerSample`/`ieeefpSampleFormat` select both
 `bit_depth` and `band_format`, and each `WriteSamples` overload converts its
 buffer to that native type. `WasLossyWrite()` then reports true only for a
-genuine narrowing (for example a `DImage` saved as 16-bit by user choice),
-not for the whole `u32`/`f64` category as it does today.
+genuine loss — a narrowing conversion (for example a `DImage` saved as
+16-bit by user choice), or an alpha channel the save options discard — not
+for the whole `u32`/`f64` category as it does today.
 
 **Capability corrections** on `BigTiffFormat`:
 

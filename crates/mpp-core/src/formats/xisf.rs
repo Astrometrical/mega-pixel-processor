@@ -158,7 +158,7 @@ impl XisfImage {
     }
 }
 
-impl super::PlanarRows for XisfImage {
+impl super::PlanarRows<f32> for XisfImage {
     fn width(&self) -> u64 {
         self.width()
     }

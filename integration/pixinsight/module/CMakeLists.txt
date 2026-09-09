@@ -57,6 +57,7 @@ add_library(mpp-pxm SHARED
   Mpp.cpp
   BigTiffFormat.cpp
   BigTiffInstance.cpp
+  TiffOptionsDialog.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/mpp_shm.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/mpp_protocol.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/mpp_host.cpp)

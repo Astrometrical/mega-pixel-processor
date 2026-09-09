@@ -9,6 +9,7 @@
 #include "BigTiffInstance.h"
 
 #include "BigTiffFormat.h"
+#include "TiffOptionsDialog.h"
 
 #include <pcl/Console.h>
 #include <pcl/Exception.h>
@@ -95,21 +96,172 @@ std::string ResolveWorkerPath()
    return std::string( worker.ToUTF8().c_str() );
 }
 
-// Behavioral-contract sample mapping, applied per sample: f32 passes
-// through, f64 narrows, unsigned integers divide by their type maximum.
-// u8/u16 are exact in f32 (their maxima fit a 24-bit significand); u32 loses
-// precision by design (documented precision note).
+// Protocol band-format name of a PixInsight sample type: the string
+// CreateImage() must have negotiated for a WriteSamples buffer of this type
+// to reach a shm slot untouched.
 template <typename T>
-float NormalizeSample( T v )
+constexpr const char* NativeBandFormat()
 {
-   if constexpr ( std::is_floating_point_v<T> )
-      return float( v );
+   if constexpr ( std::is_same_v<T, float> )
+      return "f32";
+   else if constexpr ( std::is_same_v<T, double> )
+      return "f64";
    else
    {
       static_assert( std::is_unsigned_v<T>, "integer samples are unsigned in PCL" );
-      constexpr double maxv = double( std::numeric_limits<T>::max() );
-      return float( double( v )/maxv );
+      if constexpr ( sizeof( T ) == 1 )
+         return "u8";
+      else if constexpr ( sizeof( T ) == 2 )
+         return "u16";
+      else
+      {
+         static_assert( sizeof( T ) == 4, "unexpected integer sample width" );
+         return "u32";
+      }
    }
+}
+
+// Number of sample values a format can tell apart, as a bit count: the
+// integer formats' own width, and a float format's significand (24 for f32,
+// 53 for f64). Used only to decide whether a conversion narrows -- it is a
+// resolution comparison, not a storage size.
+int FormatValueBits( const std::string& fmt )
+{
+   if ( fmt == "u8" )
+      return 8;
+   if ( fmt == "u16" )
+      return 16;
+   if ( fmt == "u32" )
+      return 32;
+   if ( fmt == "f32" )
+      return 24;
+   if ( fmt == "f64" )
+      return 53;
+   return 0;   // unreachable: CreateImage() only ever negotiates the five above
+}
+
+// True if converting a T sample to \a fmt can lose information, which is
+// exactly what WasLossyWrite() reports (Unknowns §6).
+//
+// Two ways that happens: the destination resolves fewer distinct values than
+// the source (f64 -> f32, u32 -> f32, u16 -> u8, ...), or a floating-point
+// sample is quantized onto an integer grid at all -- a DImage saved as u8 is
+// the brief's own example, and even f32 -> u32 collapses the dense small
+// magnitudes f32 can represent onto a uniform grid. Every same-type
+// conversion, and every widening one (u8 -> u16, u16 -> f32, u32 -> f64,
+// f32 -> f64), is exact and reports false: since protocol v3 the u32 and f64
+// paths are among them, which is the whole point of this phase.
+template <typename T>
+bool ConversionIsLossy( const std::string& fmt )
+{
+   const int srcBits = FormatValueBits( NativeBandFormat<T>() );
+   const int dstBits = FormatValueBits( fmt );
+   const bool floatToInteger =
+      std::is_floating_point_v<T> && ( fmt == "u8" || fmt == "u16" || fmt == "u32" );
+   return srcBits > dstBits || floatToInteger;
+}
+
+// One sample from PixInsight's sample type \a Src to the wire's \a Dst, via
+// the unit range PixInsight itself defines: floating-point samples are
+// already in [0,1], integer samples span [0, max]. Integer destinations are
+// rounded to nearest and clamped, so an out-of-range float sample (PCL
+// permits them) cannot wrap around; NaN maps to 0 because the `> 0` test
+// below is false for it.
+//
+// THIS CONVERSION EXISTS TWICE, IN TWO LANGUAGES. `Sample::from_unit_f32`
+// in crates/mpp-core/src/formats/tiff_write/sample.rs is the Rust
+// implementation of the same mapping, and the two MUST agree sample for
+// sample. They currently do, on all four properties that define it:
+//   1. the scale is computed in double, never float (u32's maximum exceeds
+//      float's 24-bit mantissa);
+//   2. integer results round HALF UP (`+ 0.5` then truncate here,
+//      `.round()` on a non-negative value there);
+//   3. out-of-range input SATURATES at 0 and the destination maximum
+//      rather than wrapping;
+//   4. NaN maps to 0.
+// Drift would be invisible in testing: CreateImage() always negotiates
+// band_format_ == bit_depth, so the worker takes mpp-core's verbatim
+// `write_tiff_native` path and never runs the Rust copy on the PixInsight
+// route -- this function is the only one of the two that a PixInsight save
+// exercises. Change one, change the other.
+template <typename Dst, typename Src>
+Dst ConvertSample( Src v )
+{
+   double unit;
+   if constexpr ( std::is_floating_point_v<Src> )
+      unit = double( v );
+   else
+   {
+      static_assert( std::is_unsigned_v<Src>, "integer samples are unsigned in PCL" );
+      unit = double( v )/double( std::numeric_limits<Src>::max() );
+   }
+
+   if constexpr ( std::is_floating_point_v<Dst> )
+      return Dst( unit );
+   else
+   {
+      constexpr double maxv = double( std::numeric_limits<Dst>::max() );
+      const double scaled = unit*maxv;
+      if ( !( scaled > 0 ) )
+         return Dst( 0 );                              // <= 0, or NaN
+      if ( scaled >= maxv )
+         return std::numeric_limits<Dst>::max();
+      return Dst( scaled + 0.5 );
+   }
+}
+
+// Converts \a n samples from \a src into the raw \a dst buffer, which the
+// caller has sized for \a n samples of \a fmt.
+template <typename T>
+void ConvertBuffer( const T* src, void* dst, uint64_t n, const std::string& fmt )
+{
+   auto run = [src, n]( auto* out )
+   {
+      using Dst = std::remove_pointer_t<decltype( out )>;
+      for ( uint64_t i = 0; i < n; ++i )
+         out[i] = ConvertSample<Dst>( src[i] );
+   };
+   if ( fmt == "f32" )
+      run( reinterpret_cast<float*>( dst ) );
+   else if ( fmt == "f64" )
+      run( reinterpret_cast<double*>( dst ) );
+   else if ( fmt == "u8" )
+      run( reinterpret_cast<uint8_t*>( dst ) );
+   else if ( fmt == "u16" )
+      run( reinterpret_cast<uint16_t*>( dst ) );
+   else if ( fmt == "u32" )
+      run( reinterpret_cast<uint32_t*>( dst ) );
+   else
+      throw Error( String( "BigTIFF: internal error: unknown band format \"" ) +
+                   String( fmt.c_str() ) + "\"." );
+}
+
+// Base64 of a byte range, for the ICC profile the v3 Init carries as text.
+// PCL's own RFC 1421 encoder/decoder (IsoString::ToBase64 / FromBase64,
+// String.h:7663 and 7765) is used rather than a hand-rolled pair: it is
+// public PCL API this module already links, it is the standard alphabet with
+// padding the worker's decoder expects
+// (base64::engine::general_purpose::STANDARD), and a bespoke codec in the
+// one code path that carries opaque user colour data would be all risk and
+// no gain.
+std::string EncodeBase64( const std::vector<uint8_t>& bytes )
+{
+   if ( bytes.empty() )
+      return std::string();
+   return std::string( IsoString::ToBase64( bytes.data(), bytes.size() ).c_str() );
+}
+
+// NUL-terminated text out of one of TiffFormatOptions' fixed-size character
+// arrays, never reading past the array even if the block arrived unterminated
+// (it crosses the module boundary, so its contents are not this module's to
+// trust -- the same reason TiffFormatOptions::IsValid() exists).
+template <size_t N>
+std::string TagText( const char ( &field )[N] )
+{
+   size_t len = 0;
+   while ( len < N && field[len] != '\0' )
+      ++len;
+   return std::string( field, len );
 }
 
 } // anonymous namespace
@@ -195,6 +347,10 @@ ImageDescriptionArray BigTiffInstance::Open( const String& filePath, const IsoSt
    read_channels_ = meta.channels;
    read_bit_depth_ = meta.bit_depth;
    read_color_space_ = info.colorSpace;
+   // Base64 ICC blob, empty when the file embeds none; decoded on demand by
+   // ReadICCProfile(). The probe already parsed it, so keeping it costs one
+   // string copy and saves reopening the file to answer the core's query.
+   read_icc_base64_ = meta.icc_profile;
    path_ = filePath;
    open_ = true;
    read_mode_ = true;
@@ -238,6 +394,25 @@ void BigTiffInstance::Close()
    }
    open_ = false;
    read_mode_ = false;   // a read instance carries no live session; just clear state
+
+   // Per-file state that must not leak into a reused instance: an ICC
+   // profile stashed for a save that never happened would otherwise be
+   // embedded in the next one, and a stale read blob would be reported for
+   // a file that has none.
+   //
+   // lossy_ belongs here for the same reason and one of its own:
+   // WasLossyWrite() reports on "the last file write operation in this file"
+   // (FileFormatImplementation.h:792), so it is per-file state by
+   // definition, and an instance driven through a second Create() must start
+   // it over. Leaving it set would make one narrowing save poison every
+   // later exact save on the same instance -- routinely observable since the
+   // flag started covering ordinary conversions like f32 -> u16, not just
+   // the exotic ones.
+   icc_profile_.clear();
+   read_icc_base64_.clear();
+   band_format_.clear();
+   discarded_channel_ = -1;
+   lossy_ = false;
 }
 
 // ----------------------------------------------------------------------------
@@ -354,6 +529,69 @@ void BigTiffInstance::ReadImage( UInt32Image& image )
 
 // ----------------------------------------------------------------------------
 
+bool BigTiffInstance::QueryOptions( Array<ImageOptions>& options, Array<void*>& formatOptions )
+{
+   // Called once, just before Create(), typically for File > Save As
+   // (FileFormatImplementation.h:461-506). Returning false aborts the save,
+   // which is exactly what cancelling the dialog must do.
+
+   // The core passes one ImageOptions per image and says formats that do not
+   // support multiple images may ignore all but the first
+   // (FileFormatImplementation.h:465-475). This format writes a single image
+   // per file, so only the first is meaningful; an empty array means the
+   // caller offered no starting point, so start from the PCL defaults.
+   const ImageOptions imageOptions = options.IsEmpty() ? ImageOptions() : options[0];
+
+   // Same for the format-specific block, with one extra step: the pointer may
+   // be null, or a foreign block from another format entirely, so it is only
+   // read after TiffFormatOptions::IsValid() confirms it is ours. Otherwise
+   // the struct's own defaults stand -- note the default container is Auto,
+   // not Big: this format owns .tif/.tiff now, so a save that fits in a
+   // classic TIFF should be one.
+   TiffFormatOptions tiffOptions;
+   if ( !formatOptions.IsEmpty() )
+   {
+      const void* existing = formatOptions[0];
+      if ( TiffFormatOptions::IsValid( existing ) )
+         tiffOptions = *reinterpret_cast<const TiffFormatOptions*>( existing );
+   }
+
+   // imageHasAlpha is unconditionally true here, and cannot be anything else:
+   // QueryOptions() runs BEFORE Create(), so no geometry has been handed to
+   // this instance yet and there is no way to ask whether this particular
+   // image carries an alpha channel. The alpha control is therefore always
+   // offered, and reconciling the user's choice with the image that actually
+   // arrives is CreateImage()'s job -- an image with no alpha channel forces
+   // the association to "none" on the wire regardless of what was chosen
+   // here, because the image, not the dialog, is the authority.
+   TiffOptionsDialog dialog( imageOptions, tiffOptions, /*imageHasAlpha=*/true );
+   if ( dialog.Execute() != StdDialogCode::Ok )
+      return false;   // aborts the save
+
+   options.Clear();
+   options.Add( dialog.GetImageOptions() );
+
+   // Ownership: this block is allocated here and released by
+   // BigTiffFormat::DisposeFormatSpecificData(), both inside this module. The
+   // unique_ptr covers the window in which Add() could throw; on success the
+   // core owns the raw pointer and we must not touch it again.
+   //
+   // Any pointer already in the array is deliberately NOT deleted: nothing in
+   // the API transfers ownership of an incoming block to us (only
+   // DisposeFormatSpecificData does that), so freeing one here risks a
+   // double-free in the core, which is far worse than the at-most-one small
+   // block a core that does not dispose it would strand.
+   std::unique_ptr<TiffFormatOptions> block(
+      new TiffFormatOptions( dialog.GetFormatOptions() ) );
+   formatOptions.Clear();
+   formatOptions.Add( block.get() );
+   (void)block.release();
+
+   return true;
+}
+
+// ----------------------------------------------------------------------------
+
 void BigTiffInstance::Create( const String& filePath, int numberOfImages, const IsoString& hints )
 {
    (void)hints;   // no hint vocabulary in v1 (Unknowns §10)
@@ -406,6 +644,40 @@ void BigTiffInstance::SetOptions( const ImageOptions& options )
    have_options_ = true;
 }
 
+void BigTiffInstance::SetFormatSpecificData( const void* data )
+{
+   // Advisory, exactly like SetOptions(): stored here, applied when the
+   // authoritative geometry arrives in CreateImage().
+   //
+   // The core promises to call BigTiffFormat::ValidateFormatSpecificData()
+   // first and to skip this call if that returns false
+   // (FileFormatImplementation.h:600-604), but the same block also reaches us
+   // through intermodule communication, so the identity test is repeated here
+   // rather than assumed. A block that fails it leaves have_format_options_
+   // false and the defaults in force.
+   if ( TiffFormatOptions::IsValid( data ) )
+   {
+      format_options_ = *reinterpret_cast<const TiffFormatOptions*>( data );
+      have_format_options_ = true;
+   }
+}
+
+void* BigTiffInstance::FormatSpecificData() const
+{
+   // A fresh copy for the caller, who becomes its owner and releases it
+   // through BigTiffFormat::DisposeFormatSpecificData(); this instance keeps
+   // format_options_. Returning the address of the member instead would hand
+   // out a pointer into an object the core does not own and would outlive
+   // nothing -- the core would eventually delete a member of this instance.
+   //
+   // nullptr when nothing was set is the documented "no such data have been
+   // retrieved" answer (FileFormatImplementation.h:214-221). The read path
+   // never sets these options, so an opened file reports none.
+   if ( !have_format_options_ )
+      return nullptr;
+   return new TiffFormatOptions( format_options_ );
+}
+
 void BigTiffInstance::CreateImage( const ImageInfo& info )
 {
    if ( !open_ )
@@ -417,18 +689,21 @@ void BigTiffInstance::CreateImage( const ImageInfo& info )
       throw Error( "BigTIFF: invalid image geometry." );
    if ( info.colorSpace != ColorSpace::Gray && info.colorSpace != ColorSpace::RGB )
       throw Error( "BigTIFF: only grayscale and RGB images are supported." );
-   const int nominalChannels = ( info.colorSpace == ColorSpace::Gray ) ? 1 : 3;
-   if ( info.numberOfChannels != nominalChannels )
-      throw Error( String().Format( "BigTIFF: %d channels are not supported for this color "
-                                    "space (expected %d; alpha channels cannot be stored).",
-                                    info.numberOfChannels, nominalChannels ) );
+   // Colour channels plus an optional alpha plane: the engine accepts 1, 2, 3
+   // or 4 channels (gray, gray+alpha, RGB, RGBA -- TiffWriteOptions::validate).
+   const int colourChannels = ( info.colorSpace == ColorSpace::Gray ) ? 1 : 3;
+   if ( info.numberOfChannels != colourChannels && info.numberOfChannels != colourChannels + 1 )
+      throw Error( String().Format(
+         "BigTIFF: %d channels are not supported for this color space "
+         "(expected %d, or %d with an alpha channel).",
+         info.numberOfChannels, colourChannels, colourChannels + 1 ) );
+   const bool hasAlpha = info.numberOfChannels == colourChannels + 1;
 
-   // Sample-format mapping (behavioral contract). If SetOptions() never ran
-   // (Unknowns §3), the default-constructed ImageOptions (16-bit integer)
-   // select "u16". The options are advisory (Unknowns §5): they choose the
-   // OUTPUT sample format only -- every WriteSamples overload normalizes its
-   // own buffer to f32 regardless, so a disagreeing overload still writes
-   // correct data in the format negotiated here.
+   // Sample-format mapping. Protocol v3 carries bands in their native type,
+   // so this is now an identity map rather than the narrowing table phase 2
+   // shipped: what the user asks for is what the file gets. If SetOptions()
+   // never ran (Unknowns §3), the default-constructed ImageOptions (16-bit
+   // integer) select "u16".
    if ( options_.complexSample )
       throw Error( "BigTIFF: complex sample formats are not supported." );
    if ( !options_.ieeefpSampleFormat && options_.signedIntegers )
@@ -437,11 +712,8 @@ void BigTiffInstance::CreateImage( const ImageInfo& info )
    if ( options_.ieeefpSampleFormat )
       switch ( options_.bitsPerSample )
       {
-      case 32:   // f32 -> "f32", the native path
-      case 64:   // f64 -> "f32", narrowed (documented; lossiness is tracked
-                 // where the narrowing actually happens, in WriteSamples)
-         bitDepth = "f32";
-         break;
+      case 32: bitDepth = "f32"; break;
+      case 64: bitDepth = "f64"; break;
       default:
          throw Error( String().Format( "BigTIFF: %d-bit floating-point samples are not "
                                        "supported.", int( options_.bitsPerSample ) ) );
@@ -449,28 +721,80 @@ void BigTiffInstance::CreateImage( const ImageInfo& info )
    else
       switch ( options_.bitsPerSample )
       {
-      case 8:
-         bitDepth = "u8";
-         break;
-      case 16:
-         bitDepth = "u16";
-         break;
-      case 32:   // u32 -> f32 in [0,1] (u32/(2^32-1); documented precision note)
-         bitDepth = "f32";
-         break;
+      case 8:  bitDepth = "u8"; break;
+      case 16: bitDepth = "u16"; break;
+      case 32: bitDepth = "u32"; break;
       default:
          throw Error( String().Format( "BigTIFF: %d-bit integer samples are not supported.",
                                        int( options_.bitsPerSample ) ) );
       }
+   // v3: bands cross shm in the output's own type. Setting the two from one
+   // variable is deliberate -- the protocol's coupling rule (band_format must
+   // equal bit_depth unless it is the converting "f32", see
+   // WriteSessionConfig::band_format) is satisfied by construction, and the
+   // worker rejects an Init where they drift apart.
+   band_format_ = bitDepth;
+
+   // The alpha contract, both directions. The dialog's alpha item may say
+   // "not written", and an image may carry no alpha channel at all; the two
+   // must be reconciled here because the IMAGE, not the dialog, is the
+   // authority on whether an alpha channel exists (QueryOptions() runs before
+   // any geometry is known, so it always offers the control).
+   //
+   //   image has alpha + "not written" -> drop the plane: send the colour
+   //      channels alone and discard the alpha WriteSamples call, rather than
+   //      sending a channel count with alpha="none" that
+   //      TiffWriteOptions::validate rejects as a multiband image;
+   //   image has no alpha -> force alpha="none" whatever was chosen, or the
+   //      same validator rejects an alpha association with 1 or 3 channels.
+   //
+   // Either mismatch would otherwise surface as a save-time error from a
+   // dialog that promised the save would work.
+   std::string alphaMode = "none";
+   discarded_channel_ = -1;
+   uint64_t wireChannels = uint64_t( info.numberOfChannels );
+   if ( hasAlpha )
+      switch ( format_options_.alpha )
+      {
+      case TiffAlpha::Unassociated: alphaMode = "unassociated"; break;
+      case TiffAlpha::Associated:   alphaMode = "associated"; break;
+      case TiffAlpha::None:
+      default:
+         // The user asked for the alpha channel not to be written.
+         discarded_channel_ = colourChannels;
+         wireChannels = uint64_t( colourChannels );
+         // Dropping a whole channel is a lossy write, and is recorded here
+         // -- at the decision -- rather than in PushTyped(), so the flag is
+         // true from CreateImage() onwards whether or not the core ever
+         // hands us the alpha plane. PCL's own wording talks about lossy
+         // *compression*, and the user did ask for the drop, so reporting
+         // it is a judgement call; this module makes it because an entire
+         // channel of the source image is absent from the file, and this
+         // is the phase that exists because a capability claimed more than
+         // the code delivered. Understating the loss here would be the
+         // same mistake in the other direction.
+         lossy_ = true;
+         break;
+      }
 
    width_ = uint64_t( info.width );
    height_ = uint64_t( info.height );
-   channels_ = uint64_t( info.numberOfChannels );
+   channels_ = wireChannels;
 
-   // ~4 MiB of f32 per band (plan contract), at least 1 row, at most the
-   // whole image.
+   // ~4 MiB per band (plan contract) measured in the NEGOTIATED band sample
+   // width, not sizeof( float ): an f64 session would otherwise commit twice
+   // the intended shm per slot. At least 1 row, at most the whole image.
+   uint64_t bandSampleBytes = 0;
+   try
+   {
+      bandSampleBytes = uint64_t( mpp::WriteSession::SampleBytes( band_format_ ) );
+   }
+   catch ( const mpp::HostError& e )
+   {
+      throw Error( String( "BigTIFF: " ) + String( e.what() ) );
+   }
    const uint64_t kTargetBandBytes = uint64_t( 4 )*1024*1024;
-   uint64_t bandRows = kTargetBandBytes/( width_*sizeof( float ) );
+   uint64_t bandRows = kTargetBandBytes/( width_*bandSampleBytes );
    bandRows = std::max<uint64_t>( 1, std::min<uint64_t>( bandRows, height_ ) );
    band_rows_ = uint32_t( bandRows );
 
@@ -483,6 +807,61 @@ void BigTiffInstance::CreateImage( const ImageInfo& info )
    cfg.bit_depth = bitDepth;
    cfg.band_rows = band_rows_;
    cfg.slots = 4;   // >= 2 recommended (mpp_host.h); 4 keeps bands in flight
+   cfg.band_format = band_format_;
+
+   // The TIFF-specific half of the options. format_options_ holds the user's
+   // choices when SetFormatSpecificData() ran and the struct's own defaults
+   // otherwise (Unknowns §3 -- a save driven by another module never calls
+   // it), and those defaults are the behaviour that save should get.
+   switch ( format_options_.container )
+   {
+   case TiffContainer::Classic: cfg.container = "classic"; break;
+   case TiffContainer::Big:     cfg.container = "big"; break;
+   case TiffContainer::Auto:
+   default:                     cfg.container = "auto"; break;
+   }
+   switch ( format_options_.layout )
+   {
+   case TiffLayout::Tiles:  cfg.layout = "tiles"; break;
+   case TiffLayout::Strips:
+   default:                 cfg.layout = "strips"; break;
+   }
+   switch ( format_options_.compression )
+   {
+   case TiffCompression::Lzw:      cfg.compression = "lzw"; break;
+   case TiffCompression::Deflate:  cfg.compression = "deflate"; break;
+   case TiffCompression::Packbits: cfg.compression = "packbits"; break;
+   case TiffCompression::None:
+   default:                        cfg.compression = "none"; break;
+   }
+   cfg.tile_size = format_options_.tileSize;
+   cfg.deflate_level = format_options_.deflateLevel;
+   // TIFF tag 317 is defined for integer samples only and the engine rejects
+   // the combination, so a predictor never reaches the wire alongside a
+   // floating-point output format. The dialog already refuses to harvest one
+   // (TiffOptionsDialog::UpdateEnableStates), but the block can also arrive
+   // from a script or another module whose ImageOptions disagree with it.
+   const bool floatOutput = ( bitDepth == "f32" || bitDepth == "f64" );
+   cfg.predictor = format_options_.predictor && !floatOutput;
+   cfg.alpha = alphaMode;
+   cfg.description = TagText( format_options_.description );
+   cfg.copyright = TagText( format_options_.copyright );
+   cfg.software = TagText( format_options_.software );
+
+   // Resolution: ImageOptions models it, so it comes from there rather than
+   // the TIFF block. The worker writes the tags only when both values are
+   // positive; PCL's own "0 = unknown" convention therefore passes straight
+   // through.
+   cfg.x_resolution = options_.xResolution;
+   cfg.y_resolution = options_.yResolution;
+   cfg.resolution_unit = options_.metricResolution ? "cm" : "inch";
+
+   // ICC profile stashed by WriteICCProfile(), which the core calls before
+   // this function. options_.embedICCProfile is the core's own switch for
+   // whether a profile should be embedded at all; honour it rather than
+   // embedding a profile a caller explicitly asked us not to.
+   if ( !icc_profile_.empty() && options_.embedICCProfile )
+      cfg.icc_profile_base64 = EncodeBase64( icc_profile_ );
 
    try
    {
@@ -524,7 +903,7 @@ void BigTiffInstance::CloseImage()
 // ----------------------------------------------------------------------------
 
 template <typename T>
-void BigTiffInstance::PushNormalized( const T* buffer, int startRow, int rowCount, int channel )
+void BigTiffInstance::PushTyped( const T* buffer, int startRow, int rowCount, int channel )
 {
    if ( session_ == nullptr )
       throw Error( "BigTIFF: internal error: WriteSamples() called with no image created "
@@ -536,30 +915,52 @@ void BigTiffInstance::PushNormalized( const T* buffer, int startRow, int rowCoun
                    "coordinates." );
    if ( rowCount == 0 )
       return;
+   // The alpha plane of an image whose save options say "not written": the
+   // session was opened for the colour channels alone, so this buffer has
+   // nowhere to go and dropping it is what the user asked for (see the alpha
+   // contract in CreateImage()). Only ever one index, never a general
+   // out-of-range escape hatch -- any other bad channel still reaches
+   // PushBandBytes, which rejects it against the Init geometry.
+   //
+   // Returning above the ConversionIsLossy() check below is deliberate and
+   // safe: CreateImage() already set lossy_ when it decided to discard this
+   // channel, so a dropped plane reports WasLossyWrite() == true even though
+   // no sample of it is ever converted here.
+   if ( discarded_channel_ >= 0 && channel == discarded_channel_ )
+      return;
+
+   // Whether this buffer's own type survives the trip intact. Recorded on
+   // every call rather than per overload: the conversion, not the overload,
+   // is what can lose information (Unknowns §5 -- the overload that fires
+   // need not match the negotiated format).
+   if ( ConversionIsLossy<T>( band_format_ ) )
+      lossy_ = true;
+
+   const bool nativeBands = ( band_format_ == NativeBandFormat<T>() );
 
    try
    {
       // Split into <= band_rows_ chunks; channel/row-range validity is
-      // enforced by WriteSession::PushBand against the Init geometry.
+      // enforced by WriteSession::PushBandBytes against the Init geometry.
       uint64_t row = uint64_t( startRow );
       uint64_t remaining = uint64_t( rowCount );
       const T* p = buffer;
-      std::vector<float> scratch;
+      std::vector<uint8_t> scratch;
+      const size_t dstSampleBytes = mpp::WriteSession::SampleBytes( band_format_ );
       while ( remaining > 0 )
       {
          const uint32_t rows = uint32_t( std::min<uint64_t>( remaining, band_rows_ ) );
          const uint64_t n = uint64_t( rows )*width_;
-         const float* samples;
-         if constexpr ( std::is_same_v<T, float> )
-            samples = p;   // native path: no conversion, no copy
+         const void* samples;
+         if ( nativeBands )
+            samples = p;   // negotiated type == this overload's type: no conversion, no copy
          else
          {
-            scratch.resize( size_t( n ) );
-            for ( uint64_t i = 0; i < n; ++i )
-               scratch[size_t( i )] = NormalizeSample( p[i] );
+            scratch.resize( size_t( n )*dstSampleBytes );
+            ConvertBuffer( p, scratch.data(), n, band_format_ );
             samples = scratch.data();
          }
-         session_->PushBand( uint32_t( channel ), row, rows, samples );
+         session_->PushBandBytes( uint32_t( channel ), row, rows, samples );
          p += n;
          row += rows;
          remaining -= rows;
@@ -574,31 +975,34 @@ void BigTiffInstance::PushNormalized( const T* buffer, int startRow, int rowCoun
    }
 }
 
+// All five overloads are now one call: PushTyped() knows this buffer's type
+// and the negotiated band type, so it -- not the overload -- decides whether
+// a conversion is needed and whether it narrows. In the ordinary save the two
+// agree and the buffer reaches shm untouched.
+
 void BigTiffInstance::WriteSamples( const pcl::Image::sample* buffer, int startRow, int rowCount, int channel )
 {
-   PushNormalized( buffer, startRow, rowCount, channel );
+   PushTyped( buffer, startRow, rowCount, channel );
 }
 
 void BigTiffInstance::WriteSamples( const pcl::DImage::sample* buffer, int startRow, int rowCount, int channel )
 {
-   lossy_ = true;   // f64 -> f32 narrowing (behavioral contract; Unknowns §6)
-   PushNormalized( buffer, startRow, rowCount, channel );
+   PushTyped( buffer, startRow, rowCount, channel );
 }
 
 void BigTiffInstance::WriteSamples( const UInt8Image::sample* buffer, int startRow, int rowCount, int channel )
 {
-   PushNormalized( buffer, startRow, rowCount, channel );   // exact in f32
+   PushTyped( buffer, startRow, rowCount, channel );
 }
 
 void BigTiffInstance::WriteSamples( const UInt16Image::sample* buffer, int startRow, int rowCount, int channel )
 {
-   PushNormalized( buffer, startRow, rowCount, channel );   // exact in f32
+   PushTyped( buffer, startRow, rowCount, channel );
 }
 
 void BigTiffInstance::WriteSamples( const UInt32Image::sample* buffer, int startRow, int rowCount, int channel )
 {
-   lossy_ = true;   // u32 precision exceeds f32's 24-bit significand (Unknowns §6)
-   PushNormalized( buffer, startRow, rowCount, channel );
+   PushTyped( buffer, startRow, rowCount, channel );
 }
 
 // ----------------------------------------------------------------------------
@@ -651,12 +1055,62 @@ void BigTiffInstance::WriteImage( const UInt32Image& image )
 
 bool BigTiffInstance::WasLossyWrite() const
 {
-   // True iff a narrowing conversion happened on this instance's write path
-   // (f64 or u32 sources; Unknowns §6 -- the flag is kept accurate at all
-   // times regardless of when the core queries it). A float image saved
-   // into a u16/u8 output file is a user-selected quantization, not a shim
-   // conversion, and is not reported here.
+   // True iff this instance's write path actually lost information: a
+   // narrowing sample conversion -- a DImage the user chose to save as
+   // 16-bit, say -- or an alpha channel the save options discarded
+   // (Unknowns §6: the flag is kept accurate at all times regardless of when
+   // the core queries it).
+   //
+   // Since protocol v3 that no longer includes u32 or f64 OUTPUT: those bands
+   // cross shm and reach the file in their own type, exactly. Before phase 4
+   // both were narrowed to f32 and both reported lossy here; reporting them
+   // now would be as untrue as the capabilities were then. See
+   // ConversionIsLossy() for the full rule.
    return lossy_;
+}
+
+// ----------------------------------------------------------------------------
+
+ICCProfile BigTiffInstance::ReadICCProfile()
+{
+   // Called only while BigTiffFormat::CanStoreICCProfiles() is true, and only
+   // for an open file. An empty ICCProfile is the documented "no profile"
+   // answer (FileFormatImplementation.h:240-248), which is what a file
+   // without tag 34675 gets.
+   if ( !open_ || !read_mode_ )
+      throw Error( "BigTIFF: internal error: ReadICCProfile() called before a successful "
+                   "Open()." );
+   if ( read_icc_base64_.empty() )
+      return ICCProfile();
+
+   // The blob came from our own worker's standard-alphabet base64 encoder, so
+   // a failure here is an internal inconsistency or a corrupt profile in the
+   // file -- either way loud beats silent, since silently returning "no
+   // profile" would let a colour-managed image open as if it were untagged.
+   try
+   {
+      return ICCProfile( IsoString( read_icc_base64_.c_str() ).FromBase64() );
+   }
+   catch ( const Exception& e )
+   {
+      throw Error( String( "BigTIFF: the ICC profile embedded in '" ) + path_ +
+                   "' could not be decoded: " + e.Message() );
+   }
+}
+
+void BigTiffInstance::WriteICCProfile( const ICCProfile& icc )
+{
+   // PCL calls this before CreateImage() on the write path. Store the bytes;
+   // CreateImage() base64s them into the v3 Init. Arriving after the session
+   // exists would mean the profile could not reach the file, so say so
+   // rather than dropping it silently.
+   if ( session_ != nullptr )
+      throw Error( "BigTIFF: internal error: an ICC profile arrived after the image was "
+                   "created; it cannot be embedded." );
+   if ( icc.IsProfile() )
+      icc_profile_.assign( icc.ProfileData().Begin(), icc.ProfileData().End() );
+   else
+      icc_profile_.clear();   // an empty profile means "embed none"
 }
 
 // ----------------------------------------------------------------------------

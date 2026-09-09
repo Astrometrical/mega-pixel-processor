@@ -4,6 +4,7 @@
 
 #include "BigTiffInstance.h"
 #include "MppVersion.h"
+#include "TiffFormatOptions.h"
 
 namespace pcl
 {
@@ -109,28 +110,90 @@ bool BigTiffFormat::CanWriteIncrementally() const
 
 bool BigTiffFormat::CanStore32Bit() const
 {
-   // u32 saves are accepted and mapped u32/(2^32-1) into [0,1] f32 -- a
-   // documented precision reduction (behavioral contract mapping table).
+   // True, and now genuinely so: protocol v3 carries u32 bands natively and
+   // the writer emits 32-bit unsigned samples. Before phase 4 this was
+   // advertised while the value was narrowed to f32 -- exactly the
+   // truth-in-advertising violation this phase existed to fix.
    return true;
 }
 
 bool BigTiffFormat::CanStoreFloat() const
 {
-   return true;   // f32 is the native path (shm bands are f32)
+   return true;   // f32 bands and 32-bit float output, both exact
 }
 
 bool BigTiffFormat::CanStoreDouble() const
 {
-   // f64 saves are accepted and narrowed to f32 -- lossy, reported via
-   // BigTiffInstance::WasLossyWrite().
-   return true;
+   return true;   // f64 bands and 64-bit float output, both exact
 }
 
 bool BigTiffFormat::CanStoreAlphaChannels() const
 {
-   // The wire protocol (docs/pi-protocol.md §5) accepts channels == 1 or 3
-   // only, so alpha channels cannot be stored.
-   return false;
+   // Gray+alpha and RGBA write an ExtraSamples tag with the association the
+   // options dialog selected.
+   return true;
+}
+
+bool BigTiffFormat::CanStoreResolution() const
+{
+   return true;   // XResolution/YResolution/ResolutionUnit from ImageOptions
+}
+
+bool BigTiffFormat::CanStoreICCProfiles() const
+{
+   return true;   // tag 34675, written on save and read back on open
+}
+
+bool BigTiffFormat::SupportsCompression() const
+{
+   // The header names our exact case: "The optional ZIP and LZW compressions
+   // used in TIFF are the exact kind of compressions that must cause this
+   // member function to return true" (MetaFileFormat.h). The options dialog
+   // offers LZW, Deflate (the ZIP scheme) and PackBits, all applied to the
+   // source pixels per strip or tile, so true is the only honest answer.
+   //
+   // The exclusion in the same paragraph -- a format's own native scheme,
+   // as in JPEG or JPEG2000 -- does not apply: this format writes
+   // uncompressed pixel data unless the user asks for one of the three.
+   return true;
+}
+
+// ----------------------------------------------------------------------------
+
+bool BigTiffFormat::UsesFormatSpecificData() const
+{
+   // True, so the core round-trips our TiffFormatOptions block from
+   // BigTiffInstance::QueryOptions() into the SetFormatSpecificData() that
+   // precedes Create()/CreateImage() (MetaFileFormat.h:815-828,
+   // FileFormatImplementation.h:576-605). While this returns false,
+   // SetFormatSpecificData() is never called and the TIFF-specific half of
+   // the options dialog would be discarded.
+   return true;
+}
+
+bool BigTiffFormat::ValidateFormatSpecificData( const void* data ) const
+{
+   // The core knows nothing about these blocks and passes them among
+   // instances of *different* formats, so anything reaching us here may be a
+   // foreign pointer that must not be dereferenced as our own type. The
+   // magic/version check is the whole of the test, and it lives on the struct
+   // that owns the invariant.
+   return TiffFormatOptions::IsValid( data );
+}
+
+void BigTiffFormat::DisposeFormatSpecificData( void* data ) const
+{
+   // Ownership arrives here and ends here: this is the only place a block
+   // allocated by BigTiffInstance::QueryOptions() or FormatSpecificData() is
+   // released. The new and the delete are both inside this module, so the
+   // allocator matches.
+   //
+   // Gated on IsValid for the same reason Validate is: never call delete on a
+   // pointer that is not one of ours. A block that fails the test was not
+   // allocated by us, so declining to free it cannot leak anything we own.
+   if ( !TiffFormatOptions::IsValid( data ) )
+      return;
+   delete reinterpret_cast<TiffFormatOptions*>( data );
 }
 
 // ----------------------------------------------------------------------------

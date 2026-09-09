@@ -236,7 +236,11 @@ int main() {
       fail("output file is shorter than the BigTIFF magic");
     }
     // BigTIFF magic: "II" (little-endian byte order) + 0x2B 0x00 (BigTIFF
-    // version marker), per the TIFF6/BigTIFF public spec.
+    // version marker), per the TIFF6/BigTIFF public spec. BigTIFF is the
+    // right expectation because the output path above ends in `.tf8`, an
+    // extension that names BigTIFF specifically; the writer honours that
+    // over its usual under-4-GB default of classic TIFF. A `.tif` output
+    // this small would (correctly) be classic.
     const uint8_t kExpectedMagic[4] = {0x49, 0x49, 0x2B, 0x00};
     for (int i = 0; i < 4; ++i) {
       if (magic[i] != kExpectedMagic[i]) {

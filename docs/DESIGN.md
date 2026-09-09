@@ -139,7 +139,7 @@ distortion grids) do not bump it. Source of truth:
   (custom controls, navigator bottom-left, maxZoomPixelRatio 4,
   visibilityRatio 1). When a solution exists, center RA/Dec and pixel
   scale are baked into the page's telemetry footer at publish time (a
-  live WCS readout is phase-5 DeepSky work).
+  live WCS readout is phase-6 DeepSky work).
 - Universal viewer mode: `--mode single` / auto below 4096 px per side
   uses OSD's single-image source, no pyramid; oversize explicit-single
   warns and suggests DZI.
@@ -172,20 +172,21 @@ distortion grids) do not bump it. Source of truth:
      streams `Band` frames as bands arrive; `mpp::WriteSession` (the host
      driver) has no callback interfaces to implement, just a synchronous
      fill-a-slot/send/await-ack rhythm over a free-slot pool.
-   - **Sample-format mapping** (PI image type → wire `bit_depth`; every
-     `WriteSamples` buffer is normalized to f32 in `[0,1]` regardless of the
-     negotiated output format): `pcl::Image` (f32) → `"f32"` native;
+   - **Sample-format mapping** — *superseded by phase 4*, recorded as the
+     v1 shape (PI image type → wire `bit_depth`; every `WriteSamples` buffer
+     was normalized to f32 in `[0,1]` regardless of the negotiated output
+     format; protocol v3 replaced this with an identity mapping and native
+     bands): `pcl::Image` (f32) → `"f32"` native;
      `pcl::DImage` (f64) → `"f32"` narrowed (lossy, reported);
      `UInt8Image`/`UInt16Image` → `"u8"`/`"u16"` exact;
      `UInt32Image` → `"f32"` via `v/(2^32-1)` (lossy, reported). See
      `integration/pixinsight/README.md`'s mapping table for the full detail.
-   - **No-options v1**: no format-specific options dialog, no ICC/thumbnail/
-     property storage — the module advertises only what is true; a
-     FITS-keyword/property sidecar into BigTIFF remains a candidate for a
-     future, not-yet-assigned phase (phase 3, item 3 below, shipped read
-     support without it — see `integration/pixinsight/README.md`'s "Out of
-     scope" list), and the WCS sidecar stays `mpp`'s own JSON mechanism
-     regardless.
+   - **No-options v1** — *the options dialog and ICC storage arrived in
+     phase 4*: v1 shipped no format-specific options dialog and no
+     ICC/thumbnail/property storage, on the principle that the module
+     advertises only what is true. A FITS-keyword/property sidecar into
+     BigTIFF is still unbuilt (phase 5 below), and the WCS sidecar stays
+     `mpp`'s own JSON mechanism regardless.
    - **Manual-smoke verification boundary**: loading the module inside
      PixInsight is deliberately *not* automated. The machine-verifiable
      boundary is compile/link/symbol gates (zero warnings, no undefined
@@ -249,57 +250,191 @@ distortion grids) do not bump it. Source of truth:
      protocol change additive (new tags + one `Init` field) instead of a
      breaking redesign, and let the host/worker read-mode code reuse the
      write path's free-slot-pool pattern nearly verbatim.
-   - **Native fidelity on read, unlike the normalized write path.** Every
-     `WriteSamples` buffer is normalized to f32 in `[0,1]` (phase 2); reads
-     go the other way — a u16 file decodes into a `UInt16Image`, an f32 file
-     into a `pcl::Image`, with no forced conversion. `ImageMeta.bit_depth`
+   - **Native fidelity on read** — the contrast this bullet originally drew,
+     against a write path that normalized everything, was *abolished by
+     phase 4*: protocol v3 made the write direction native too, so there is
+     no longer an asymmetry to contrast against. What stands, unchanged: a
+     u16 file decodes into a `UInt16Image`, an f32 file into a `pcl::Image`,
+     with no forced conversion. `ImageMeta.bit_depth`
      (`docs/pi-protocol.md` §9.2) reports the file's own native sample
      format, which is why the module's `Open()` uses a geometry-probe worker
      run (`mpp-ipc-worker --probe`) to select the matching `ReadImage`
-     overload before any pixels move.
+     overload before any pixels move. As shipped in phase 3, every
+     `WriteSamples` buffer was still normalized to f32 in `[0,1]`, which is
+     the asymmetry phase 4's `band_format` closed.
    - **Extension additions, since superseded.** `.big.tiff`/`.big.tif` were
      added during phase 3 to close the "choosing BigTIFF in the save dialog
      appends `.big`, which nothing can reopen" gap (design spec finding 5)
      and to give Photoshop and PixInsight a shared bidirectional extension.
      Both were **withdrawn** afterwards — see "Stock TIFF replacement"
      below.
-4. **Stock TIFF replacement (decided 2026-09-09, implementation pending):**
-   the module now claims `.tif`/`.tiff` outright and **replaces** PixInsight's
-   stock TIFF module, which must be uninstalled first (design spec finding 1:
-   the core refuses a second format claiming an owned extension). The swap is
+4. **Stock TIFF replacement and TIFF parity (phase 4, complete):** the
+   module claims `.tif`/`.tiff` outright and **replaces** PixInsight's stock
+   TIFF module, which must be uninstalled first (design spec finding 1: the
+   core refuses a second format claiming an owned extension). The swap is
    reversible through Manage Modules / Install Modules; the procedure and its
    costs are in `integration/pixinsight/README.md`, "Replacing the stock TIFF
    module".
 
-   Forced by a Save As dialog behavior found while debugging a
-   "BigTIFF is missing from the format list" report: the dialog drops a
-   TIFF-family format whose extensions collide with those of the format
-   currently selected as the default. The compound `.big.tiff`/`.big.tif`
-   collided with the stock module's `*.tif`/`*.tiff`, so BigTIFF vanished
-   whenever TIFF was the default — for windows loaded from a `.big.tiff`, and
-   for non-file-backed windows after any TIFF save. Narrowing to
-   `.btf`/`.tf8` fixed the dialog but broke the Photoshop bridge, since
-   Photoshop recognises TIFF only by a `.tif`/`.tiff` tail. **No extension
-   set satisfies both while the stock module is installed**, so coexistence
-   was abandoned. Full investigation, including the hypotheses falsified
-   along the way, plus the parity gap this creates: `docs/tiff-parity.md`.
+   The replacement was forced by a Save As dialog behavior found while
+   debugging a "BigTIFF is missing from the format list" report: the dialog
+   drops a TIFF-family format whose extensions collide with those of the
+   format currently selected as the default. The compound `.big.tiff`/
+   `.big.tif` collided with the stock module's `*.tif`/`*.tiff`, so BigTIFF
+   vanished whenever TIFF was the default — for windows loaded from a
+   `.big.tiff`, and for non-file-backed windows after any TIFF save.
+   Narrowing to `.btf`/`.tf8` fixed the dialog but broke the Photoshop
+   bridge, since Photoshop recognises TIFF only by a `.tif`/`.tiff` tail.
+   **No extension set satisfies both while the stock module is installed**,
+   so coexistence was abandoned. Full investigation, including the
+   hypotheses falsified along the way: `docs/tiff-parity.md`.
 
-5. **DeepSky viewer components / platform hooks**: richer viewer (WCS
+   Displacing the stock module made parity mandatory rather than optional —
+   every remaining gap became a regression for anyone who swaps — so the
+   same phase closed it (design spec
+   `docs/superpowers/specs/2026-09-09-tiff-parity-design.md`, implementation
+   plan `docs/superpowers/plans/2026-09-09-tiff-parity.md`). A PixInsight
+   user saving a TIFF now chooses sample format, compression, container,
+   strips-vs-tiles, alpha association, an embedded ICC profile, resolution
+   and the three TIFF text tags, from an Astrometrical-branded options
+   dialog.
+
+   Decisions locked while landing this plan:
+   - **Hand-rolled IFD writer, not a fork of the `tiff` crate.** The crate's
+     `ImageEncoder` has no tile support, but every primitive it withholds is
+     public one layer down — `TiffEncoder::image_directory()`'s
+     `DirectoryEncoder` (`write_data()`/`write_tag()`), the
+     `encoder::compression` compressors, and `TiffKind`/`TiffKindStandard`/
+     `TiffKindBig` as a type parameter. So `mpp-core` writes IFDs itself
+     (`formats/tiff_write/`) on top of the crate's public API: strips **and**
+     tiles, classic **and** BigTIFF, five sample formats, 1–4 channels, four
+     compressors and the horizontal predictor all fall out of one generic
+     encode loop, with no vendored encoder to re-merge and no wait on
+     upstream. This falsified `docs/tiff-parity.md`'s framing of tiled write
+     as the schedule-driving item: it is the largest single piece of work,
+     but it is ordinary work.
+   - **Protocol v3 carries write bands in their native sample type.** Honest
+     `CanStore32Bit`/`CanStoreDouble` could not be fixed in the encoder
+     alone: every write band crossed shm as unit-range `f32`, and f32's
+     24-bit significand destroys u32 precision before `mpp-core` ever sees a
+     sample. `InitMessage` therefore gained `band_format`, describing the shm
+     payload's own type independently of `bit_depth` (the output file's), so
+     `u32` and `f64` reach the encoder intact. Fifteen new `Init` fields in
+     all, every one `#[serde(default)]`, so a v2 payload still parses into
+     exactly the v2 behaviour (`docs/pi-protocol.md` §10). This also closes a
+     standing asymmetry rather than inventing a mechanism — the read path has
+     carried native sample formats since phase 3.
+   - **`Container::Auto` is the default, and a `.btf`/`.tf8` tail overrides
+     it.** Owning `.tif`/`.tiff` meant every save was a BigTIFF wearing a
+     classic extension, which a good deal of older software will not open;
+     `Auto` writes classic TIFF while the uncompressed payload fits under
+     4 GiB (less a 16 MiB header/IFD allowance) and BigTIFF above it.
+     Compression only ever shrinks the payload, so `Auto` never
+     under-predicts. `.btf` and `.tf8` are container *declarations*, not
+     merely TIFF-family extensions, so under `Auto` they force BigTIFF at
+     any size — a classic TIFF inside a `.btf` would be a file whose name
+     lies about its contents. The override is scoped to `Auto` alone: an
+     explicit `Container::Classic` on a `.btf` path stays classic, because
+     the caller named the container outright and the writer does not
+     second-guess an explicit request. An explicit `Classic` on an
+     over-large image fails at option validation, before any pixels move.
+   - **Read policy: palette, YCbCr and planar in; CMYK and Lab out.** The
+     first three unwind exactly or by spec — `ColorMap` is a lookup table,
+     TIFF 6.0 §21 defines the YCbCr inverse in terms of the file's own
+     `YCbCrCoefficients`/`ReferenceBlackWhite`, and planar storage is a
+     mechanical de-interleave — so accepting them costs nothing in fidelity.
+     CMYK and Lab need ICC colour management this project does not have, and
+     an unmanaged conversion would silently misrepresent pixel values, which
+     is precisely what the linear-data discipline exists to prevent. They
+     keep an explicit rejection whose text says *why*, not just
+     "unsupported". Two of the analysis document's own premises were wrong
+     here and are recorded in `docs/tiff-parity.md` so nobody re-derives
+     them: the `tiff` crate refuses palette through every public path, and it
+     does not invert YCbCr — both had to be implemented in this repo.
+   - **Refuse rather than approximate, on read.** A YCbCr file declaring
+     coefficients the reader cannot honour, a degenerate `ReferenceBlackWhite`
+     (a channel with no coding range), and an unreadable ICC tag are all hard
+     errors now. A plausible-looking wrong image is worse than a refusal,
+     for the same reason CMYK is rejected.
+   - **The options dialog is branded, and that is the product requirement.**
+     `TiffOptionsDialog` follows MergeMosaic's `MmmInterface` idiom (a
+     `GUIData` control struct, `SectionBar` sections, HTML tooltips,
+     `e_`-prefixed handlers) and opens with the Astrometrical notice block —
+     chevron, "Mega Pixel Processor — TIFF Options", tagline, copyright and
+     the three links. A user who has swapped modules must be able to tell at
+     a glance which module is loaded; a dialog indistinguishable from the
+     stock one would make the swap invisible and its failure modes
+     unattributable.
+   - **No global format preferences.** `CanEditPreferences()` stays `false`:
+     one per-save dialog, defaults in code. Sticky defaults are a later
+     change if users ask for them, and shipping a preferences surface would
+     have added a second source of truth for every option before there was
+     any evidence one is wanted.
+   - **`CanStoreKeywords()` stays `false`.** TIFF has no FITS-keyword
+     equivalent, so answering `true` would be the same truth-in-advertising
+     violation this phase existed to fix. `ImageDescription`, `Copyright` and
+     `Software` are three specific tags and travel as format-specific data,
+     not as keywords.
+   - **The dialog has no automated test, by standing decision.** The
+     machine-verifiable boundary set in phase 2 is unchanged, and no gate in
+     this repo touches a PCL widget. The manual smoke procedure in
+     `integration/pixinsight/README.md` is therefore the *only* coverage the
+     dialog and the PixInsight integration will ever have; it is written as a
+     regression test (several steps would have failed before this phase, the
+     32-bit-integer round trip most pointedly) rather than a checklist of the
+     obvious, and it must be run before the branch is called done.
+
+   **User-visible behaviour changes**, recorded because they are easy to
+   miss and each is a support question waiting to happen:
+   - Small `.tif`/`.tiff` saves are now **classic TIFF**, where every save
+     used to be BigTIFF. `.btf`/`.tf8` still get BigTIFF at any size under
+     `Auto`; an explicit `Classic` on such a path is honoured as written.
+   - `u8`/`u16` output can differ from pre-phase-4 builds by 1 LSB: integer
+     scaling now goes through `f64`, which is strictly more accurate.
+   - Resolution tags are now written whenever both values are positive,
+     which in practice means always — PCL's `ImageOptions` defaults to
+     72 dpi. Previously none were written and the round trip lost them.
+   - `WasLossyWrite()` now reports `true` for an f32 source saved as
+     `u16`/`u8`, which it did not before, and no longer reports `true` for
+     the whole `u32`/`f64` category, which is no longer narrowed. It also
+     reports `true` when the save options discard the alpha channel: the
+     user asked for the drop, but a whole channel of the source is absent
+     from the file and calling that lossless would understate it.
+   - A palette file reports a `u16` sample format, because `ColorMap`
+     entries are 16-bit.
+   - The refusals listed above (YCbCr coefficients, `ReferenceBlackWhite`,
+     unreadable ICC tag) are new errors on files that previously either did
+     not open at all or would have been approximated.
+
+5. **Deferred from phase 4, not yet assigned a phase:** WCS sidecar readback
+   (reading a `.wcs.json` — or any other WCS source — back into PixInsight
+   FITS keywords on Open; the sidecar remains `mpp`'s own JSON mechanism);
+   incremental read (`ReadSamples`), which the core never drives; thumbnails,
+   image properties and general TIFF-tag ↔ FITS-keyword mapping; global
+   format preferences (`CanEditPreferences()`); non-blocking abort wiring
+   (the phase-2 limitation, still standing); JPEG-in-TIFF and Fax compression
+   on **write** (lossy compression is wrong for linear astro data); and CMYK
+   and Lab **read**, which stay refused until this project has colour
+   management. Also open: JPEG-compressed subsampled YCbCr on read is
+   currently *accepted* and untested — see `docs/tiff-parity.md`'s
+   "Remaining gaps".
+
+6. **DeepSky viewer components / platform hooks**: richer viewer (WCS
    readout, annotations, catalog overlays), possible hosted platform.
 
-## Licensing constraints (important — applies to the PixInsight module, phases 2-3)
+## Licensing constraints (important — applies to the PixInsight module, phases 2-4)
 
 - Our code: Apache-2.0.
 - **PCL License 2.0.1 (Dec 2025) added AI-use restrictions** ("expressly
   includes use via APIs, wrappers, or third-party tools"). Founding decision:
   **do not fork or even read PixInsight's TIFF module source** (or any PCL
   module implementation) in this project — AI-assisted or otherwise. The
-  module (both its phase-2 write path and its phase-3 read path) is
-  clean-room: designed from the BigTIFF spec, libtiff/vips documentation,
+  module (its phase-2 write path, its phase-3 read path, and phase 4's
+  options dialog and parity work alike) is clean-room: designed from the BigTIFF spec, libtiff/vips documentation,
   and the public PCL API only — the same link-against-the-API posture as
   MMM's existing mmm-pxm module. This provenance is recorded in the
   module's README (`integration/pixinsight/README.md`).
-- PCL-linked module code (phases 2-3) carries the PCL license compliance
+- PCL-linked module code (phases 2-4) carries the PCL license compliance
   set: retain notices, ship the license text, the verbatim acknowledgment
   sentence in end-user docs/NOTICE, no PixInsight/Pleiades endorsement
   implication, and clear scoping so PCL-licensed parts are separate from

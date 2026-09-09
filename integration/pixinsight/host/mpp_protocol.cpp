@@ -146,6 +146,11 @@ ImageMeta ParseImageMeta(const std::string& json) {
   meta.alpha = j.at("alpha").get<uint64_t>();
   meta.color_space = j.at("color_space").get<std::string>();
   meta.bit_depth = j.at("bit_depth").get<std::string>();
+  // (v3) Additive and optional: an older worker's ImageMeta JSON predates
+  // this field entirely, so default rather than `.at()` -- the same
+  // wire-compatibility rule InitMessage's own v3 fields follow, applied in
+  // the worker->host direction.
+  meta.icc_profile = j.value("icc_profile", std::string());
   return meta;
 }
 
@@ -247,6 +252,36 @@ std::vector<uint8_t> encode_init(const InitMessage& init) {
   j["slot_bytes"] = init.slot_bytes;
   j["slots"] = init.slots;
   j["mode"] = init.mode;
+
+  // ---- protocol v3 fields (docs/pi-protocol.md §10) --------------------
+  // Emitted unconditionally, even at their defaults: every one of them is
+  // `#[serde(default)]` on the worker side, so an omitted field and a field
+  // carrying its default value mean exactly the same thing, and spelling
+  // them all out keeps this encoder's output a total function of the
+  // InitMessage rather than of which members happen to differ from a
+  // default. `band_format` names the shm sample type; `bit_depth` above
+  // names the output file's -- see InitMessage's own doc comment for the
+  // coupling rule between them.
+  j["band_format"] = init.band_format;
+  j["container"] = init.container;
+  j["layout"] = init.layout;
+  j["tile_size"] = init.tile_size;
+  j["compression"] = init.compression;
+  // Widened to `unsigned` before assignment: uint8_t is a character type in
+  // an overload set, and encoding a deflate level as a JSON *string* (or a
+  // one-character string) instead of a number would be rejected by serde as
+  // a type error -- but only after a process spawn. The cast keeps it a JSON
+  // integer by construction.
+  j["deflate_level"] = static_cast<unsigned>(init.deflate_level);
+  j["predictor"] = init.predictor;
+  j["alpha"] = init.alpha;
+  j["icc_profile"] = init.icc_profile;
+  j["description"] = init.description;
+  j["copyright"] = init.copyright;
+  j["software"] = init.software;
+  j["x_resolution"] = init.x_resolution;
+  j["y_resolution"] = init.y_resolution;
+  j["resolution_unit"] = init.resolution_unit;
   return build_frame(static_cast<uint8_t>(HostTag::Init), j.dump());
 }
 

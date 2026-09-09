@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::formats::tiff::{BitDepth, TiffWriteOptions, write_bigtiff};
+use crate::formats::tiff_write::{BitDepth, Compression, Container, TiffWriteOptions, write_tiff};
 use crate::formats::xisf::XisfImage;
 use crate::wcs::sidecar::{WcsSidecar, sidecar_path};
 use crate::{Error, Result};
@@ -11,7 +11,7 @@ use crate::{Error, Result};
 /// Supported output containers, chosen by file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// BigTIFF, written natively by [`crate::formats::tiff`].
+    /// TIFF/BigTIFF, written natively by [`crate::formats::tiff_write`].
     BigTiff,
     /// PNG via vips `pngsave` (8/16-bit).
     Png,
@@ -48,10 +48,12 @@ impl OutputFormat {
         }
     }
 
-    /// Whether this container can hold samples of `depth`.
+    /// Whether this format can carry `depth`.
     pub fn allows(self, depth: BitDepth) -> bool {
         match self {
+            // BigTIFF carries every sample format the writer supports.
             Self::BigTiff => true,
+            // The vips-backed formats top out at 16-bit unsigned.
             Self::Png | Self::Jxl => matches!(depth, BitDepth::U16 | BitDepth::U8),
             Self::Jpeg | Self::Webp | Self::Avif => matches!(depth, BitDepth::U8),
         }
@@ -109,6 +111,10 @@ pub struct ConvertOptions {
     pub sidecar: bool,
     /// Lossy-format quality 1–100 (vips `Q`); error on lossless formats.
     pub quality: Option<u8>,
+    /// TIFF/BigTIFF writer options. Ignored for the vips-backed formats,
+    /// which have their own saver options; `bit_depth` above is the field
+    /// both paths share.
+    pub tiff: TiffWriteOptions,
 }
 
 impl Default for ConvertOptions {
@@ -117,6 +123,7 @@ impl Default for ConvertOptions {
             bit_depth: None,
             sidecar: true,
             quality: None,
+            tiff: TiffWriteOptions::default(),
         }
     }
 }
@@ -182,7 +189,7 @@ fn interchange_path(output: &Path) -> PathBuf {
 
 /// Convert `input` (XISF) to `output`, whose extension selects the
 /// [`OutputFormat`]: [`OutputFormat::BigTiff`] is written natively by
-/// [`write_bigtiff`], while png/jpg/webp/avif/jxl are produced by writing a
+/// [`write_tiff`], while png/jpg/webp/avif/jxl are produced by writing a
 /// temp BigTIFF interchange file next to the output and spawning `vips` to
 /// convert it to the final container, writing the WCS sidecar next to the
 /// output when the input carries an astrometric solution and `opts.sidecar`
@@ -205,7 +212,7 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
             if !format.allows(d) {
                 return Err(Error::format(
                     output,
-                    format!("{d:?} samples are not supported by {format:?} output"),
+                    format!("{d:?} bit depth is not supported by {format:?} output"),
                 ));
             }
             d
@@ -233,9 +240,14 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         ));
     }
     img.advise_sequential();
-    let tiff_opts = TiffWriteOptions { bit_depth: depth };
     match format {
-        OutputFormat::BigTiff => write_bigtiff(&img, output, &tiff_opts)?,
+        OutputFormat::BigTiff => {
+            let tiff_opts = TiffWriteOptions {
+                bit_depth: depth,
+                ..opts.tiff.clone()
+            };
+            write_tiff(&img, output, &tiff_opts)?
+        }
         _ => {
             let vips_bin = crate::vips::vips_available().ok_or_else(|| {
                 Error::format(
@@ -246,7 +258,21 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
             })?;
             let tmp = interchange_path(output);
             let _guard = TempFileGuard(tmp.clone());
-            write_bigtiff(&img, &tmp, &tiff_opts)?;
+            // This TIFF is a private handoff to vips, never a user-visible
+            // output: it must not honour the user's `--container` or
+            // `--compression` choice, only the resolved sample format vips
+            // needs to read back. Force BigTIFF (headroom for any image
+            // size) and no compression (vips reads every container/
+            // compression combination the writer can produce, but there is
+            // no reason to spend cycles compressing data that is about to
+            // be re-encoded).
+            let tiff_opts = TiffWriteOptions {
+                bit_depth: depth,
+                container: Container::Big,
+                compression: Compression::None,
+                ..opts.tiff.clone()
+            };
+            write_tiff(&img, &tmp, &tiff_opts)?;
             let dest_spec = format!(
                 "{}{}",
                 output.display(),
@@ -504,6 +530,20 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vips_formats_reject_wide_sample_formats() {
+        use crate::formats::tiff::BitDepth;
+        // BigTIFF is the only output that can carry u32 or f64 samples; the
+        // vips-backed formats top out at u16, so widening BitDepth must not
+        // silently make `--bit-depth f64 --format png` legal.
+        assert!(OutputFormat::BigTiff.allows(BitDepth::U32));
+        assert!(OutputFormat::BigTiff.allows(BitDepth::F64));
+        assert!(!OutputFormat::Png.allows(BitDepth::U32));
+        assert!(!OutputFormat::Png.allows(BitDepth::F64));
+        assert!(!OutputFormat::Jpeg.allows(BitDepth::U32));
+        assert!(!OutputFormat::Jxl.allows(BitDepth::F64));
     }
 
     #[test]

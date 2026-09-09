@@ -7,7 +7,7 @@
 //! Public API surface:
 //!
 //! - [`formats`] — image readers/writers: native XISF reading and
-//!   strip-streaming BigTIFF writing; vips-backed mainstream-format export
+//!   strip-streaming TIFF/BigTIFF writing; vips-backed mainstream-format export
 //!   (PNG/JPEG/WebP/AVIF/JXL, via [`vips`]) and DZI tile-pyramid export are
 //!   both implemented today.
 //! - [`wcs`] — astrometric solutions: the linear WCS model, extraction

@@ -4,9 +4,10 @@
 //! host doing it — implements every lifecycle arm of the wire protocol:
 //! successful writes (grayscale f32 and RGB u16, in-order and shuffled band
 //! delivery), incomplete-coverage rejection, version-mismatch rejection,
-//! cancellation cleanup, oversize-band rejection, host-gone cleanup, and
+//! cancellation cleanup, oversize-band rejection, host-gone cleanup,
 //! (Task 3) rejecting a read-direction `ReadBandAck` reply on a write
-//! session.
+//! session, and (protocol v3) native-sample-type bands plus the widened
+//! write options reaching the encoder.
 //!
 //! The reference host role (creating the shm segment, driving `Init` →
 //! `Band`… → `Finish`/`Cancel`, checking the child's exit code against its
@@ -28,7 +29,7 @@ use mpp_ipc::protocol::{
 use mpp_ipc::shm::ShmSegment;
 use mpp_ipc::testhost::{
     TestHostConfig, run_cancel_after_first_band, run_oversize_band_session, run_write_session,
-    run_write_session_incomplete, run_write_session_shuffled,
+    run_write_session_incomplete, run_write_session_shuffled, run_write_session_typed,
 };
 use tiff::decoder::{Decoder, DecodingResult};
 
@@ -60,14 +61,18 @@ fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// BigTIFF magic: little-endian "II", version 43 (0x2B) — `tiff.rs`'s own
-/// unit tests check the same bytes.
-fn assert_bigtiff_magic(path: &Path) {
+/// Classic TIFF magic: little-endian "II", version 42 (0x2A).
+///
+/// The worker leaves `Container::Auto`, so these small test images come out
+/// as classic TIFF; the container is not what these tests are about, they
+/// just need the output to be a TIFF the decoder below can open. BigTIFF is
+/// covered by `mpp`'s `big_smoke` test, which writes a real >4 GB payload.
+fn assert_tiff_magic(path: &Path) {
     let head = std::fs::read(path).unwrap();
     assert_eq!(
         &head[0..4],
-        &[0x49, 0x49, 0x2B, 0x00],
-        "expected BigTIFF magic bytes at the start of {}",
+        &[0x49, 0x49, 0x2A, 0x00],
+        "expected classic TIFF magic bytes at the start of {}",
         path.display()
     );
 }
@@ -79,7 +84,7 @@ fn assert_bigtiff_magic(path: &Path) {
 /// 64x48x1, f32, `band_rows: 7` — doesn't divide 48 (48 = 6*7 + 6), so the
 /// last band of the run is a genuine partial band. Every decoded sample
 /// must equal `pixel(y, x)` exactly: f32 is passthrough end to end (shm →
-/// staging → BigTIFF), so there is no rounding to tolerate.
+/// staging → TIFF), so there is no rounding to tolerate.
 #[test]
 fn gray_f32_roundtrip() {
     let dir = tmpdir("gray-f32");
@@ -88,18 +93,20 @@ fn gray_f32_roundtrip() {
     let pixel = |_c: u64, y: u64, x: u64| ((y * width + x) as f32) / (width as f32 * height as f32);
 
     let cfg = TestHostConfig {
-        worker_exe: env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
-        output_path: out.clone(),
-        width,
-        height,
-        channels: 1,
         bit_depth: "f32".to_string(),
         band_rows: 7,
         slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            1,
+        )
     };
     run_write_session(&cfg, pixel).expect("write session should succeed");
 
-    assert_bigtiff_magic(&out);
+    assert_tiff_magic(&out);
     let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
     assert_eq!(dec.dimensions().unwrap(), (width as u32, height as u32));
     match dec.read_image().unwrap() {
@@ -137,18 +144,20 @@ fn rgb_u16_roundtrip() {
     };
 
     let cfg = TestHostConfig {
-        worker_exe: env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
-        output_path: out.clone(),
-        width,
-        height,
-        channels,
         bit_depth: "u16".to_string(),
         band_rows: 8,
         slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            channels,
+        )
     };
     run_write_session(&cfg, pixel).expect("write session should succeed");
 
-    assert_bigtiff_magic(&out);
+    assert_tiff_magic(&out);
     let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
     assert_eq!(dec.dimensions().unwrap(), (width as u32, height as u32));
     match dec.read_image().unwrap() {
@@ -158,7 +167,13 @@ fn rgb_u16_roundtrip() {
                 for x in 0..width {
                     for c in 0..channels {
                         let idx = ((y * width + x) * channels + c) as usize;
-                        let expected = (pixel(c, y, x).clamp(0.0, 1.0) * 65535.0).round() as u16;
+                        // Mirror `Sample::from_unit_f32`, which scales in
+                        // f64. The old f32 product rounded a value a hair
+                        // below .5 (54612.4987 here) up to exactly 54612.5
+                        // and then away from zero, giving a 1-LSB-high
+                        // answer; scaling in f64 does not.
+                        let expected =
+                            (f64::from(pixel(c, y, x).clamp(0.0, 1.0)) * 65535.0).round() as u16;
                         assert_eq!(
                             data[idx], expected,
                             "mismatch at row {y} col {x} channel {c}"
@@ -180,7 +195,7 @@ fn rgb_u16_roundtrip() {
 /// Same geometry/pixel formula as `gray_f32_roundtrip`, but driven through
 /// `run_write_session_shuffled` (bands sent in reverse order). The
 /// worker's staging file reassembles arbitrary-order bands into the same
-/// planar layout regardless of arrival order, so the resulting BigTIFF
+/// planar layout regardless of arrival order, so the resulting TIFF
 /// must be byte-for-byte identical to the in-order run.
 #[test]
 fn shuffled_band_order() {
@@ -191,14 +206,16 @@ fn shuffled_band_order() {
     let pixel = |_c: u64, y: u64, x: u64| ((y * width + x) as f32) / (width as f32 * height as f32);
 
     let cfg_in_order = TestHostConfig {
-        worker_exe: env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
-        output_path: out_in_order.clone(),
-        width,
-        height,
-        channels: 1,
         bit_depth: "f32".to_string(),
         band_rows: 7,
         slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out_in_order.clone(),
+            width,
+            height,
+            1,
+        )
     };
     let cfg_shuffled = TestHostConfig {
         output_path: out_shuffled.clone(),
@@ -209,7 +226,7 @@ fn shuffled_band_order() {
     run_write_session_shuffled(&cfg_shuffled, pixel)
         .expect("shuffled write session should succeed");
 
-    assert_bigtiff_magic(&out_shuffled);
+    assert_tiff_magic(&out_shuffled);
     let in_order_bytes = std::fs::read(&out_in_order).unwrap();
     let shuffled_bytes = std::fs::read(&out_shuffled).unwrap();
     assert_eq!(
@@ -237,14 +254,16 @@ fn incomplete_coverage_errors() {
     let pixel = |_c: u64, y: u64, x: u64| ((y * width + x) as f32) / (width as f32 * height as f32);
 
     let cfg = TestHostConfig {
-        worker_exe: env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
-        output_path: out.clone(),
-        width,
-        height,
-        channels: 1,
         bit_depth: "f32".to_string(),
         band_rows,
         slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            1,
+        )
     };
 
     // 7 bands total (48 = 6*7 + 6); send half, leaving rows 21..48 uncovered.
@@ -309,6 +328,7 @@ fn version_mismatch_errors() {
         slot_bytes: 128,
         slots: 1,
         mode: SessionMode::Write,
+        ..Default::default()
     };
     assert_ne!(init.protocol_version, IPC_PROTOCOL_VERSION);
     let payload = serde_json::to_vec(&init).unwrap();
@@ -342,14 +362,16 @@ fn cancel_cleans_up() {
     let dir = tmpdir("cancel");
     let out = dir.join("out.tif");
     let cfg = TestHostConfig {
-        worker_exe: env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
-        output_path: out.clone(),
-        width: 32,
-        height: 24,
-        channels: 1,
         bit_depth: "f32".to_string(),
         band_rows: 6,
         slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            32,
+            24,
+            1,
+        )
     };
 
     run_cancel_after_first_band(&cfg).expect("cancel session should report cancellation cleanly");
@@ -383,14 +405,16 @@ fn oversize_band_rejected() {
     let pixel = |_c: u64, y: u64, x: u64| ((y * width + x) as f32) / (width as f32 * height as f32);
 
     let cfg = TestHostConfig {
-        worker_exe: env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
-        output_path: out.clone(),
-        width,
-        height,
-        channels: 1,
         bit_depth: "f32".to_string(),
         band_rows,
         slots: 1,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            1,
+        )
     };
 
     // A real band needs band_rows * width * 4 = 8 * 32 * 4 = 1024 bytes;
@@ -461,6 +485,7 @@ fn host_gone_cleans_up() {
         slot_bytes,
         slots,
         mode: SessionMode::Write,
+        ..Default::default()
     };
     let init_payload = serde_json::to_vec(&init).unwrap();
     write_frame(&mut stdin, tag::INIT, &init_payload).expect("write Init frame");
@@ -591,6 +616,7 @@ fn read_band_ack_on_write_session_errors() {
         slot_bytes,
         slots,
         mode: SessionMode::Write,
+        ..Default::default()
     };
     let payload = serde_json::to_vec(&init).unwrap();
     write_frame(&mut stdin, tag::INIT, &payload).expect("write Init frame");
@@ -634,6 +660,258 @@ fn read_band_ack_on_write_session_errors() {
         leftovers.is_empty(),
         "staging file(s) left behind: {leftovers:?}"
     );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 10. u32_bands_reach_the_file_bit_exact
+// ---------------------------------------------------------------------------
+
+/// Protocol v3's reason for existing: `u32` samples must survive the trip
+/// through shm unchanged, including values `f32` cannot represent.
+///
+/// 16_777_217 is the first integer above `f32`'s 24-bit mantissa and
+/// 4_000_000_001 is past `f32`'s integer resolution entirely, so this fails
+/// loudly the moment a band is routed through the unit-range `f32` domain —
+/// which is exactly what the worker used to do unconditionally.
+#[test]
+fn u32_bands_reach_the_file_bit_exact() {
+    let dir = tmpdir("e2e-u32");
+    let out = dir.join("out.tif");
+    let values: Vec<u32> = vec![0, 1, 16_777_217, 4_000_000_001, u32::MAX, 42];
+
+    let cfg = TestHostConfig {
+        bit_depth: "u32".to_string(),
+        band_format: "u32".to_string(),
+        band_rows: 1,
+        slots: 1,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            values.len() as u64,
+            1,
+            1,
+        )
+    };
+    let bytes_written = run_write_session_typed(&cfg, |_c, _y, x: u64| values[x as usize])
+        .expect("u32 write session should succeed");
+    assert!(bytes_written > 0);
+
+    let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+    match dec.read_image().unwrap() {
+        DecodingResult::U32(data) => assert_eq!(data, values),
+        other => panic!("expected U32 samples, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 11. f64_bands_reach_the_file_bit_exact
+// ---------------------------------------------------------------------------
+
+/// The other half of the v3 promise: `f64` samples reach the file with
+/// their full mantissa. `f64::consts::PI` and `1.0 + f64::EPSILON` both
+/// collapse to a different value if they pass through `f32`, so a
+/// regression to the old behaviour is a hard failure, not a rounding
+/// tolerance question.
+#[test]
+fn f64_bands_reach_the_file_bit_exact() {
+    let dir = tmpdir("e2e-f64");
+    let out = dir.join("out.tif");
+    let values: Vec<f64> = vec![
+        std::f64::consts::PI,
+        1.0 + f64::EPSILON,
+        -1.0e300,
+        1.0 / 3.0,
+    ];
+
+    let cfg = TestHostConfig {
+        bit_depth: "f64".to_string(),
+        band_format: "f64".to_string(),
+        band_rows: 1,
+        slots: 1,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            values.len() as u64,
+            1,
+            1,
+        )
+    };
+    run_write_session_typed(&cfg, |_c, _y, x: u64| values[x as usize])
+        .expect("f64 write session should succeed");
+
+    let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+    match dec.read_image().unwrap() {
+        DecodingResult::F64(data) => assert_eq!(data, values),
+        other => panic!("expected F64 samples, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 12. a_tiled_compressed_write_session_produces_a_tiled_file
+// ---------------------------------------------------------------------------
+
+/// The v3 `Init` write options are not decoration: `layout: "tiles"`,
+/// `tile_size: 128` and `compression: "lzw"` must reach
+/// `TiffWriteOptions` and show up as real tags in the output file. 300x200
+/// is deliberately not a multiple of 128, so the encoder also has to handle
+/// partial edge tiles.
+#[test]
+fn a_tiled_compressed_write_session_produces_a_tiled_file() {
+    let dir = tmpdir("e2e-tiled");
+    let out = dir.join("out.tif");
+    let (width, height) = (300u64, 200u64);
+    let pixel = |_c: u64, y: u64, x: u64| ((y * width + x) as f32) / (width as f32 * height as f32);
+
+    let cfg = TestHostConfig {
+        layout: "tiles".to_string(),
+        tile_size: 128,
+        compression: "lzw".to_string(),
+        band_rows: 32,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            1,
+        )
+    };
+    let bytes_written = run_write_session(&cfg, pixel).expect("tiled write session should succeed");
+    assert!(bytes_written > 0);
+
+    let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(dec.get_tag_u64(tiff::tags::Tag::TileWidth).unwrap(), 128);
+    assert_eq!(dec.get_tag_u64(tiff::tags::Tag::TileLength).unwrap(), 128);
+    // TIFF compression 5 = LZW.
+    assert_eq!(dec.get_tag_u64(tiff::tags::Tag::Compression).unwrap(), 5);
+    match dec.read_image().unwrap() {
+        DecodingResult::F32(data) => {
+            assert_eq!(data.len(), (width * height) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * width + x) as usize;
+                    assert_eq!(data[idx], pixel(0, y, x), "mismatch at row {y} col {x}");
+                }
+            }
+        }
+        other => panic!("expected F32 samples, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 13. text_and_resolution_tags_reach_the_file
+// ---------------------------------------------------------------------------
+
+/// The remaining v3 metadata options make it from `Init` into the IFD:
+/// `ImageDescription`, `Copyright`, `Software` and the resolution pair.
+#[test]
+fn text_and_resolution_tags_reach_the_file() {
+    let dir = tmpdir("e2e-tags");
+    let out = dir.join("out.tif");
+    let cfg = TestHostConfig {
+        description: "M31 mosaic".to_string(),
+        copyright: "Copyright (c) 2026 Astrometrical".to_string(),
+        software: "Mega Pixel Processor".to_string(),
+        x_resolution: 300.0,
+        y_resolution: 300.0,
+        band_rows: 8,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            16,
+            8,
+            1,
+        )
+    };
+    run_write_session(&cfg, |_c, _y, _x| 0.5).expect("write session should succeed");
+
+    let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(
+        dec.get_tag_ascii_string(tiff::tags::Tag::ImageDescription)
+            .unwrap(),
+        "M31 mosaic"
+    );
+    assert_eq!(
+        dec.get_tag_ascii_string(tiff::tags::Tag::Copyright)
+            .unwrap(),
+        "Copyright (c) 2026 Astrometrical"
+    );
+    assert_eq!(
+        dec.get_tag_ascii_string(tiff::tags::Tag::Software).unwrap(),
+        "Mega Pixel Processor"
+    );
+    // ResolutionUnit 2 = inch.
+    assert_eq!(dec.get_tag_u64(tiff::tags::Tag::ResolutionUnit).unwrap(), 2);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 14. u8_bands_reach_the_file_bit_exact
+// ---------------------------------------------------------------------------
+
+/// The last of the five `band_format`s to get an end-to-end exercise, and
+/// the narrowest: `u8` bands must reach the file as 8-bit samples, byte for
+/// byte, with `BitsPerSample = 8`.
+///
+/// Narrow rather than wide is the risk here. A `u8` band is one byte per
+/// sample, so every stride, slot-size and staging calculation the worker
+/// makes is at its smallest — an off-by-one that a 4-byte `f32` band
+/// absorbs (its rows are 4x longer than the slot's alignment unit) shows up
+/// immediately at width 1. Multiple rows and a 3-row image over a 2-row
+/// band deliberately force a partial final band.
+#[test]
+fn u8_bands_reach_the_file_bit_exact() {
+    let dir = tmpdir("e2e-u8");
+    let out = dir.join("out.tif");
+    let (width, height) = (5u64, 3u64);
+    // Both endpoints of the range plus the two values a signed/unsigned mix-up
+    // would corrupt (0x80 and 0xFF).
+    let value = |y: u64, x: u64| -> u8 {
+        const PATTERN: [u8; 15] = [
+            0, 1, 127, 128, 255, 2, 254, 64, 192, 3, 253, 65, 191, 4, 252,
+        ];
+        PATTERN[(y * width + x) as usize]
+    };
+
+    let cfg = TestHostConfig {
+        bit_depth: "u8".to_string(),
+        band_format: "u8".to_string(),
+        band_rows: 2,
+        slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            1,
+        )
+    };
+    let bytes_written = run_write_session_typed(&cfg, |_c, y: u64, x: u64| value(y, x))
+        .expect("u8 write session should succeed");
+    assert!(bytes_written > 0);
+
+    let expected: Vec<u8> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| value(y, x)))
+        .collect();
+
+    let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(dec.dimensions().unwrap(), (width as u32, height as u32));
+    assert_eq!(
+        dec.get_tag_u64_vec(tiff::tags::Tag::BitsPerSample).unwrap(),
+        vec![8]
+    );
+    match dec.read_image().unwrap() {
+        DecodingResult::U8(data) => assert_eq!(data, expected),
+        other => panic!("expected U8 samples, got {other:?}"),
+    }
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

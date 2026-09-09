@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::convert::{TempFileGuard, unique_temp};
-use crate::formats::tiff::{BitDepth, TiffWriteOptions, write_bigtiff};
+use crate::formats::tiff_write::{BitDepth, TiffWriteOptions, write_tiff};
 use crate::formats::xisf::XisfImage;
 use crate::viewer::{ViewerParams, emit_viewer};
 use crate::vips::{vips_available, vips_dzsave, vips_msb, vipsheader_field};
@@ -225,11 +225,12 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
             let wcs = crate::wcs::from_xisf_properties(&img.header().properties);
             let tmp = unique_temp(outdir, &stem, "tif");
             let guard = TempFileGuard(tmp.clone());
-            write_bigtiff(
+            write_tiff(
                 &img,
                 &tmp,
                 &TiffWriteOptions {
                     bit_depth: BitDepth::U8,
+                    ..Default::default()
                 },
             )?;
             (tmp, img.width(), img.height(), wcs, Some(guard))
@@ -436,11 +437,12 @@ mod tests {
         synth_xisf(&x, 32, 16, 1, false);
         let img = crate::formats::xisf::XisfImage::open(&x).unwrap();
         let t16 = dir.join("plain.tif");
-        crate::formats::tiff::write_bigtiff(
+        crate::formats::tiff_write::write_tiff(
             &img,
             &t16,
-            &crate::formats::tiff::TiffWriteOptions {
-                bit_depth: crate::formats::tiff::BitDepth::U16,
+            &TiffWriteOptions {
+                bit_depth: BitDepth::U16,
+                ..Default::default()
             },
         )
         .unwrap();

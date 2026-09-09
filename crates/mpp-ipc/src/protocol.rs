@@ -1,4 +1,4 @@
-//! Wire protocol v2 between the PixInsight host and `mpp-ipc-worker`.
+//! Wire protocol v3 between the PixInsight host and `mpp-ipc-worker`.
 //!
 //! One control-channel frame is `[u8 tag][u32 LE payload_len][payload
 //! bytes]` ([`write_frame`] / [`read_frame`]). `Band` frames (the hot path)
@@ -14,6 +14,22 @@
 //! [`ImageMeta`] (tag [`tag::IMAGE_META`]) and request bands via
 //! [`tag::READ_BAND`] (reusing [`BandHeader`]'s 20-byte layout), acked by
 //! the host with [`tag::READ_BAND_ACK`].
+//!
+//! Version 3 widens [`InitMessage`] only — no new tag, no changed binary
+//! layout. [`InitMessage::band_format`] names the sample type the host
+//! places in shm slots, separating it from [`InitMessage::bit_depth`] (the
+//! *output file's* sample format): before v3 every band crossed shm as
+//! unit-range `f32`, whose 24-bit mantissa destroys `u32` values and
+//! truncates `f64` ones. The two fields are coupled by one rule a mirroring
+//! host must reproduce — `band_format` must equal `bit_depth` unless it is
+//! `"f32"`, the one domain the writer converts from; see
+//! [`InitMessage::band_format`]. The rest of the v3 fields carry the TIFF
+//! writer's full option set (container, layout, compression, alpha, ICC
+//! profile, text tags, resolution). Every v3 field is `#[serde(default)]`,
+//! so a v2 host's `Init` payload still deserializes into exactly the v2
+//! behaviour — and a field documented as ignored (`deflate_level` off
+//! Deflate, `tile_size` off `"tiles"`) is genuinely ignored, never
+//! validated, so an unset host-side default cannot reject a run.
 
 use std::io::{self, Read, Write};
 
@@ -22,7 +38,7 @@ use serde::{Deserialize, Serialize};
 /// Wire-protocol version. Bumped on any wire-format change (new tag,
 /// reordered/resized binary field, renamed/retyped JSON field, changed
 /// lifecycle rule) — see `docs/pi-protocol.md` §8.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 
 /// Frame tag constants. Host→worker tags start at 128; worker→host tags are
 /// small integers 1–6 (a debugging convenience for spotting a mixed-up
@@ -93,9 +109,13 @@ pub struct InitMessage {
     pub width: u64,
     /// Image height in pixels.
     pub height: u64,
-    /// Channel count: `1` (mono) or `3` (RGB).
+    /// Channel count: `1` (gray), `2` (gray+alpha), `3` (RGB) or `4`
+    /// (RGBA); 2 and 4 require an [`InitMessage::alpha`] association.
     pub channels: u64,
-    /// Output sample format: `"f32"`, `"u16"`, or `"u8"`.
+    /// Output sample format: `"f32"`, `"f64"`, `"u32"`, `"u16"`, or
+    /// `"u8"`. Names the *file's* sample format; the shm sample type is
+    /// [`InitMessage::band_format`], which must equal this field unless it
+    /// is `"f32"` (see its coupling rule).
     pub bit_depth: String,
     /// Name of the shm segment the host already created.
     pub shm_name: String,
@@ -107,12 +127,182 @@ pub struct InitMessage {
     /// Which direction this session runs: [`SessionMode::Write`] (the v1
     /// host-push flow) or [`SessionMode::Read`] (the v2 worker-pull flow).
     /// Absent in v1 `Init` JSON, which defaults to [`SessionMode::Write`]
-    /// for wire-compat. Placed last so existing positional/partial
-    /// constructors keep compiling as far as field order goes (the field
-    /// must still be listed explicitly since `InitMessage` has no
-    /// `Default` impl of its own).
+    /// for wire-compat. The v2 and v3 fields are appended after the v1
+    /// ones so field order never changes under a version bump; a partial
+    /// constructor can fill the rest from
+    /// [`InitMessage::default`](InitMessage::default).
     #[serde(default)]
     pub mode: SessionMode,
+
+    /// **(v3)** Sample type of the pixel data the host places in shm slots:
+    /// `"f32"` (the v1/v2 behaviour and the default), `"f64"`, `"u8"`,
+    /// `"u16"` or `"u32"`. Absent in a v2 payload, which defaults to
+    /// `"f32"`.
+    ///
+    /// This is a *separate* field from [`InitMessage::bit_depth`] — this one
+    /// names the shm sample type, that one names the output file's — but the
+    /// two are not free of each other. **Coupling rule:** `band_format` must
+    /// equal `bit_depth`, unless `band_format` is `"f32"`, which may target
+    /// any `bit_depth`. A native (non-`"f32"`) band is written to the file
+    /// verbatim, which is the entire point of v3 — there is no round trip
+    /// through `f32` to lose bits in, and equally no conversion available if
+    /// the two disagree. `"f32"` is the one sample domain the writer converts
+    /// from, so an `"f32"` session keeps the v1/v2 freedom to pick any output
+    /// format. The worker rejects a violating `Init` up front, before it
+    /// stages a single band.
+    #[serde(default = "default_band_format")]
+    pub band_format: String,
+
+    /// **(v3)** TIFF container: `"auto"` (default), `"classic"` or `"big"`.
+    #[serde(default = "default_container")]
+    pub container: String,
+
+    /// **(v3)** Block layout: `"strips"` (default) or `"tiles"`.
+    #[serde(default = "default_layout")]
+    pub layout: String,
+
+    /// **(v3)** Tile edge in pixels when `layout == "tiles"`; a power of two
+    /// in `128..=1024`. Ignored for `"strips"`.
+    #[serde(default = "default_tile_size")]
+    pub tile_size: u32,
+
+    /// **(v3)** Block compression: `"none"` (default), `"lzw"`, `"deflate"`
+    /// or `"packbits"`.
+    #[serde(default = "default_compression")]
+    pub compression: String,
+
+    /// **(v3)** Deflate level 1-9; ignored unless `compression == "deflate"`.
+    #[serde(default = "default_deflate_level")]
+    pub deflate_level: u8,
+
+    /// **(v3)** Apply the horizontal differencing predictor. Rejected for a
+    /// floating-point `bit_depth`.
+    #[serde(default)]
+    pub predictor: bool,
+
+    /// **(v3)** Alpha association: `"none"` (default), `"unassociated"` or
+    /// `"associated"`. Must agree with `channels` in both directions.
+    #[serde(default = "default_alpha")]
+    pub alpha: String,
+
+    /// **(v3)** Base64-encoded ICC profile to embed, empty when absent.
+    /// Capped at 16 MiB decoded.
+    #[serde(default)]
+    pub icc_profile: String,
+
+    /// **(v3)** `ImageDescription` (TIFF tag 270), empty when absent.
+    #[serde(default)]
+    pub description: String,
+
+    /// **(v3)** `Copyright` (TIFF tag 33432), empty when absent.
+    #[serde(default)]
+    pub copyright: String,
+
+    /// **(v3)** `Software` (TIFF tag 305), empty when absent.
+    #[serde(default)]
+    pub software: String,
+
+    /// **(v3)** Horizontal resolution in pixels per
+    /// [`InitMessage::resolution_unit`]; `0` means unknown and writes no
+    /// resolution tags.
+    #[serde(default)]
+    pub x_resolution: f64,
+
+    /// **(v3)** Vertical resolution; see [`InitMessage::x_resolution`].
+    #[serde(default)]
+    pub y_resolution: f64,
+
+    /// **(v3)** Resolution unit: `"inch"` (default) or `"cm"`.
+    #[serde(default = "default_resolution_unit")]
+    pub resolution_unit: String,
+}
+
+/// Every field at its wire default, so a constructor (a host, a test) can
+/// spell out only what it means to set: `InitMessage { width: 4096,
+/// ..Default::default() }`.
+///
+/// The `#[serde(default)]` fields take exactly the values a v2 payload
+/// deserializes to, and [`InitMessage::protocol_version`] takes
+/// [`IPC_PROTOCOL_VERSION`]. The fields with no meaningful default —
+/// `worker_version`, `output_path`, `shm_name`, the geometry, and the slot
+/// geometry — come back empty or zero, which every validator in the worker
+/// rejects loudly rather than running on.
+impl Default for InitMessage {
+    fn default() -> Self {
+        Self {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            worker_version: String::new(),
+            output_path: String::new(),
+            width: 0,
+            height: 0,
+            channels: 0,
+            bit_depth: "f32".to_string(),
+            shm_name: String::new(),
+            slot_bytes: 0,
+            slots: 0,
+            mode: SessionMode::Write,
+            band_format: default_band_format(),
+            container: default_container(),
+            layout: default_layout(),
+            tile_size: default_tile_size(),
+            compression: default_compression(),
+            deflate_level: default_deflate_level(),
+            predictor: false,
+            alpha: default_alpha(),
+            icc_profile: String::new(),
+            description: String::new(),
+            copyright: String::new(),
+            software: String::new(),
+            x_resolution: 0.0,
+            y_resolution: 0.0,
+            resolution_unit: default_resolution_unit(),
+        }
+    }
+}
+
+/// Default [`InitMessage::band_format`]: `"f32"`, the v1/v2 shm sample type.
+fn default_band_format() -> String {
+    "f32".to_string()
+}
+
+/// Default [`InitMessage::container`]: `"auto"`, classic TIFF until the
+/// payload no longer fits one.
+fn default_container() -> String {
+    "auto".to_string()
+}
+
+/// Default [`InitMessage::layout`]: `"strips"`, the v1/v2 behaviour.
+fn default_layout() -> String {
+    "strips".to_string()
+}
+
+/// Default [`InitMessage::tile_size`]: 256 pixels per edge. Only consulted
+/// when `layout == "tiles"`, which is never the case for a defaulted
+/// (v2) payload.
+fn default_tile_size() -> u32 {
+    256
+}
+
+/// Default [`InitMessage::compression`]: `"none"`, the v1/v2 behaviour.
+fn default_compression() -> String {
+    "none".to_string()
+}
+
+/// Default [`InitMessage::deflate_level`]: 6, matching
+/// `TiffWriteOptions::effective_deflate_level`'s own default.
+fn default_deflate_level() -> u8 {
+    6
+}
+
+/// Default [`InitMessage::alpha`]: `"none"`, no alpha channel.
+fn default_alpha() -> String {
+    "none".to_string()
+}
+
+/// Default [`InitMessage::resolution_unit`]: `"inch"` (TIFF
+/// `ResolutionUnit = 2`).
+fn default_resolution_unit() -> String {
+    "inch".to_string()
 }
 
 /// Worker→host `Progress` message (tag [`tag::PROGRESS`]).
@@ -158,6 +348,13 @@ pub struct ImageMeta {
     pub color_space: String,
     /// Sample format: `"u8"`, `"u16"`, `"u32"`, `"f32"`, or `"f64"`.
     pub bit_depth: String,
+    /// **(v3)** Base64-encoded embedded ICC profile, empty when the file
+    /// has none. Mirrors [`InitMessage::icc_profile`]'s encoding, in the
+    /// other direction: the worker read this off the file rather than the
+    /// host asserting it. `#[serde(default)]` so an older worker's
+    /// `ImageMeta` (no such field at all) still parses.
+    #[serde(default)]
+    pub icc_profile: String,
 }
 
 /// Host→worker `Band` frame payload (tag [`tag::BAND`]): names one
@@ -278,6 +475,7 @@ mod tests {
             slot_bytes: 4_915_200,
             slots: 4,
             mode: SessionMode::Write,
+            ..Default::default()
         }
     }
 
@@ -386,7 +584,7 @@ mod tests {
         let init = sample_init();
         let value = serde_json::to_value(&init).unwrap();
         let expected = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": 3,
             "worker_version": "0.1.0",
             "output_path": "/tmp/out.tif",
             "width": 12000,
@@ -396,7 +594,22 @@ mod tests {
             "shm_name": "/mpp-ipc-3f2a91",
             "slot_bytes": 4_915_200,
             "slots": 4,
-            "mode": "write"
+            "mode": "write",
+            "band_format": "f32",
+            "container": "auto",
+            "layout": "strips",
+            "tile_size": 256,
+            "compression": "none",
+            "deflate_level": 6,
+            "predictor": false,
+            "alpha": "none",
+            "icc_profile": "",
+            "description": "",
+            "copyright": "",
+            "software": "",
+            "x_resolution": 0.0,
+            "y_resolution": 0.0,
+            "resolution_unit": "inch"
         });
         assert_eq!(value, expected);
     }
@@ -473,8 +686,75 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_2() {
-        assert_eq!(IPC_PROTOCOL_VERSION, 2);
+    fn protocol_version_is_3() {
+        assert_eq!(IPC_PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn a_v2_init_payload_still_deserializes() {
+        // Wire compatibility: every v3 field is #[serde(default)], so a
+        // payload written by a v2 host parses into today's behaviour.
+        let v2 = r#"{
+            "protocol_version": 2,
+            "worker_version": "0.1.0",
+            "output_path": "/tmp/o.tif",
+            "width": 10, "height": 10, "channels": 3,
+            "bit_depth": "f32",
+            "shm_name": "/mpp-x", "slot_bytes": 1200, "slots": 2
+        }"#;
+        let init: InitMessage = serde_json::from_str(v2).unwrap();
+        assert_eq!(init.band_format, "f32");
+        assert_eq!(init.container, "auto");
+        assert_eq!(init.layout, "strips");
+        assert_eq!(init.compression, "none");
+        assert_eq!(init.alpha, "none");
+        assert!(init.icc_profile.is_empty());
+        assert!(init.description.is_empty());
+        assert!(init.copyright.is_empty());
+        assert!(init.software.is_empty());
+        assert_eq!(init.resolution_unit, "inch");
+        assert_eq!(init.tile_size, 256);
+        assert_eq!(init.deflate_level, 6);
+        assert!(!init.predictor);
+        assert_eq!(init.x_resolution, 0.0);
+        assert_eq!(init.y_resolution, 0.0);
+        assert_eq!(init.mode, SessionMode::Write);
+    }
+
+    #[test]
+    fn v3_fields_round_trip_through_json() {
+        let init = InitMessage {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            worker_version: "0.1.0".to_string(),
+            output_path: "/tmp/o.tif".to_string(),
+            width: 4,
+            height: 4,
+            channels: 4,
+            bit_depth: "u32".to_string(),
+            shm_name: "/mpp-y".to_string(),
+            slot_bytes: 64,
+            slots: 2,
+            mode: SessionMode::Write,
+            band_format: "u32".to_string(),
+            container: "big".to_string(),
+            layout: "tiles".to_string(),
+            tile_size: 512,
+            compression: "deflate".to_string(),
+            deflate_level: 9,
+            predictor: true,
+            alpha: "unassociated".to_string(),
+            icc_profile: "AAEC".to_string(),
+            description: "M31".to_string(),
+            copyright: "(c) 2026".to_string(),
+            software: "mpp".to_string(),
+            x_resolution: 300.0,
+            y_resolution: 300.0,
+            resolution_unit: "cm".to_string(),
+        };
+        let json = serde_json::to_string(&init).unwrap();
+        let back: InitMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, init);
+        assert_eq!(IPC_PROTOCOL_VERSION, 3);
     }
 
     #[test]
@@ -486,6 +766,7 @@ mod tests {
             alpha: 0,
             color_space: "rgb".into(),
             bit_depth: "f32".into(),
+            icc_profile: "AAEC".into(),
         };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains("\"width\":9888") && j.contains("\"color_space\":\"rgb\""));
@@ -493,10 +774,23 @@ mod tests {
     }
 
     #[test]
+    fn image_meta_without_icc_profile_still_parses() {
+        // Wire compatibility: an older worker's `ImageMeta` JSON has no
+        // `icc_profile` field at all; `#[serde(default)]` must still parse
+        // it, defaulting to an empty (no-profile) string.
+        let j = serde_json::json!({
+            "width": 4, "height": 4, "channels": 1, "alpha": 0,
+            "color_space": "gray", "bit_depth": "u8",
+        });
+        let m: ImageMeta = serde_json::from_value(j).unwrap();
+        assert_eq!(m.icc_profile, "");
+    }
+
+    #[test]
     fn init_mode_defaults_to_write() {
         // A v1 InitMessage JSON (no "mode") must still parse, as Write.
         let v1 = serde_json::json!({
-            "protocol_version": 2, "worker_version": "0.1.0", "output_path": "/x",
+            "protocol_version": 3, "worker_version": "0.1.0", "output_path": "/x",
             "width": 1, "height": 1, "channels": 1, "bit_depth": "f32",
             "shm_name": "/mpp-x", "slot_bytes": 4, "slots": 1
         })
@@ -508,7 +802,7 @@ mod tests {
     #[test]
     fn init_mode_read_deserializes() {
         let v2 = serde_json::json!({
-            "protocol_version": 2, "worker_version": "0.1.0", "output_path": "/x",
+            "protocol_version": 3, "worker_version": "0.1.0", "output_path": "/x",
             "width": 1, "height": 1, "channels": 1, "bit_depth": "f32",
             "shm_name": "/mpp-x", "slot_bytes": 4, "slots": 1, "mode": "read"
         })

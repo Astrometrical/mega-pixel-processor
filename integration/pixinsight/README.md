@@ -16,9 +16,16 @@ the module's identity, binary name, or install layout is BigTIFF-specific.
 
 The `BigTIFF` format:
 
-- **Writes** BigTIFF (`.tif`, `.tiff`, `.btf`, `.tf8`) from inside
+- **Writes** TIFF/BigTIFF (`.tif`, `.tiff`, `.btf`, `.tf8`) from inside
   PixInsight's own Save/Save As dialogs — past classic TIFF's 4 GB limit,
-  without going through `mpp`'s CLI (phase 2).
+  without going through `mpp`'s CLI (phase 2). Every save presents a
+  branded options dialog (phase 4): sample format, compression, container,
+  strips or tiles, alpha, ICC profile, resolution and the three text tags.
+  With the container on its `Automatic` default, `.btf`/`.tf8` name BigTIFF
+  and always get it, while `.tif`/`.tiff` get classic TIFF when the pixel
+  data fits under 4 GB and BigTIFF when it does not — so an ordinary-sized
+  `.tif` opens in the widest possible set of readers. Either container can
+  also be demanded outright.
 - **Reads** whole-image TIFF and BigTIFF files with the same four
   extensions (phase 3) back into PixInsight, including plain (non-Big)
   stripped/tiled TIFFs the module didn't itself write — the general
@@ -30,12 +37,12 @@ module** — the two cannot coexist, and the stock module must be uninstalled
 first. See "Replacing the stock TIFF module" below for the procedure, how to
 revert, and what you give up.
 
-It is **not yet** a full replacement for what the stock module does: no
-format-options dialog, no compression (output is always uncompressed), no
-alpha channels, no ICC/thumbnail/FITS-keyword/property passthrough, and no
-palette/CMYK/YCbCr/multiband or signed/complex-sample input. `docs/tiff-parity.md`
-is the gap analysis against the stock module's own options dialog; see also
-"Out of scope" below and `docs/DESIGN.md`'s phase entries.
+As of phase 4 it is at parity with the stock module's write options and
+past them in places (tiled output, PackBits, an explicit container choice).
+What it still does **not** do: read CMYK or Lab files, pass through FITS
+keywords, thumbnails or image properties, or write JPEG/Fax-compressed
+output. `docs/tiff-parity.md` records how the gap was closed and what is
+left; see also "Out of scope" below and `docs/DESIGN.md`'s phase entries.
 
 ## Architecture
 
@@ -46,9 +53,9 @@ PixInsight core                              PixInsight core
 integration/pixinsight/module/   (mpp-pxm.so — PCL-linked shim, C++20)
   BigTiffFormat   -- format identity/capabilities (MetaFileFormat)
   BigTiffInstance -- per-file session (FileFormatImplementation)
-      |  write: normalizes every WriteSamples          |  read: Open()+ReadImage,
-      |  buffer to f32 in [0,1], splits into            |  AllocateData + PixelData
-      |  <= band_rows chunks                            |  fills straight from bands
+      |  write: QueryOptions() -> TiffOptionsDialog     |  read: Open()+ReadImage,
+      |  converts each WriteSamples buffer to           |  AllocateData + PixelData
+      |  band_format, splits into <= band_rows chunks   |  fills straight from bands
       v                                                  v
 integration/pixinsight/host/     (libmpp_host — PCL-free static lib, C++17)
   mpp::WriteSession  -- host pushes Band, worker acks    mpp::ReadSession -- worker pushes
@@ -72,9 +79,10 @@ to its own binary (via `dladdr` on POSIX / `GetModuleFileNameW` on Windows,
 the same pattern MergeMosaic's `mmm-pxm` module uses), not linked into the
 `.so` at all. `mpp::WriteSession` and `mpp::ReadSession` (`host/mpp_host.h`)
 are the two host-side session types `BigTiffInstance` drives, one per
-direction; both speak the same protocol v2 wire format
+direction; both speak the same protocol v3 wire format
 (`docs/pi-protocol.md`), just with slot ownership inverted for reads (§9 of
-that document).
+that document). v3 widened `Init` only — fifteen new, defaulted fields
+(§10) — leaving the frame layout and lifecycle exactly as v2 left them.
 
 Supported PixInsight versions: **1.9.0 and newer**. The module's declared
 core-API floor is baked in from the PCL revision it links (see
@@ -115,24 +123,126 @@ writing a new pair and constructing it in `InstallPixInsightModule`
 (`module/Mpp.cpp`) alongside `BigTiffFormat`; the binary name, module
 identity, CI jobs, staging layout, and install procedure below are unaffected.
 
+## Declared capabilities
+
+What `BigTiffFormat` tells the PixInsight core it can do. The rule this
+table exists to enforce is truth in advertising: **a `true` here must be
+genuinely delivered**, and a `false` must not understate what the code does.
+Phase 4 existed because `CanStore32Bit()`/`CanStoreDouble()` answered `true`
+while the write path silently narrowed both to `f32`.
+
+| Query | Answer | What backs it |
+|---|---|---|
+| `CanRead()` / `CanWrite()` | `true` / `true` | `Open()`+`ReadImage`, and `Create()`+`WriteSamples` |
+| `CanReadIncrementally()` | `false` | Explicit: the core drives interactive opens through whole-image `ReadImage` even when this is `true`, so `ReadSamples` is left unimplemented |
+| `CanWriteIncrementally()` | `true` | Required, or `WriteSamples()` is never called |
+| `CanStore8Bit()` / `CanStore16Bit()` | `true` | `u8`/`u16` bands and output, verbatim |
+| `CanStore32Bit()` | `true` | Native `u32` bands and 32-bit unsigned output. Advertised-but-narrowed before phase 4 |
+| `CanStoreFloat()` / `CanStoreDouble()` | `true` | Native `f32`/`f64` bands and output. `CanStoreDouble()` was likewise narrowed before phase 4 |
+| `CanStore64Bit()` | `false` | 64-bit *integer* samples; TIFF has no such sample format |
+| `CanStoreGrayscale()` / `CanStoreRGBColor()` | `true` | 1- and 3-channel output |
+| `CanStoreAlphaChannels()` | `true` | Gray+alpha and RGBA, with an `ExtraSamples` association |
+| `CanStoreResolution()` | `true` | `XResolution`/`YResolution`/`ResolutionUnit` |
+| `CanStoreICCProfiles()` | `true` | Tag 34675, written on save and read back on open |
+| `SupportsCompression()` | `true` | LZW, Deflate and PackBits over the source pixels. `MetaFileFormat.h` names exactly this case: *"The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true"* |
+| `UsesFormatSpecificData()` | `true` | The `TiffFormatOptions` block round-trips from `QueryOptions()` into `CreateImage()` |
+| `CanStoreKeywords()` | `false` | **By decision, permanently.** TIFF has no FITS-keyword equivalent; Image Description / Copyright / Software are three fixed tags, not a keyword namespace |
+| `CanEditPreferences()` | `false` | **By decision.** No global format preferences — one per-save dialog, defaults in code |
+| `CanStoreThumbnails()` / `CanStoreProperties()` / `CanStoreImageProperties()` | `false` | Deferred (`docs/DESIGN.md` phase 5) |
+| `CanStoreComplex()` / `CanStoreDComplex()` | `false` | Complex samples are rejected with a `pcl::Error` |
+
+Everything not listed keeps its `MetaFileFormat.h` default; the header
+`module/BigTiffFormat.h` annotates each override with the default it
+diverges from.
+
 ## Write: sample-format mapping
 
-Every `WriteSamples` buffer is normalized to `f32` in `[0, 1]` before it is
-pushed as a band, independently of what output sample format was negotiated
-via `SetOptions`/`CreateImage`:
+Since protocol v3 the mapping is the **identity**: the sample format chosen
+in the options dialog (or, absent a dialog, taken from `ImageOptions`)
+selects both the output file's `bit_depth` **and** `band_format`, the sample
+type the pixel data itself takes across shared memory. Nothing is normalized
+to `f32` on the way out any more, so `u32` and `f64` reach the encoder with
+every bit intact.
 
-| PixInsight sample type | `InitMessage.bit_depth` sent to the worker | Notes |
+| Chosen sample format | `bit_depth` | `band_format` | Notes |
+|---|---|---|---|
+| 8-bit unsigned | `"u8"` | `"u8"` | native, verbatim |
+| 16-bit unsigned | `"u16"` | `"u16"` | native, verbatim |
+| 32-bit unsigned | `"u32"` | `"u32"` | native, verbatim — before phase 4 this was advertised and then narrowed to f32 |
+| 32-bit float | `"f32"` | `"f32"` | native, verbatim |
+| 64-bit float | `"f64"` | `"f64"` | native, verbatim — likewise previously narrowed |
+
+The `WriteSamples` overload the core happens to call need not match the
+negotiated format (PCL does not specify which it picks), so each overload
+converts its own buffer to `band_format`. A conversion that genuinely loses
+information — an `f32` view saved as 16-bit by user choice, say — sets the
+flag `WasLossyWrite()` reports. It is now a *per-conversion* answer rather
+than the blanket "any `u32`/`f64` save is lossy" it used to be, and it is
+reset per file.
+
+`band_format` must equal `bit_depth` unless it is `"f32"`, which is the
+converting path the CLI and older payloads use (`docs/pi-protocol.md`
+§10.1). Complex and signed-integer sample formats are still rejected with a
+`pcl::Error`. Channel counts 1–4 are accepted: grayscale, gray+alpha, RGB
+and RGBA, with the alpha association carried in an `ExtraSamples` tag.
+
+## Write: the TIFF options dialog
+
+`BigTiffFormat::UsesFormatSpecificData()` is `true` and
+`BigTiffInstance::QueryOptions()` presents `TiffOptionsDialog` — a PCL
+`Dialog` subclass — before every save. It opens with the Astrometrical
+notice block (chevron, *"Mega Pixel Processor — TIFF Options"*, tagline,
+copyright and the astrometrical.com / Astrometrical Tools / Ko-fi links), so
+it is visibly **not** the stock TIFF dialog. That is deliberate: once you
+have swapped modules, the dialog is how you tell which one is loaded.
+
+Cancelling returns `false` from `QueryOptions()`, which aborts the save
+before any file is created.
+
+Five `SectionBar` sections:
+
+| Section | Controls | What it sets |
 |---|---|---|
-| `pcl::Image` (`float`, f32) | `"f32"` | native path, zero-copy pass-through |
-| `pcl::DImage` (`double`, f64) | `"f32"` | narrowed; `WasLossyWrite()` reports `true` |
-| `UInt8Image` (`uint8`) | `"u8"` | exact — `u8` fits f32's significand |
-| `UInt16Image` (`uint16`) | `"u16"` | exact — `u16` fits f32's significand |
-| `UInt32Image` (`uint32`) | `"f32"` | `v / (2^32 - 1)` into `[0,1]`; lossy — `u32`'s precision exceeds f32's 24-bit significand, reported via `WasLossyWrite()` |
+| **Sample Format** | Five radio buttons: 8-bit unsigned, 16-bit unsigned, 32-bit unsigned, 32-bit float, 64-bit float | `ImageOptions::bitsPerSample`/`ieeefpSampleFormat`, and through them both `bit_depth` and `band_format` |
+| **Compression** | Method combo (None / LZW / Deflate (zlib) / PackBits (RLE)), Deflate level spin box (1–9), horizontal-predictor check box | Per-strip/per-tile compression. The predictor is integer-only and its check box disables for the two float formats — the engine rejects the combination too, so it cannot be smuggled past the UI |
+| **Layout** | Container combo (*Automatic (classic TIFF when it fits)* / *Classic TIFF* / *BigTIFF*), strips-vs-tiles radio pair, tile-size combo (powers of two, 128–1024, default 256) | Container selection and the strip/tile choice. Not in the stock dialog; tiles exist for the Astrometrical large-image load path |
+| **Embedded Data** | Embed-ICC-profile check box, alpha-association combo (*Not written* / *Unassociated (straight)* / *Associated (premultiplied)*) | Whether tag 34675 is written, and the `ExtraSamples` value. The alpha combo is **always** offered — `QueryOptions()` runs before `Create()`, so no geometry has reached the instance yet and there is no way to ask whether *this* image carries alpha. `CreateImage()` reconciles it: an image with no alpha channel forces `"none"` on the wire whatever was chosen, and an image that has one with *Not written* selected has the plane dropped |
+| **Metadata** | Image Description, Copyright and Software edits; X and Y resolution numeric edits with a *Pixels per inch* / *Pixels per centimeter* unit combo | TIFF tags 270 / 33432 / 305, and `XResolution`/`YResolution`/`ResolutionUnit` |
 
-Complex and signed-integer sample formats are rejected with a `pcl::Error`.
-Only grayscale (1 channel) and RGB (3 channels) images are supported; alpha
-channels cannot be stored (`CanStoreAlphaChannels() == false`) because the
-wire protocol (`docs/pi-protocol.md` §5) only accepts `channels == 1` or `3`.
+The three text tags must be pure ASCII with no embedded NUL — TIFF's ASCII
+tag type cannot encode anything else — and the engine rejects a violation
+before it creates the output file, naming the field.
+
+The dialog's TIFF-specific answers travel as a `TiffFormatOptions` block (a
+POD struct with a magic word, a version, fixed-width fields and fixed-size
+character arrays — no pointers, since PCL owns the block's lifetime across a
+module boundary). Sample format and resolution ride in `ImageOptions`
+instead, which already models them. If `SetFormatSpecificData()` never runs,
+`CreateImage()` falls back to in-code defaults; there are **no global
+preferences** (`CanEditPreferences()` is `false`), so every save asks.
+
+### Container selection
+
+`Automatic` writes a **classic** TIFF while the uncompressed payload fits
+under 4 GiB (less a 16 MiB header/IFD allowance) and a BigTIFF above it.
+Compression only ever shrinks the payload, so `Automatic` never
+under-predicts.
+
+Two consequences worth knowing:
+
+- **A small `.tif` save is now a classic TIFF.** Before phase 4 every save
+  this module made was a BigTIFF, including small ones wearing a `.tif`
+  name, which a good deal of older software will not open.
+- **`.btf` and `.tf8` still get BigTIFF at any size — under `Automatic`.**
+  Those extensions *declare* the container rather than merely naming the
+  family, so honouring them beats the size heuristic: a classic TIFF inside
+  a `.btf` would be a file whose name lies about its contents. The override
+  applies **only** when the container combo is on `Automatic`, though. An
+  explicit `Classic TIFF` on a `.btf` path stays classic — you named the
+  container in so many words, and the writer does not second-guess an
+  explicit request. (Choosing `Classic TIFF` for an image *too large* for it
+  is a different matter: that fails at option validation, before any pixels
+  move, with an error naming the size.)
 
 ## Read support
 
@@ -144,7 +254,7 @@ implements only the five `ReadImage` overloads (§8.3), never `ReadSamples`.
 
 The decode itself is `mpp-core`'s streaming TIFF/BigTIFF reader
 (`crates/mpp-core/src/formats/tiff_read.rs`), driven by `mpp-ipc-worker` in
-protocol-v2 **read mode** (`docs/pi-protocol.md` §9: the worker decodes a
+**read mode** (`docs/pi-protocol.md` §9, unchanged from v2 to v3: the worker decodes a
 band, fills the named shm slot, and announces it via `ReadBand`; the host
 consumes it and sends `ReadBandAck` to free the slot — slot ownership
 inverted from the write path). It is a general TIFF/BigTIFF importer, not
@@ -159,12 +269,38 @@ limited to files this module itself wrote:
 - **Colour/sample support**: grayscale or RGB, with or without an alpha
   channel (`ImageMeta.alpha`/`ImageMeta.channels`,
   `docs/pi-protocol.md` §9.2); native `u8`/`u16`/`u32`/`f32`/`f64` samples,
-  decoded and handed to PixInsight at their **native** bit depth — unlike
-  the write path, nothing is normalized to f32 on the way in.
-- **Rejected with a clear error** (never silently mis-decoded): palette,
-  CMYK, YCbCr, Lab, and other multiband colour types; planar
-  (non-interleaved) sample storage; signed-integer samples; complex/void
-  samples; any bit depth outside the five listed above.
+  decoded and handed to PixInsight at their **native** bit depth. Both
+  directions are native since phase 4.
+- **Palette (`ColorMap`) images**: expanded to RGB by looking the indices up
+  in the file's own `ColorMap`. The result reports a `u16` sample format,
+  because `ColorMap` entries are 16-bit — a palette file therefore opens as
+  a `UInt16Image` whatever the width of its indices.
+- **`YCbCr` images**: 8-bit, chunky, inverted to RGB by TIFF 6.0 §21's own
+  transform, parameterised by the file's `YCbCrCoefficients` and
+  `ReferenceBlackWhite` tags (defaulting to the spec's values when absent).
+  A file whose coefficients cannot be honoured, or whose
+  `ReferenceBlackWhite` gives a channel no coding range, is **refused**
+  rather than approximated. Planar `YCbCr` is refused: the inverse needs all
+  three components in one chunk.
+- **Planar (`PlanarConfiguration = 2`) storage**: de-interleaved into the
+  reader's chunky band model. A mechanical unwind; the samples themselves
+  are untouched.
+- **ICC profiles**: read back from tag 34675 and returned by
+  `BigTiffInstance::ReadICCProfile()`, so a colour-managed file keeps its
+  profile through an open. An unreadable ICC tag is an error, not a silent
+  drop.
+- **Rejected with a clear error** (never silently mis-decoded): CMYK and Lab
+  colour, which need ICC colour management this project does not have — the
+  error says so, rather than only naming the colour type; other multiband
+  colour types; signed-integer samples; complex/void samples; any bit depth
+  outside the five listed above.
+- **Untested, and accepted anyway — JPEG-compressed subsampled `YCbCr`.**
+  The reader validates the YCbCr transform's parameters but does **not**
+  check `ChromaSubsampling`, so a subsampled file is accepted. No
+  JPEG-in-TIFF fixture exists in this repo, and this is the most likely
+  YCbCr TIFF a real user has, so treat such a file as unverified: it may
+  decode correctly, mis-decode, or error out of the decoder. Tracked in
+  `docs/tiff-parity.md`, "Remaining gaps".
 - **Save-rename safety net** (write path, documented here since it
   directly affects what a subsequent read sees): `BigTiffInstance::Create()`
   rewrites any output path lacking a TIFF-family tail to `<path>.tiff` and
@@ -286,13 +422,27 @@ delete either.
 nothing breaks — the format just won't register. Uninstall the stock TIFF
 module and restart, and it appears.
 
-**What you give up while swapped.** This module is not yet at parity with
-the stock TIFF module. Output is always uncompressed (no Deflate/LZW), `u32`
-and `f64` saves are narrowed to `f32`, alpha channels are refused, and ICC
-profiles, TIFF text tags and resolution are not written. On read, palette,
-CMYK, YCbCr, Lab, multiband, planar and signed-integer files are rejected
-with a clear error rather than mis-decoded. `docs/tiff-parity.md` tracks the
-full gap.
+**What you give up while swapped.** Since phase 4 the honest list is short:
+
+- **No CMYK or Lab input.** Both are refused with an error saying why —
+  converting either to RGB faithfully needs ICC colour management this
+  project does not have, and an unmanaged conversion would silently
+  misrepresent your pixel values. Signed-integer, complex and void samples
+  and arbitrary multiband colour are refused for their own reasons.
+- **No FITS-keyword, thumbnail or image-property passthrough.**
+  `CanStoreKeywords()` is `false`: TIFF has no FITS-keyword equivalent, and
+  Image Description / Copyright / Software are three specific tags, not
+  keywords. Nothing beyond geometry, pixels, the ICC profile, resolution and
+  those three tags crosses the container in either direction.
+- **No JPEG- or Fax-compressed output.** Lossy compression is wrong for
+  linear astro data. (Reading such a file may work — see "Read support"'s
+  note on subsampled `YCbCr`, which is accepted but untested.)
+- **No global format preferences.** Every save presents the options dialog;
+  there are no sticky defaults.
+
+Everything else the stock dialog offered is here, and tiled output, PackBits
+and an explicit container choice are additions on top.
+`docs/tiff-parity.md` records the full before/after and what remains.
 
 ## Manual smoke procedure
 
@@ -322,10 +472,12 @@ is the human's manual check:
    under File > Save As > format list (and under File > Open's format
    filter) described as "Mega Pixel Processor: BigTIFF/TIFF (read+write)".
 4. **Write smoke**: open any image (any bit depth, grayscale or RGB), Save
-   As, choose the BigTIFF format — the dialog appends `.tif`. Check the
-   format also appears for a *non-file-backed* window (duplicate a view, or
-   use any process that creates one) and for a window loaded from a TIFF:
-   both were the cases the old compound extensions broke (see
+   As, choose the BigTIFF format — the dialog appends `.tif`, and the TIFF
+   options dialog opens before the file is written (exercised properly in
+   "TIFF options" below; accept the defaults for now). Check the format also
+   appears for a *non-file-backed* window (duplicate a view, or use any
+   process that creates one) and for a window loaded from a TIFF: both were
+   the cases the old compound extensions broke (see
    `docs/tiff-parity.md`).
 5. Verify the saved file: open it in Photoshop (PS >= 26.2 opens BigTIFF)
    or round-trip it through `mpp`'s own reader (`target/release/mpp convert
@@ -344,6 +496,121 @@ is the human's manual check:
    PixInsight's Console shows the rename warning and the file lands at
    `<name>.tiff` — then confirm that renamed file re-opens via step 7's
    procedure.
+
+### TIFF options (phase 4)
+
+**Read this before running it.** The options dialog and its wiring into
+PixInsight have **no automated test anywhere in this repo**, by the standing
+verification boundary above — no gate here touches a PCL widget. This
+procedure is the only coverage they will ever get, so it is not a checklist
+of the obvious. Steps marked **[REGRESSION]** would have *failed* before
+phase 4; steps marked **[ASSUMPTION]** probe something the PCL headers
+describe but do not normatively guarantee, where being wrong is expensive.
+Run all eleven, in order, and treat a skipped step as an untested claim.
+
+You will need `xxd` (or any hex dump), and `tiffinfo` (libtiff-tools) or
+`exiftool` for the tag checks. `target/release/mpp-ipc-worker --probe <file>`
+prints the geometry and sample format of any file this module can read, and
+is the quickest independent second opinion.
+
+1. **The dialog is ours.** Save any image as TIFF. Confirm the options
+   dialog appears before the file is written, and that it is visibly *not*
+   the stock TIFF dialog: the Astrometrical chevron, the title *"Mega Pixel
+   Processor — TIFF Options"*, the tagline and copyright line, and three
+   clickable links (astrometrical.com · Astrometrical Tools · Ko-fi) that
+   show a pointing-hand cursor. Expand and collapse each of the five section
+   bars and confirm the dialog grows and shrinks with them.
+2. **Cancel aborts.** Press Cancel. Confirm **no file is written** (not an
+   empty one, not a truncated one — check the target directory) and that
+   PixInsight reports the save as cancelled rather than failed.
+3. **[REGRESSION] Every sample format survives.** Save the same image five
+   times, once per Sample Format radio button: 8-bit unsigned, 16-bit
+   unsigned, 32-bit unsigned, 32-bit float, 64-bit float. Reopen each in
+   PixInsight and confirm the sample format survived — the 32-bit-integer
+   save must reopen as a `UInt32Image` and the 64-bit float save as a
+   `DImage`. **These two are the point of the whole phase**: before it, both
+   capabilities were advertised and then silently narrowed to `f32`, so a
+   `u32` save came back with 8 bits of precision quietly gone. If either
+   reopens as a `pcl::Image`, protocol v3's native band path is broken.
+   (Expect `u8`/`u16` values to differ from a pre-phase-4 build by at most
+   1 LSB: integer scaling now goes through `f64` and is strictly more
+   accurate.)
+4. **[REGRESSION] Compression works and is independent per block.** Save the
+   same image with LZW, with Deflate (try levels 1 and 9), and with
+   PackBits. Confirm each reopens with identical pixels, and that each
+   compressed file is smaller than the uncompressed one. Then repeat one of
+   them on an *integer* image with the horizontal predictor ticked, and
+   confirm the predictor check box is **disabled** when a float sample
+   format is selected. Before phase 4 output was always uncompressed, and
+   `BigTiffFormat::SupportsCompression()` reported `false` to match; it now
+   returns `true`, as `MetaFileFormat.h` requires of a format offering
+   LZW/ZIP over its source pixels.
+5. **[REGRESSION] Automatic picks classic TIFF for a small image.** Save a
+   small image (a few MB) with the container combo on Automatic to a `.tif`
+   path. Confirm the first four bytes are the *classic* magic:
+   `xxd -l 4 out.tif` shows `4949 2a00` (`II*\0`), **not** `4949 2b00`
+   (`II+\0`, BigTIFF). Then save the same image to a `.btf` path, still on
+   Automatic, and confirm it *is* BigTIFF (`4949 2b00`) — the extension
+   declares the container and overrides the size heuristic. Before phase 4
+   every save was BigTIFF regardless, which is exactly the behaviour change
+   most likely to surprise an existing user.
+6. **[REGRESSION] Tiles.** Save with Layout set to Tiles (try 256 and one
+   other tile size). Confirm the file reopens in PixInsight with correct
+   geometry and pixels, and that `tiffinfo out.tif` reports
+   `TileWidth`/`TileLength` (and tile offsets/byte counts) rather than
+   `RowsPerStrip`. Use an image whose width and height are **not** multiples
+   of the tile size, so the padded right-column, bottom-row and corner tiles
+   are exercised.
+7. **[REGRESSION] Alpha round trip.** Open or construct an image with an
+   alpha channel (RGBA or gray+alpha), save it with the alpha combo set to
+   Unassociated, and reopen. Confirm the alpha channel is present and
+   correct, and that `tiffinfo` shows an `ExtraSamples` entry. Repeat with
+   Associated. Alpha was refused outright before phase 4.
+8. **[ASSUMPTION] Alpha set to "Not written" — check the colour channels,
+   not just the count.** Save an RGBA image with the alpha combo on *Not
+   written*, then **reopen it and compare the R, G and B planes against the
+   source**. The drop path opens the session for the colour channels alone
+   and discards the `WriteSamples` call for the alpha index, which assumes
+   PCL hands colour channels before alpha. If that assumption is ever false,
+   this does not error — the wire accepts the geometry either way — it
+   writes the **alpha plane into the red channel** and silently corrupts the
+   image. A file that merely "opens as RGB with no alpha" is not a pass;
+   the pixels must match.
+9. **[ASSUMPTION] Save from a colour-managed window.** Take a window that
+   carries an ICC profile (assign one via PixInsight's colour management if
+   you must), save it with *Embed ICC profile* ticked, and confirm the save
+   **completes** and that `exiftool out.tif` (or `tiffinfo`) shows an ICC
+   profile (tag 34675). Then reopen the file in PixInsight and confirm the
+   profile comes back. This is the single highest-consequence unverified
+   assumption in the phase: `WriteICCProfile()` **throws** if PCL calls it
+   after `CreateImage()`, and while the PCL header's prose supports the
+   assumed before-`CreateImage()` order, that prose is descriptive, not a
+   normative guarantee. If any core path calls it later, **every**
+   ICC-bearing save fails hard rather than degrading to a profile-less
+   file — so exercise this from more than one route if you can (Save,
+   Save As, and a script-driven `FileFormat` write).
+10. **[REGRESSION] Text tags and resolution.** Fill in Image Description,
+    Copyright and Software, set the resolution to something distinctive
+    (say 300, unit inch), and save. Confirm with `exiftool out.tif` or
+    `tiffinfo out.tif` that tags 270, 33432 and 305 carry your text and that
+    `XResolution`/`YResolution`/`ResolutionUnit` carry the value. Note that
+    resolution tags are now written on *every* save — PCL's `ImageOptions`
+    defaults to 72 dpi, so even a save where you touch nothing gets them,
+    where before phase 4 none were written at all. Also confirm a non-ASCII
+    character in one of the text fields is refused with a message naming the
+    field, **before** any output file appears.
+11. **Photoshop round trip.** Open a tiled, Deflate-compressed **BigTIFF**
+    written by this module in Photoshop (PS >= 26.2) and confirm it renders
+    correctly at full size. This is the check that a hand-rolled IFD is
+    correct by more than our own decoder's opinion — the failure mode this
+    guards is a file `mpp` reads back happily and every other reader
+    rejects. Repeat with a tiled *classic* TIFF written to a `.tif` path,
+    which is the newly common case.
+
+Also worth a pass while you are here: confirm `WasLossyWrite()` behaves —
+saving a 32-bit-float view as 16-bit unsigned should report a lossy write
+(it did not before phase 4), while saving that same view as 32-bit float,
+or a `UInt32Image` as 32-bit unsigned, should not.
 
 ### Known v1 limitation: abort wiring
 
@@ -446,23 +713,21 @@ Deferred to a later phase (not implemented by this module today):
 - **Incremental read (`ReadSamples`).** The core always decodes through
   whole-image `ReadImage`; `mpp-core`'s reader is itself streaming/chunked
   internally, but the module never exposes that as PCL incremental read.
-- **General TIFF-tag → FITS-keyword mapping, ICC profiles, thumbnails,
-  and image properties.** Nothing beyond geometry and pixel data is read
-  from or written to the container.
-- **Palette / CMYK / YCbCr / Lab / other multiband colour, and
-  signed-integer or complex-sample inputs.** Rejected with a clear
-  `pcl::Error` rather than mis-decoded (see "Read support").
-- **Parity with the stock TIFF module.** Now that this module claims
-  `.tif`/`.tiff` and displaces the stock one, the gaps below stop being
-  merely deferred and become regressions for anyone who swaps: no
-  compression options (Deflate/LZW), no true `u32`/`f64` output (both are
-  narrowed to `f32`), no alpha, no ICC profile, no Image Description /
-  Copyright / Software tags, no resolution, and no tiled output. Scoped in
-  `docs/tiff-parity.md`.
-- **Classic (non-Big) TIFF *writing*.** The write path only ever produces
-  BigTIFF; reading classic TIFF is supported (see "Read support"), writing
-  it is not.
-- A format-options dialog (no options exposed).
+- **General TIFF-tag → FITS-keyword mapping, thumbnails, and image
+  properties.** ICC profiles are written and read back as of phase 4, but
+  nothing else beyond geometry, pixels, resolution and the three text tags
+  crosses the container.
+- **CMYK / Lab / other multiband colour, and signed-integer or
+  complex-sample inputs.** Rejected with a clear `pcl::Error` rather than
+  mis-decoded (see "Read support"). Palette, `YCbCr` and planar storage are
+  **no longer** on this list — all three are accepted since phase 4.
+- **Global format preferences** (`CanEditPreferences()` is `false`). One
+  per-save dialog, defaults in code; no sticky settings.
+- **JPEG- and Fax-compressed output.** Read support comes free from the
+  decoder where it works; writing lossy compression is wrong for linear
+  astro data and is not parity with the stock dialog either. Note that
+  JPEG-compressed subsampled `YCbCr` on *read* is currently accepted and
+  untested — see "Read support".
 - Non-blocking abort wiring (see "Known v1 limitation" above) — write path
   only; there is no read-side cancellation concern since a read session has
   no equivalent in-progress-file state to abandon.

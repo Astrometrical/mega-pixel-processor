@@ -40,24 +40,64 @@
 
 namespace mpp {
 
-/// Configuration for one `WriteSession`: the worker binary to spawn and the
-/// output image's geometry/band shape. `band_rows` is the nominal row count
-/// per `PushBand` call the caller commits to -- it sizes the shm slots
-/// (`slot_bytes = band_rows * width * sizeof(float)`), so every `PushBand`
-/// call's `rows` must be `<= band_rows` (the last band of a channel may be
-/// shorter; `WriteSession` rejects a larger one as a host bug rather than
-/// risk a slot overrun -- see docs/pi-protocol.md §6's "slot-size
-/// validation" rule, which this mirrors host-side before the worker ever
-/// sees the band).
+/// Configuration for one `WriteSession`: the worker binary to spawn, the
+/// output image's geometry/band shape, and (protocol v3) the full set of
+/// TIFF write options the worker's encoder accepts. `band_rows` is the
+/// nominal row count per `PushBand`/`PushBandBytes` call the caller commits
+/// to -- it sizes the shm slots (`slot_bytes = band_rows * width *
+/// WriteSession::SampleBytes(band_format)`), so every push call's `rows`
+/// must be `<= band_rows` (the last band of a channel may be shorter;
+/// `WriteSession` rejects a larger one as a host bug rather than risk a slot
+/// overrun -- see docs/pi-protocol.md §6's "slot-size validation" rule,
+/// which this mirrors host-side before the worker ever sees the band).
+///
+/// **`band_format` vs `bit_depth`** (docs/pi-protocol.md §10): `band_format`
+/// is the sample type this host writes into the shm slots; `bit_depth` is
+/// the sample format of the *output file*. They are coupled by one rule the
+/// constructor enforces (as the worker does): `band_format` must equal
+/// `bit_depth` unless `band_format` is `"f32"`, the one sample domain the
+/// writer converts from. A native (non-f32) band is written verbatim, so
+/// there is no conversion path if the two disagree.
+///
+/// Every v3 option below is defaulted to its wire default, which is also the
+/// v1/v2 behaviour -- a caller that fills in only the v1 fields gets exactly
+/// the pre-v3 session it used to.
 struct WriteSessionConfig {
   std::string worker_exe;   ///< Absolute path to the `mpp-ipc-worker` binary.
   std::string output_path;  ///< Output file path the worker will encode to.
   uint64_t width = 0;       ///< Image width in pixels.
   uint64_t height = 0;      ///< Image height in pixels.
-  uint64_t channels = 0;    ///< Channel count: `1` or `3`.
-  std::string bit_depth;    ///< Output sample format: `"f32"`, `"u16"`, or `"u8"`.
-  uint32_t band_rows = 0;   ///< Nominal rows per `PushBand` call; sizes the shm slots.
+  uint64_t channels = 0;    ///< Channel count: `1`, `2`, `3` or `4`.
+  /// Output file sample format: `"f32"`, `"f64"`, `"u32"`, `"u16"` or `"u8"`.
+  std::string bit_depth;
+  uint32_t band_rows = 0;   ///< Nominal rows per push call; sizes the shm slots.
   uint32_t slots = 0;       ///< Number of shm slots to create; `>= 2` recommended.
+
+  // ---- protocol v3 write options --------------------------------------
+  /// **(v3)** shm sample type: `"f32"` (default; the v1/v2 behaviour and the
+  /// only converting path), `"f64"`, `"u32"`, `"u16"` or `"u8"`. See the
+  /// coupling rule in this struct's doc comment.
+  std::string band_format = "f32";
+  std::string container = "auto";    ///< **(v3)** `"auto"`, `"classic"` or `"big"`.
+  std::string layout = "strips";     ///< **(v3)** `"strips"` or `"tiles"`.
+  uint32_t tile_size = 256;          ///< **(v3)** tile edge, power of two 128..1024.
+  std::string compression = "none";  ///< **(v3)** `"none"`, `"lzw"`, `"deflate"`, `"packbits"`.
+  /// **(v3)** Deflate level 1-9; ignored unless `compression == "deflate"`.
+  /// Defaults to `6`, the wire default -- **not** `0`, which is not a legal
+  /// level and would not match what a v2 host's omitted field means.
+  uint8_t deflate_level = 6;
+  bool predictor = false;            ///< **(v3)** horizontal predictor; integer formats only.
+  std::string alpha = "none";        ///< **(v3)** `"none"`, `"unassociated"`, `"associated"`.
+  /// **(v3)** Base64-encoded ICC profile to embed; empty means none. Capped
+  /// at 16 MiB decoded, checked by the constructor before a process is
+  /// spawned (the worker enforces the same bound).
+  std::string icc_profile_base64;
+  std::string description;           ///< **(v3)** TIFF tag 270 (ImageDescription).
+  std::string copyright;             ///< **(v3)** TIFF tag 33432 (Copyright).
+  std::string software;              ///< **(v3)** TIFF tag 305 (Software).
+  double x_resolution = 0.0;         ///< **(v3)** pixels per unit; `0` = unknown.
+  double y_resolution = 0.0;         ///< **(v3)** pixels per unit; `0` = unknown.
+  std::string resolution_unit = "inch";  ///< **(v3)** `"inch"` or `"cm"`.
 };
 
 /// Progress snapshot pumped into `WriteSession::Finish`'s callback, mirroring
@@ -110,15 +150,34 @@ class WriteSession {
   /// while none is: a `BandAck` frees the slot it names, a `Progress` frame
   /// is tolerated and dropped (no callback is registered during band
   /// streaming; see `Finish` for progress reporting) -- per
-  /// docs/pi-protocol.md §7.7. Once a slot is free, copies `rows * width`
-  /// `f32` samples of `channel` into it (native-endian, row-major, exactly
-  /// the shm layout docs/pi-protocol.md §6 specifies) and sends the matching
-  /// `Band` frame. Channels/rows may be pushed in any order
-  /// (docs/pi-protocol.md §7.2). Throws `HostError` if `channel` or the
+  /// docs/pi-protocol.md §7.7. Once a slot is free, copies
+  /// `rows * width * SampleBytes(cfg.band_format)` bytes of `channel` from
+  /// `samples` into it (native-endian, row-major, exactly the shm layout
+  /// docs/pi-protocol.md §6 specifies) and sends the matching `Band` frame.
+  /// `samples` must point at `rows * width` samples of the session's
+  /// negotiated `band_format` -- not always `f32`, as it was before protocol
+  /// v3. Channels/rows may be pushed in any order (docs/pi-protocol.md
+  /// §7.2). Throws `HostError` if `channel` or the
   /// `[start_row, start_row + rows)` range fall outside the configured
   /// geometry, `rows` exceeds the configured `band_rows`, the worker reports
   /// `Error`, or the worker exits/closes its output unexpectedly.
+  void PushBandBytes(uint32_t channel, uint64_t start_row, uint32_t rows, const void* samples);
+
+  /// f32 convenience wrapper over `PushBandBytes`, for the (default) session
+  /// that negotiated `band_format == "f32"`. Throws `HostError` if it did
+  /// not: on, say, a `"u32"` session the buffer's element type would
+  /// disagree with the wire format, and silently copying
+  /// `rows * width * 4` bytes of `float` into a slot the worker reads back
+  /// as `u32` is exactly the class of bug protocol v3 exists to eliminate.
   void PushBand(uint32_t channel, uint64_t start_row, uint32_t rows, const float* samples);
+
+  /// Sample width in bytes of `band_format` -- the unit `PushBandBytes`
+  /// measures its buffer in, and the multiplier in this session's
+  /// `slot_bytes`. `4` for `"f32"`/`"u32"`, `8` for `"f64"`, `2` for
+  /// `"u16"`, `1` for `"u8"`. Throws `HostError` for any other string
+  /// (`WriteSession`'s constructor calls this to validate `cfg.band_format`,
+  /// so an unknown format never reaches the worker).
+  static size_t SampleBytes(const std::string& band_format);
 
   /// Drains any outstanding (unacked) bands -- pumping `Progress` frames
   /// seen along the way into `cb` -- then sends `Finish` and reads frames
