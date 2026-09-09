@@ -139,7 +139,8 @@ private:
    // disagree (Unknowns §5: the overload that fires need not match
    // SetOptions), samples go through the unit range, and lossy_ records any
    // narrowing. A push for the alpha plane the user chose not to write
-   // (see discarded_channel_) is dropped here.
+   // (see discarded_channel_) is dropped here; CreateImage() has already
+   // flagged that drop as lossy.
    template <typename T>
    void PushTyped( const T* buffer, int startRow, int rowCount, int channel );
 
@@ -191,7 +192,9 @@ private:
    // from the struct's own defaults instead of assuming a value.
    bool have_format_options_ = false;    // SetFormatSpecificData() ran with a valid block
    TiffFormatOptions format_options_;    // advisory TIFF options for the next image
-   bool lossy_ = false;           // a narrowing conversion happened (Unknowns §6)
+   // The write lost information: a narrowing sample conversion (Unknowns §6)
+   // or a discarded alpha channel (see discarded_channel_).
+   bool lossy_ = false;
    uint64_t width_ = 0, height_ = 0, channels_ = 0;   // from CreateImage()
 
    // Wire sample type for this image's bands: "u8" | "u16" | "u32" | "f32" |

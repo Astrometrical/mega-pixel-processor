@@ -167,6 +167,23 @@ bool ConversionIsLossy( const std::string& fmt )
 // rounded to nearest and clamped, so an out-of-range float sample (PCL
 // permits them) cannot wrap around; NaN maps to 0 because the `> 0` test
 // below is false for it.
+//
+// THIS CONVERSION EXISTS TWICE, IN TWO LANGUAGES. `Sample::from_unit_f32`
+// in crates/mpp-core/src/formats/tiff_write/sample.rs is the Rust
+// implementation of the same mapping, and the two MUST agree sample for
+// sample. They currently do, on all four properties that define it:
+//   1. the scale is computed in double, never float (u32's maximum exceeds
+//      float's 24-bit mantissa);
+//   2. integer results round HALF UP (`+ 0.5` then truncate here,
+//      `.round()` on a non-negative value there);
+//   3. out-of-range input SATURATES at 0 and the destination maximum
+//      rather than wrapping;
+//   4. NaN maps to 0.
+// Drift would be invisible in testing: CreateImage() always negotiates
+// band_format_ == bit_depth, so the worker takes mpp-core's verbatim
+// `write_tiff_native` path and never runs the Rust copy on the PixInsight
+// route -- this function is the only one of the two that a PixInsight save
+// exercises. Change one, change the other.
 template <typename Dst, typename Src>
 Dst ConvertSample( Src v )
 {
@@ -746,6 +763,17 @@ void BigTiffInstance::CreateImage( const ImageInfo& info )
          // The user asked for the alpha channel not to be written.
          discarded_channel_ = colourChannels;
          wireChannels = uint64_t( colourChannels );
+         // Dropping a whole channel is a lossy write, and is recorded here
+         // -- at the decision -- rather than in PushTyped(), so the flag is
+         // true from CreateImage() onwards whether or not the core ever
+         // hands us the alpha plane. PCL's own wording talks about lossy
+         // *compression*, and the user did ask for the drop, so reporting
+         // it is a judgement call; this module makes it because an entire
+         // channel of the source image is absent from the file, and this
+         // is the phase that exists because a capability claimed more than
+         // the code delivered. Understating the loss here would be the
+         // same mistake in the other direction.
+         lossy_ = true;
          break;
       }
 
@@ -893,6 +921,11 @@ void BigTiffInstance::PushTyped( const T* buffer, int startRow, int rowCount, in
    // contract in CreateImage()). Only ever one index, never a general
    // out-of-range escape hatch -- any other bad channel still reaches
    // PushBandBytes, which rejects it against the Init geometry.
+   //
+   // Returning above the ConversionIsLossy() check below is deliberate and
+   // safe: CreateImage() already set lossy_ when it decided to discard this
+   // channel, so a dropped plane reports WasLossyWrite() == true even though
+   // no sample of it is ever converted here.
    if ( discarded_channel_ >= 0 && channel == discarded_channel_ )
       return;
 
@@ -1022,8 +1055,9 @@ void BigTiffInstance::WriteImage( const UInt32Image& image )
 
 bool BigTiffInstance::WasLossyWrite() const
 {
-   // True iff a conversion that actually loses information happened on this
-   // instance's write path -- a DImage the user chose to save as 16-bit, say
+   // True iff this instance's write path actually lost information: a
+   // narrowing sample conversion -- a DImage the user chose to save as
+   // 16-bit, say -- or an alpha channel the save options discarded
    // (Unknowns §6: the flag is kept accurate at all times regardless of when
    // the core queries it).
    //
