@@ -60,10 +60,20 @@ public:
    bool CanReadIncrementally() const override;   // default false -> false (explicit; whole-image ReadImage only)
    bool CanWrite() const override;               // default true  -> true (explicit for clarity)
    bool CanWriteIncrementally() const override;  // default false -> true (WriteSamples path)
-   bool CanStore32Bit() const override;          // default false -> true (u32 -> f32, precision note)
-   bool CanStoreFloat() const override;          // default false -> true (f32 is the native path)
-   bool CanStoreDouble() const override;         // default false -> true (f64 -> f32, lossy narrowing)
-   bool CanStoreAlphaChannels() const override;  // default true  -> false (worker accepts 1 or 3 channels only)
+   bool CanStore32Bit() const override;          // default false -> true (native u32 samples, exact)
+   bool CanStoreFloat() const override;          // default false -> true (native f32 samples, exact)
+   bool CanStoreDouble() const override;         // default false -> true (native f64 samples, exact)
+   bool CanStoreAlphaChannels() const override;  // default true  -> true (gray+alpha and RGBA, ExtraSamples)
+   bool CanStoreResolution() const override;     // default false -> true (X/YResolution + ResolutionUnit)
+   bool CanStoreICCProfiles() const override;    // default false -> true (tag 34675, both directions)
+
+   // NOT overridden, deliberately: CanStoreKeywords() keeps its false
+   // default. TIFF has no FITS-keyword equivalent -- the three text tags this
+   // format writes (ImageDescription, Copyright, Software) are fixed,
+   // single-valued tags carried as format-specific data (TiffFormatOptions),
+   // not a keyword namespace a caller can add names to. Advertising keyword
+   // storage would promise a FITSKeywordArray round-trip nothing here can
+   // deliver, so this is not a gap to "fix".
 
    // -- Format-specific data (MetaFileFormat.h:815-852). The core preserves
    //    an opaque per-instance block for us -- our TiffFormatOptions -- and

@@ -110,28 +110,38 @@ bool BigTiffFormat::CanWriteIncrementally() const
 
 bool BigTiffFormat::CanStore32Bit() const
 {
-   // u32 saves are accepted and mapped u32/(2^32-1) into [0,1] f32 -- a
-   // documented precision reduction (behavioral contract mapping table).
+   // True, and now genuinely so: protocol v3 carries u32 bands natively and
+   // the writer emits 32-bit unsigned samples. Before phase 4 this was
+   // advertised while the value was narrowed to f32 -- exactly the
+   // truth-in-advertising violation this phase existed to fix.
    return true;
 }
 
 bool BigTiffFormat::CanStoreFloat() const
 {
-   return true;   // f32 is the native path (shm bands are f32)
+   return true;   // f32 bands and 32-bit float output, both exact
 }
 
 bool BigTiffFormat::CanStoreDouble() const
 {
-   // f64 saves are accepted and narrowed to f32 -- lossy, reported via
-   // BigTiffInstance::WasLossyWrite().
-   return true;
+   return true;   // f64 bands and 64-bit float output, both exact
 }
 
 bool BigTiffFormat::CanStoreAlphaChannels() const
 {
-   // The wire protocol (docs/pi-protocol.md §5) accepts channels == 1 or 3
-   // only, so alpha channels cannot be stored.
-   return false;
+   // Gray+alpha and RGBA write an ExtraSamples tag with the association the
+   // options dialog selected.
+   return true;
+}
+
+bool BigTiffFormat::CanStoreResolution() const
+{
+   return true;   // XResolution/YResolution/ResolutionUnit from ImageOptions
+}
+
+bool BigTiffFormat::CanStoreICCProfiles() const
+{
+   return true;   // tag 34675, written on save and read back on open
 }
 
 // ----------------------------------------------------------------------------
