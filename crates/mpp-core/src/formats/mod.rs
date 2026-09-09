@@ -6,6 +6,7 @@
 
 pub mod tiff;
 pub mod tiff_read;
+pub mod tiff_write;
 pub mod xisf;
 
 /// A planar image source the streaming writers can drain row by row.

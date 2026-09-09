@@ -35,6 +35,18 @@ pub enum BitDepth {
     U8,
 }
 
+impl BitDepth {
+    /// Bytes per sample in the output file.
+    pub fn bytes(self) -> usize {
+        match self {
+            BitDepth::U8 => 1,
+            BitDepth::U16 => 2,
+            BitDepth::U32 | BitDepth::F32 => 4,
+            BitDepth::F64 => 8,
+        }
+    }
+}
+
 /// Options for [`write_bigtiff`].
 #[derive(Debug, Clone, Default)]
 pub struct TiffWriteOptions {

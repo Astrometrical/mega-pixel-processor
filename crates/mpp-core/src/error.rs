@@ -8,8 +8,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The error type for all mpp-core operations.
 ///
-/// Deliberately small: an I/O failure on a file, or a malformed/unsupported
-/// file. New variants are added only when a caller needs to distinguish them.
+/// Deliberately small: an I/O failure on a file, a malformed/unsupported
+/// file, or an invalid option/argument combination caught before any file is
+/// touched. New variants are added only when a caller needs to distinguish
+/// them.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An operating-system I/O failure on `path`.
@@ -31,6 +33,16 @@ pub enum Error {
         /// Human-readable explanation of what is wrong.
         reason: String,
     },
+
+    /// An option or argument combination that cannot produce a valid file.
+    ///
+    /// Unlike [`Error::Io`] and [`Error::Format`] this carries no path: it
+    /// reports a caller mistake caught before any file is touched.
+    #[error("invalid option: {reason}")]
+    Invalid {
+        /// Human-readable explanation of what is wrong and what would be legal.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -46,6 +58,13 @@ impl Error {
     pub fn format(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
         Error::Format {
             path: path.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Build an [`Error::Invalid`] from a reason.
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Error::Invalid {
             reason: reason.into(),
         }
     }
