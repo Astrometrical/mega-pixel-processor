@@ -830,6 +830,30 @@ mod tests {
     }
 
     #[test]
+    fn an_ignored_deflate_level_cannot_reject_an_init() {
+        // `deflate_level` is documented as ignored unless the compression
+        // is deflate, so a host that never set it — 0 being the natural
+        // default for an unset `uint8_t` on the C++ side — must not have
+        // every run rejected over it.
+        for compression in ["none", "lzw", "packbits"] {
+            let mut init = test_init();
+            init.compression = compression.to_string();
+            init.deflate_level = 0;
+            assert!(
+                validate_init(&init).is_ok(),
+                "deflate_level 0 must be ignored for compression {compression:?}"
+            );
+        }
+        // Under deflate it is load-bearing, and still checked.
+        let mut init = test_init();
+        init.compression = "deflate".to_string();
+        init.deflate_level = 0;
+        assert!(validate_init(&init).is_err());
+        init.deflate_level = 9;
+        assert!(validate_init(&init).is_ok());
+    }
+
+    #[test]
     fn a_native_band_format_must_match_the_output_bit_depth() {
         // u16 bands into a u8 file has no encode path: `write_tiff_native`
         // writes samples verbatim and `write_tiff` only converts from f32.

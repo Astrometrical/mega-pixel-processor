@@ -17,14 +17,19 @@
 //!
 //! Version 3 widens [`InitMessage`] only — no new tag, no changed binary
 //! layout. [`InitMessage::band_format`] names the sample type the host
-//! places in shm slots, decoupling it from [`InitMessage::bit_depth`] (the
+//! places in shm slots, separating it from [`InitMessage::bit_depth`] (the
 //! *output file's* sample format): before v3 every band crossed shm as
 //! unit-range `f32`, whose 24-bit mantissa destroys `u32` values and
-//! truncates `f64` ones. The rest of the v3 fields carry the TIFF writer's
-//! full option set (container, layout, compression, alpha, ICC profile,
-//! text tags, resolution). Every v3 field is `#[serde(default)]`, so a v2
-//! host's `Init` payload still deserializes into exactly the v2
-//! behaviour.
+//! truncates `f64` ones. The two fields are coupled by one rule a mirroring
+//! host must reproduce — `band_format` must equal `bit_depth` unless it is
+//! `"f32"`, the one domain the writer converts from; see
+//! [`InitMessage::band_format`]. The rest of the v3 fields carry the TIFF
+//! writer's full option set (container, layout, compression, alpha, ICC
+//! profile, text tags, resolution). Every v3 field is `#[serde(default)]`,
+//! so a v2 host's `Init` payload still deserializes into exactly the v2
+//! behaviour — and a field documented as ignored (`deflate_level` off
+//! Deflate, `tile_size` off `"tiles"`) is genuinely ignored, never
+//! validated, so an unset host-side default cannot reject a run.
 
 use std::io::{self, Read, Write};
 
@@ -109,7 +114,8 @@ pub struct InitMessage {
     pub channels: u64,
     /// Output sample format: `"f32"`, `"f64"`, `"u32"`, `"u16"`, or
     /// `"u8"`. Names the *file's* sample format; the shm sample type is
-    /// [`InitMessage::band_format`].
+    /// [`InitMessage::band_format`], which must equal this field unless it
+    /// is `"f32"` (see its coupling rule).
     pub bit_depth: String,
     /// Name of the shm segment the host already created.
     pub shm_name: String,
@@ -130,14 +136,20 @@ pub struct InitMessage {
 
     /// **(v3)** Sample type of the pixel data the host places in shm slots:
     /// `"f32"` (the v1/v2 behaviour and the default), `"f64"`, `"u8"`,
-    /// `"u16"` or `"u32"`. Independent of [`InitMessage::bit_depth`], which
-    /// names the *output file's* sample format. Absent in a v2 payload,
-    /// which defaults to `"f32"`.
+    /// `"u16"` or `"u32"`. Absent in a v2 payload, which defaults to
+    /// `"f32"`.
     ///
-    /// The worker converts only from the `"f32"` unit-range domain: a
-    /// non-`"f32"` `band_format` must equal `bit_depth`, since those
-    /// samples are written to the file verbatim (that is the point — no
-    /// round trip through `f32` to lose bits in).
+    /// This is a *separate* field from [`InitMessage::bit_depth`] — this one
+    /// names the shm sample type, that one names the output file's — but the
+    /// two are not free of each other. **Coupling rule:** `band_format` must
+    /// equal `bit_depth`, unless `band_format` is `"f32"`, which may target
+    /// any `bit_depth`. A native (non-`"f32"`) band is written to the file
+    /// verbatim, which is the entire point of v3 — there is no round trip
+    /// through `f32` to lose bits in, and equally no conversion available if
+    /// the two disagree. `"f32"` is the one sample domain the writer converts
+    /// from, so an `"f32"` session keeps the v1/v2 freedom to pick any output
+    /// format. The worker rejects a violating `Init` up front, before it
+    /// stages a single band.
     #[serde(default = "default_band_format")]
     pub band_format: String,
 

@@ -100,7 +100,9 @@ pub struct TiffWriteOptions {
     pub layout: Layout,
     /// Per-block compression.
     pub compression: Compression,
-    /// Deflate level, 1-9; ignored unless [`Compression::Deflate`]. `None`
+    /// Deflate level, 1-9; ignored unless [`Compression::Deflate`] — which
+    /// includes being ignored by [`TiffWriteOptions::validate`], so an
+    /// out-of-range value on a non-Deflate request is not an error. `None`
     /// selects the default level 6.
     ///
     /// The underlying encoder offers three levels, not nine, so the value
@@ -174,7 +176,15 @@ impl TiffWriteOptions {
             )));
         }
 
-        if let Some(level) = self.deflate_level
+        // Gated on the compression that actually reads it. `deflate_level`
+        // is documented — here and in the IPC protocol's `Init` message —
+        // as ignored unless the compression is Deflate, and a value
+        // documented as ignored must not be able to fail validation: a
+        // caller (notably the PixInsight host's C++ `InitMessage`, whose
+        // natural default for an unset `uint8_t` is 0) would otherwise
+        // have every request rejected over a field it never meant to set.
+        if self.compression == Compression::Deflate
+            && let Some(level) = self.deflate_level
             && !(1..=9).contains(&level)
         {
             return Err(Error::invalid(format!(
@@ -300,6 +310,50 @@ mod tests {
             ..opts()
         };
         assert!(o.validate(16, 16, 1).is_ok());
+    }
+
+    #[test]
+    fn deflate_level_is_range_checked_only_when_deflate_is_selected() {
+        // Documented as ignored unless the compression is Deflate, so an
+        // out-of-range value must not fail validation for any other
+        // compression — a host's unset-field default (0, say) would
+        // otherwise reject every request. See the gate in `validate`.
+        for compression in [Compression::None, Compression::Lzw, Compression::Packbits] {
+            for level in [0u8, 10, 255] {
+                let o = TiffWriteOptions {
+                    compression,
+                    deflate_level: Some(level),
+                    ..opts()
+                };
+                assert!(
+                    o.validate(16, 16, 1).is_ok(),
+                    "deflate_level {level} must be ignored for {compression:?}"
+                );
+            }
+        }
+
+        // Under Deflate it is load-bearing, and still rejected.
+        for (level, ok) in [(0u8, false), (1, true), (6, true), (9, true), (10, false)] {
+            let o = TiffWriteOptions {
+                compression: Compression::Deflate,
+                deflate_level: Some(level),
+                ..opts()
+            };
+            assert_eq!(
+                o.validate(16, 16, 1).is_ok(),
+                ok,
+                "deflate level {level} under Compression::Deflate"
+            );
+        }
+
+        // `None` means "the default level", legal either way.
+        let o = TiffWriteOptions {
+            compression: Compression::Deflate,
+            deflate_level: None,
+            ..opts()
+        };
+        assert!(o.validate(16, 16, 1).is_ok());
+        assert_eq!(o.effective_deflate_level(), 6);
     }
 
     #[test]
