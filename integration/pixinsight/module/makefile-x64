@@ -117,7 +117,8 @@ LIBS     = -L"$(PCLLIBDIR)" $(PLATFORM_LIBS)
 
 MODULE_OBJS = $(OBJDIR)/Mpp.o \
               $(OBJDIR)/BigTiffFormat.o \
-              $(OBJDIR)/BigTiffInstance.o
+              $(OBJDIR)/BigTiffInstance.o \
+              $(OBJDIR)/TiffOptionsDialog.o
 
 HOST_OBJS   = $(OBJDIR)/mpp_shm.o \
               $(OBJDIR)/mpp_protocol.o \
