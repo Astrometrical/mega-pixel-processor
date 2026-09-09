@@ -8,7 +8,7 @@
 //!   host sends into a memory-mapped scratch file ([`staging::Staging`]),
 //!   and — once `Finish` confirms every row of every channel arrived —
 //!   streams the staged planes through
-//!   [`mpp_core::formats::tiff::write_bigtiff`] and reports `Done`. `Cancel`
+//!   [`mpp_core::formats::tiff_write::write_tiff`] and reports `Done`. `Cancel`
 //!   (or the host disappearing before `Finish`) tears down cleanly instead.
 //! - [`SessionMode::Read`] ([`read::run_read`]): the worker opens an
 //!   existing image via [`TiffReader`], reports its geometry as
@@ -29,8 +29,8 @@ mod staging;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use mpp_core::formats::tiff::{BitDepth, TiffWriteOptions, write_bigtiff};
 use mpp_core::formats::tiff_read::TiffReader;
+use mpp_core::formats::tiff_write::{BitDepth, TiffWriteOptions, write_tiff};
 use mpp_ipc::link::{HostEvent, HostLink};
 use mpp_ipc::protocol::{InitMessage, SessionMode};
 use mpp_ipc::shm::ShmSegment;
@@ -281,11 +281,14 @@ fn run_write<R: Read, W: Write>(
 
     // `staging` is fully covered here: the `Finish` arm above already
     // returned early if `first_uncovered()` found a gap, so every `row()`
-    // call `write_bigtiff` makes below reads real data, never the
+    // call `write_tiff` makes below reads real data, never the
     // zero-filled uncovered case documented on `Staging`'s `PlanarRows`
     // impl (see `staging.rs`).
-    let opts = TiffWriteOptions { bit_depth };
-    if let Err(e) = write_bigtiff(&staging, &output_path, &opts) {
+    let opts = TiffWriteOptions {
+        bit_depth,
+        ..Default::default()
+    };
+    if let Err(e) = write_tiff(&staging, &output_path, &opts) {
         // The encoder may have left a partial file behind; best-effort
         // clean it up rather than leaving a corrupt-looking output file
         // for the host to trip over after we've already reported failure.

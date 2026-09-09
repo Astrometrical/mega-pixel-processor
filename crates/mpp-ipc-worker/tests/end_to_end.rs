@@ -60,14 +60,18 @@ fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// BigTIFF magic: little-endian "II", version 43 (0x2B) — `tiff.rs`'s own
-/// unit tests check the same bytes.
-fn assert_bigtiff_magic(path: &Path) {
+/// Classic TIFF magic: little-endian "II", version 42 (0x2A).
+///
+/// The worker leaves `Container::Auto`, so these small test images come out
+/// as classic TIFF; the container is not what these tests are about, they
+/// just need the output to be a TIFF the decoder below can open. BigTIFF is
+/// covered by `mpp`'s `big_smoke` test, which writes a real >4 GB payload.
+fn assert_tiff_magic(path: &Path) {
     let head = std::fs::read(path).unwrap();
     assert_eq!(
         &head[0..4],
-        &[0x49, 0x49, 0x2B, 0x00],
-        "expected BigTIFF magic bytes at the start of {}",
+        &[0x49, 0x49, 0x2A, 0x00],
+        "expected classic TIFF magic bytes at the start of {}",
         path.display()
     );
 }
@@ -79,7 +83,7 @@ fn assert_bigtiff_magic(path: &Path) {
 /// 64x48x1, f32, `band_rows: 7` — doesn't divide 48 (48 = 6*7 + 6), so the
 /// last band of the run is a genuine partial band. Every decoded sample
 /// must equal `pixel(y, x)` exactly: f32 is passthrough end to end (shm →
-/// staging → BigTIFF), so there is no rounding to tolerate.
+/// staging → TIFF), so there is no rounding to tolerate.
 #[test]
 fn gray_f32_roundtrip() {
     let dir = tmpdir("gray-f32");
@@ -99,7 +103,7 @@ fn gray_f32_roundtrip() {
     };
     run_write_session(&cfg, pixel).expect("write session should succeed");
 
-    assert_bigtiff_magic(&out);
+    assert_tiff_magic(&out);
     let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
     assert_eq!(dec.dimensions().unwrap(), (width as u32, height as u32));
     match dec.read_image().unwrap() {
@@ -148,7 +152,7 @@ fn rgb_u16_roundtrip() {
     };
     run_write_session(&cfg, pixel).expect("write session should succeed");
 
-    assert_bigtiff_magic(&out);
+    assert_tiff_magic(&out);
     let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
     assert_eq!(dec.dimensions().unwrap(), (width as u32, height as u32));
     match dec.read_image().unwrap() {
@@ -158,7 +162,13 @@ fn rgb_u16_roundtrip() {
                 for x in 0..width {
                     for c in 0..channels {
                         let idx = ((y * width + x) * channels + c) as usize;
-                        let expected = (pixel(c, y, x).clamp(0.0, 1.0) * 65535.0).round() as u16;
+                        // Mirror `Sample::from_unit_f32`, which scales in
+                        // f64. The old f32 product rounded a value a hair
+                        // below .5 (54612.4987 here) up to exactly 54612.5
+                        // and then away from zero, giving a 1-LSB-high
+                        // answer; scaling in f64 does not.
+                        let expected =
+                            (f64::from(pixel(c, y, x).clamp(0.0, 1.0)) * 65535.0).round() as u16;
                         assert_eq!(
                             data[idx], expected,
                             "mismatch at row {y} col {x} channel {c}"
@@ -180,7 +190,7 @@ fn rgb_u16_roundtrip() {
 /// Same geometry/pixel formula as `gray_f32_roundtrip`, but driven through
 /// `run_write_session_shuffled` (bands sent in reverse order). The
 /// worker's staging file reassembles arbitrary-order bands into the same
-/// planar layout regardless of arrival order, so the resulting BigTIFF
+/// planar layout regardless of arrival order, so the resulting TIFF
 /// must be byte-for-byte identical to the in-order run.
 #[test]
 fn shuffled_band_order() {
@@ -209,7 +219,7 @@ fn shuffled_band_order() {
     run_write_session_shuffled(&cfg_shuffled, pixel)
         .expect("shuffled write session should succeed");
 
-    assert_bigtiff_magic(&out_shuffled);
+    assert_tiff_magic(&out_shuffled);
     let in_order_bytes = std::fs::read(&out_in_order).unwrap();
     let shuffled_bytes = std::fs::read(&out_shuffled).unwrap();
     assert_eq!(

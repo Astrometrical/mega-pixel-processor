@@ -5,7 +5,7 @@ use common::{synth_xisf, tmpdir, vips_on_path};
 use std::process::Command;
 
 #[test]
-fn convert_produces_bigtiff() {
+fn convert_produces_classic_tiff_for_a_small_image() {
     let dir = tmpdir("ok");
     let input = dir.join("in.xisf");
     synth_xisf(&input, 8, 8);
@@ -19,8 +19,12 @@ fn convert_produces_bigtiff() {
         .unwrap();
     assert!(status.success());
 
+    // Classic TIFF magic: little-endian "II", version 42 (0x2A). The CLI
+    // leaves `Container::Auto`, which picks classic for anything under the
+    // 4 GB limit; `big_smoke.rs` covers the BigTIFF side with a real
+    // >4 GB payload.
     let head = std::fs::read(&output).unwrap();
-    assert_eq!(&head[0..4], &[0x49, 0x49, 0x2B, 0x00], "BigTIFF magic");
+    assert_eq!(&head[0..4], &[0x49, 0x49, 0x2A, 0x00], "classic TIFF magic");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

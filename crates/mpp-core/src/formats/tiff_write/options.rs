@@ -89,8 +89,7 @@ pub struct Resolution {
     pub unit: ResolutionUnit,
 }
 
-/// Options for `crate::formats::tiff_write::write_tiff` (added by a later
-/// task; not yet an intra-doc link until it exists).
+/// Options for [`crate::formats::tiff_write::write_tiff`].
 #[derive(Debug, Clone, Default)]
 pub struct TiffWriteOptions {
     /// Output sample format.

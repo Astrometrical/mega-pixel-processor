@@ -249,7 +249,7 @@ impl PlanarRows<f32> for Staging {
     /// starts zero-filled and this accessor does not consult `coverage` at
     /// all — so a caller must only read through this trait impl once
     /// [`Staging::is_complete`] is `true`. The worker's event loop (task 6)
-    /// enforces that shape directly: it only reaches the `write_bigtiff`
+    /// enforces that shape directly: it only reaches the `write_tiff`
     /// call after its `Finish` handler has confirmed
     /// [`Staging::first_uncovered`] returns `None`, so a partially-covered
     /// image is never streamed through the encoder.

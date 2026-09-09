@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::formats::tiff::{BitDepth, TiffWriteOptions, write_bigtiff};
+use crate::formats::tiff_write::{BitDepth, TiffWriteOptions, write_tiff};
 use crate::formats::xisf::XisfImage;
 use crate::wcs::sidecar::{WcsSidecar, sidecar_path};
 use crate::{Error, Result};
@@ -11,7 +11,7 @@ use crate::{Error, Result};
 /// Supported output containers, chosen by file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// BigTIFF, written natively by [`crate::formats::tiff`].
+    /// TIFF/BigTIFF, written natively by [`crate::formats::tiff_write`].
     BigTiff,
     /// PNG via vips `pngsave` (8/16-bit).
     Png,
@@ -184,7 +184,7 @@ fn interchange_path(output: &Path) -> PathBuf {
 
 /// Convert `input` (XISF) to `output`, whose extension selects the
 /// [`OutputFormat`]: [`OutputFormat::BigTiff`] is written natively by
-/// [`write_bigtiff`], while png/jpg/webp/avif/jxl are produced by writing a
+/// [`write_tiff`], while png/jpg/webp/avif/jxl are produced by writing a
 /// temp BigTIFF interchange file next to the output and spawning `vips` to
 /// convert it to the final container, writing the WCS sidecar next to the
 /// output when the input carries an astrometric solution and `opts.sidecar`
@@ -235,9 +235,12 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         ));
     }
     img.advise_sequential();
-    let tiff_opts = TiffWriteOptions { bit_depth: depth };
+    let tiff_opts = TiffWriteOptions {
+        bit_depth: depth,
+        ..Default::default()
+    };
     match format {
-        OutputFormat::BigTiff => write_bigtiff(&img, output, &tiff_opts)?,
+        OutputFormat::BigTiff => write_tiff(&img, output, &tiff_opts)?,
         _ => {
             let vips_bin = crate::vips::vips_available().ok_or_else(|| {
                 Error::format(
@@ -248,7 +251,7 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
             })?;
             let tmp = interchange_path(output);
             let _guard = TempFileGuard(tmp.clone());
-            write_bigtiff(&img, &tmp, &tiff_opts)?;
+            write_tiff(&img, &tmp, &tiff_opts)?;
             let dest_spec = format!(
                 "{}{}",
                 output.display(),

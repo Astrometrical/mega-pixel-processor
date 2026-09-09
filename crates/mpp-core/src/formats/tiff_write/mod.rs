@@ -8,9 +8,12 @@
 //! owning the tag set — see the tests, which assert on raw tag values as
 //! well as decoded pixels.
 
+pub mod encode;
 pub mod options;
 pub mod sample;
 
+pub use crate::formats::tiff::BitDepth;
+pub use encode::{write_tiff, write_tiff_native};
 pub use options::{
     AlphaMode, Compression, Container, Layout, Resolution, ResolutionUnit, TiffWriteOptions,
 };
