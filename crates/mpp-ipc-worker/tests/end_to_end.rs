@@ -852,3 +852,66 @@ fn text_and_resolution_tags_reach_the_file() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 14. u8_bands_reach_the_file_bit_exact
+// ---------------------------------------------------------------------------
+
+/// The last of the five `band_format`s to get an end-to-end exercise, and
+/// the narrowest: `u8` bands must reach the file as 8-bit samples, byte for
+/// byte, with `BitsPerSample = 8`.
+///
+/// Narrow rather than wide is the risk here. A `u8` band is one byte per
+/// sample, so every stride, slot-size and staging calculation the worker
+/// makes is at its smallest — an off-by-one that a 4-byte `f32` band
+/// absorbs (its rows are 4x longer than the slot's alignment unit) shows up
+/// immediately at width 1. Multiple rows and a 3-row image over a 2-row
+/// band deliberately force a partial final band.
+#[test]
+fn u8_bands_reach_the_file_bit_exact() {
+    let dir = tmpdir("e2e-u8");
+    let out = dir.join("out.tif");
+    let (width, height) = (5u64, 3u64);
+    // Both endpoints of the range plus the two values a signed/unsigned mix-up
+    // would corrupt (0x80 and 0xFF).
+    let value = |y: u64, x: u64| -> u8 {
+        const PATTERN: [u8; 15] = [
+            0, 1, 127, 128, 255, 2, 254, 64, 192, 3, 253, 65, 191, 4, 252,
+        ];
+        PATTERN[(y * width + x) as usize]
+    };
+
+    let cfg = TestHostConfig {
+        bit_depth: "u8".to_string(),
+        band_format: "u8".to_string(),
+        band_rows: 2,
+        slots: 2,
+        ..TestHostConfig::write(
+            env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+            out.clone(),
+            width,
+            height,
+            1,
+        )
+    };
+    let bytes_written = run_write_session_typed(&cfg, |_c, y: u64, x: u64| value(y, x))
+        .expect("u8 write session should succeed");
+    assert!(bytes_written > 0);
+
+    let expected: Vec<u8> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| value(y, x)))
+        .collect();
+
+    let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(dec.dimensions().unwrap(), (width as u32, height as u32));
+    assert_eq!(
+        dec.get_tag_u64_vec(tiff::tags::Tag::BitsPerSample).unwrap(),
+        vec![8]
+    );
+    match dec.read_image().unwrap() {
+        DecodingResult::U8(data) => assert_eq!(data, expected),
+        other => panic!("expected U8 samples, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
