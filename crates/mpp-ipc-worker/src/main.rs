@@ -521,6 +521,22 @@ fn validate_init(init: &InitMessage) -> Result<WriteSetup, String> {
         ));
     }
 
+    // Validated unconditionally, like every other v3 string enum: an
+    // unrecognised name is refused rather than silently defaulting to inch,
+    // which would denominate the resolution tags in a unit the host did not
+    // ask for. (The numeric fields §10.2 calls "genuinely ignored" --
+    // `tile_size`, `deflate_level` -- are the deliberate exception; the
+    // enums are not among them.)
+    let resolution_unit = match init.resolution_unit.as_str() {
+        "inch" => ResolutionUnit::Inch,
+        "cm" => ResolutionUnit::Centimeter,
+        other => {
+            return Err(format!(
+                "unknown resolution unit {other:?} (expected \"inch\" or \"cm\")"
+            ));
+        }
+    };
+
     let options = TiffWriteOptions {
         bit_depth,
         container: match init.container.as_str() {
@@ -576,10 +592,7 @@ fn validate_init(init: &InitMessage) -> Result<WriteSetup, String> {
         resolution: (init.x_resolution > 0.0 && init.y_resolution > 0.0).then_some(Resolution {
             x: init.x_resolution,
             y: init.y_resolution,
-            unit: match init.resolution_unit.as_str() {
-                "cm" => ResolutionUnit::Centimeter,
-                _ => ResolutionUnit::Inch,
-            },
+            unit: resolution_unit,
         }),
     };
     // One place owns the consistency rules: mpp-core's validator, the same
@@ -820,6 +833,14 @@ mod tests {
                 "icc_profile",
                 Box::new(|i: &mut InitMessage| i.icc_profile = "not base64!!".to_string()),
             ),
+            (
+                "resolution_unit",
+                Box::new(|i: &mut InitMessage| {
+                    i.x_resolution = 300.0;
+                    i.y_resolution = 300.0;
+                    i.resolution_unit = "centimeter".to_string();
+                }),
+            ),
         ];
         for (name, mutate) in cases {
             let mut init = test_init();
@@ -956,6 +977,38 @@ mod tests {
         // A zero on either axis means "unknown" and writes no tags.
         init.y_resolution = 0.0;
         assert!(validate_init(&init).unwrap().options.resolution.is_none());
+    }
+
+    #[test]
+    fn unknown_resolution_unit_is_refused_rather_than_defaulting_to_inch() {
+        // The whole point: "centimeter" is a plausible spelling of "cm", and
+        // silently writing inch-denominated tags for it is exactly the kind
+        // of quiet substitution this phase exists to remove. Refused whether
+        // or not a resolution is actually set, matching the other four v3
+        // string enums.
+        for (x, y) in [(300.0, 300.0), (0.0, 0.0)] {
+            let mut init = test_init();
+            init.x_resolution = x;
+            init.y_resolution = y;
+            init.resolution_unit = "centimeter".to_string();
+            let err = validate_init(&init)
+                .expect_err("an unknown resolution unit must be refused by name");
+            assert!(err.contains("resolution unit"), "{err}");
+            assert!(err.contains("centimeter"), "{err}");
+        }
+
+        // Both spellings the protocol does define still map through.
+        let mut init = test_init();
+        init.x_resolution = 300.0;
+        init.y_resolution = 300.0;
+        for (name, want) in [
+            ("inch", ResolutionUnit::Inch),
+            ("cm", ResolutionUnit::Centimeter),
+        ] {
+            init.resolution_unit = name.to_string();
+            let res = validate_init(&init).unwrap().options.resolution.unwrap();
+            assert_eq!(res.unit, want, "{name}");
+        }
     }
 
     #[test]
