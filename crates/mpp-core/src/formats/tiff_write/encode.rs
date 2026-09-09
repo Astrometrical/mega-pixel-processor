@@ -101,7 +101,11 @@ pub(crate) fn write_tiff_with_target(
     opts: &TiffWriteOptions,
     target_block_bytes: u64,
 ) -> Result<()> {
-    let container = opts.validate(img.width(), img.height(), img.channels())?;
+    let container = resolve_container(
+        opts,
+        path,
+        opts.validate(img.width(), img.height(), img.channels())?,
+    );
     let src = UnitF32Source(img);
     let mut buf = create(path)?;
     // One arm per output sample format: `O` is chosen here and nowhere else.
@@ -144,12 +148,53 @@ pub fn write_tiff_native<T: Sample>(
             opts.bit_depth
         )));
     }
-    let container = opts.validate(img.width(), img.height(), img.channels())?;
+    let container = resolve_container(
+        opts,
+        path,
+        opts.validate(img.width(), img.height(), img.channels())?,
+    );
     let src = NativeSource(img);
     let mut buf = create(path)?;
     let result =
         encode_container::<T, _, _>(container, &src, &mut buf, opts, TARGET_BLOCK_BYTES, path);
     finish_file(result, buf, path)
+}
+
+/// True for the two extensions that name BigTIFF specifically.
+///
+/// `.tif`/`.tiff` say nothing about which container is inside and are
+/// deliberately excluded: those are the ones `Container::Auto`'s size
+/// heuristic is for.
+fn declares_bigtiff(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("btf") || e.eq_ignore_ascii_case("tf8"))
+}
+
+/// Let a BigTIFF-declaring output extension override [`Container::Auto`]'s
+/// size heuristic.
+///
+/// `.btf` and `.tf8` are container declarations, not just TIFF-family
+/// extensions — the PixInsight module claims them as BigTIFF and
+/// `integration/pixinsight/README.md` documents them that way — so writing
+/// a classic TIFF into one because the payload happened to fit under 4 GB
+/// would contradict the name the caller chose. Honouring the extension
+/// beats the size heuristic here; a BigTIFF is legal at any size, whereas a
+/// classic TIFF in a `.btf` is a file whose name lies about its contents.
+///
+/// An explicit [`Container::Classic`] is left alone rather than upgraded or
+/// rejected: the caller named the container in so many words and
+/// [`TiffWriteOptions::validate`] already accepted it, so overriding it
+/// would be the writer second-guessing an explicit request. Only `Auto` —
+/// the "you decide" answer — is open to the extension's opinion.
+fn resolve_container(opts: &TiffWriteOptions, path: &Path, validated: Container) -> Container {
+    if opts.container == Container::Auto
+        && validated == Container::Classic
+        && declares_bigtiff(path)
+    {
+        return Container::Big;
+    }
+    validated
 }
 
 /// Create the output file, wrapped for buffered writing.
@@ -663,6 +708,84 @@ mod tests {
         assert!(
             !out.exists(),
             "a rejected write must not leave a file behind"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// BigTIFF magic on a little-endian host: `II` (byte order) then version
+    /// 43 = `0x2B`, little-endian. Classic TIFF is `II` then version 42 =
+    /// `0x2A`. A big-endian host writes `MM` and the version big-endian
+    /// instead — the `tiff` crate takes the file's byte-order mark from
+    /// `target_endian` — so every assertion on these bytes is gated on the
+    /// host's endianness.
+    #[cfg(target_endian = "little")]
+    fn magic(path: &std::path::Path) -> [u8; 4] {
+        let head = std::fs::read(path).unwrap();
+        [head[0], head[1], head[2], head[3]]
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn an_explicit_big_container_writes_bigtiff_magic() {
+        let dir = tmpdir("big-magic");
+        let out = dir.join("out.tif");
+        let img = Synth::new(4, 4, 1);
+        write_tiff(
+            &img,
+            &out,
+            &TiffWriteOptions {
+                container: Container::Big,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(magic(&out), [0x49, 0x49, 0x2B, 0x00], "BigTIFF magic");
+
+        // The same image under the default `Auto` is small enough for
+        // classic, which is the contrast this test exists to show.
+        let classic = dir.join("classic.tif");
+        write_tiff(&img, &classic, &TiffWriteOptions::default()).unwrap();
+        assert_eq!(
+            magic(&classic),
+            [0x49, 0x49, 0x2A, 0x00],
+            "classic TIFF magic"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn a_bigtiff_extension_overrides_auto_for_a_small_image() {
+        let dir = tmpdir("btf-ext");
+        let img = Synth::new(4, 4, 1);
+        // `.btf` and `.tf8` name BigTIFF, so `Auto` must not pick classic
+        // for them however small the payload is. `.TF8` proves the match is
+        // case-insensitive.
+        for name in ["out.btf", "out.tf8", "out.TF8"] {
+            let out = dir.join(name);
+            write_tiff(&img, &out, &TiffWriteOptions::default()).unwrap();
+            assert_eq!(
+                magic(&out),
+                [0x49, 0x49, 0x2B, 0x00],
+                "BigTIFF magic in {name}"
+            );
+        }
+        // An explicit `Classic` is an explicit request, so the extension
+        // does not override it.
+        let explicit = dir.join("explicit.btf");
+        write_tiff(
+            &img,
+            &explicit,
+            &TiffWriteOptions {
+                container: Container::Classic,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            magic(&explicit),
+            [0x49, 0x49, 0x2A, 0x00],
+            "an explicit Container::Classic stays classic"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

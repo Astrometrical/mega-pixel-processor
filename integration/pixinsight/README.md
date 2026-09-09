@@ -16,9 +16,12 @@ the module's identity, binary name, or install layout is BigTIFF-specific.
 
 The `BigTIFF` format:
 
-- **Writes** BigTIFF (`.tif`, `.tiff`, `.btf`, `.tf8`) from inside
+- **Writes** TIFF/BigTIFF (`.tif`, `.tiff`, `.btf`, `.tf8`) from inside
   PixInsight's own Save/Save As dialogs — past classic TIFF's 4 GB limit,
-  without going through `mpp`'s CLI (phase 2).
+  without going through `mpp`'s CLI (phase 2). `.btf`/`.tf8` name BigTIFF
+  and always get it; `.tif`/`.tiff` get classic TIFF when the pixel data
+  fits under 4 GB and BigTIFF when it does not, so an ordinary-sized `.tif`
+  opens in the widest possible set of readers.
 - **Reads** whole-image TIFF and BigTIFF files with the same four
   extensions (phase 3) back into PixInsight, including plain (non-Big)
   stripped/tiled TIFFs the module didn't itself write — the general
@@ -459,9 +462,11 @@ Deferred to a later phase (not implemented by this module today):
   narrowed to `f32`), no alpha, no ICC profile, no Image Description /
   Copyright / Software tags, no resolution, and no tiled output. Scoped in
   `docs/tiff-parity.md`.
-- **Classic (non-Big) TIFF *writing*.** The write path only ever produces
-  BigTIFF; reading classic TIFF is supported (see "Read support"), writing
-  it is not.
+- **Choosing the container explicitly.** The write path picks it: `.btf`
+  and `.tf8` always get BigTIFF, `.tif`/`.tiff` get classic below 4 GB and
+  BigTIFF above it. There is no way to ask for BigTIFF in a small `.tif`,
+  or for the write to fail rather than silently widen — both need the
+  format-options dialog below.
 - A format-options dialog (no options exposed).
 - Non-blocking abort wiring (see "Known v1 limitation" above) — write path
   only; there is no read-side cancellation concern since a read session has
