@@ -16,7 +16,7 @@ use tiff::encoder::compression::{
 use tiff::encoder::{TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard};
 use tiff::tags::Tag;
 
-use super::options::{AlphaMode, Compression, Container, Layout, TiffWriteOptions};
+use super::options::{AlphaMode, Compression, Container, Layout, ResolutionUnit, TiffWriteOptions};
 use super::sample::Sample;
 use crate::formats::PlanarRows;
 use crate::formats::tiff::BitDepth;
@@ -490,6 +490,50 @@ where
                 .map_err(terr)?;
         }
         _ => unreachable!("rows_per_strip is Some exactly for Layout::Strips"),
+    }
+
+    // -- embedded metadata ----------------------------------------------
+    // Written only when requested, so a default save keeps producing the
+    // same minimal IFD it always did.
+    if let Some(icc) = &opts.icc_profile {
+        // Tag 34675 is UNDEFINED-typed, but `impl TiffValue for [u8]`
+        // declares Type::BYTE, so `write_tag` would label it wrongly. Build
+        // the entry with an explicit type instead and splice it in.
+        let entry = dir
+            .write_entry_bytes(tiff::tags::Type::UNDEFINED, &icc[..])
+            .map_err(terr)?;
+        let mut extra = tiff::Directory::empty();
+        extra.extend([(Tag::IccProfile, entry)]);
+        dir.extend_from(&extra);
+    }
+    for (tag, value) in [
+        (Tag::ImageDescription, &opts.description),
+        (Tag::Copyright, &opts.copyright),
+        (Tag::Software, &opts.software),
+    ] {
+        if let Some(text) = value {
+            // Pass the bare string: `impl TiffValue for str` appends the
+            // terminating NUL itself and *rejects* a value that already
+            // contains one, or any non-ASCII byte. `TiffWriteOptions::validate`
+            // rejects such values before the file is created, so this
+            // should never actually hit that rejection path.
+            dir.write_tag(tag, text.as_str()).map_err(terr)?;
+        }
+    }
+    if let Some(res) = &opts.resolution {
+        // RATIONAL tags: a denominator of 1000 keeps the common values
+        // (72, 300, 1200 dpi) exact.
+        let rat = |v: f64| tiff::encoder::Rational {
+            n: (v * 1000.0).round().clamp(0.0, f64::from(u32::MAX)) as u32,
+            d: 1000,
+        };
+        dir.write_tag(Tag::XResolution, rat(res.x)).map_err(terr)?;
+        dir.write_tag(Tag::YResolution, rat(res.y)).map_err(terr)?;
+        let unit: u16 = match res.unit {
+            ResolutionUnit::Inch => 2,
+            ResolutionUnit::Centimeter => 3,
+        };
+        dir.write_tag(Tag::ResolutionUnit, unit).map_err(terr)?;
     }
 
     dir.finish().map_err(terr)?;
@@ -1310,6 +1354,79 @@ mod tests {
                 }
             }
             other => panic!("expected F32, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_tags_are_written_when_requested() {
+        use crate::formats::tiff_write::options::{Resolution, ResolutionUnit};
+        let dir = tmpdir("meta");
+        let out = dir.join("out.tif");
+        let img = Synth::new(4, 4, 1);
+        let icc: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let opts = TiffWriteOptions {
+            icc_profile: Some(icc.clone()),
+            description: Some("M31 mosaic".to_string()),
+            copyright: Some("Copyright (c) 2026 Astrometrical".to_string()),
+            software: Some("Mega Pixel Processor 0.1.0".to_string()),
+            resolution: Some(Resolution {
+                x: 300.0,
+                y: 300.0,
+                unit: ResolutionUnit::Inch,
+            }),
+            ..Default::default()
+        };
+        write_tiff(&img, &out, &opts).unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u8_vec(Tag::IccProfile).unwrap(), icc);
+        assert_eq!(
+            dec.get_tag_ascii_string(Tag::ImageDescription).unwrap(),
+            "M31 mosaic"
+        );
+        assert_eq!(
+            dec.get_tag_ascii_string(Tag::Copyright).unwrap(),
+            "Copyright (c) 2026 Astrometrical"
+        );
+        assert_eq!(
+            dec.get_tag_ascii_string(Tag::Software).unwrap(),
+            "Mega Pixel Processor 0.1.0"
+        );
+        // `tiff` 0.11.3's `Value::into_f64` only matches `Value::Double`, not
+        // `Value::Rational` — a RATIONAL-typed tag never converts to f64
+        // through `get_tag_f64` (confirmed by reading `decoder::ifd::Value`
+        // in the vendored source: `into_f64` has no `Rational` arm and falls
+        // through to `InvalidTypeForTag`). So this reads the raw
+        // numerator/denominator instead of asserting through `get_tag_f64`.
+        for tag in [Tag::XResolution, Tag::YResolution] {
+            match dec.get_tag(tag).unwrap() {
+                tiff::decoder::ifd::Value::Rational(n, d) => {
+                    assert_eq!((n, d), (300_000, 1000), "{tag:?}");
+                    assert_eq!(n as f64 / d as f64, 300.0, "{tag:?} as f64");
+                }
+                other => panic!("expected {tag:?} to be Rational, got {other:?}"),
+            }
+        }
+        assert_eq!(dec.get_tag_u64(Tag::ResolutionUnit).unwrap(), 2); // inch
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_tags_are_absent_when_not_requested() {
+        let dir = tmpdir("nometa");
+        let out = dir.join("out.tif");
+        let img = Synth::new(4, 4, 1);
+        write_tiff(&img, &out, &TiffWriteOptions::default()).unwrap();
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        for tag in [
+            Tag::IccProfile,
+            Tag::ImageDescription,
+            Tag::Copyright,
+            Tag::Software,
+            Tag::XResolution,
+        ] {
+            assert!(dec.get_tag(tag).is_err(), "{tag:?} should be absent");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

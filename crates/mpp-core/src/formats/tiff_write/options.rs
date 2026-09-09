@@ -182,6 +182,32 @@ impl TiffWriteOptions {
             )));
         }
 
+        // The `tiff` crate's `impl TiffValue for str` writes these as
+        // Type::ASCII and appends its own NUL terminator; it rejects a
+        // value that already contains a NUL or any non-ASCII byte, failing
+        // mid-encode with an opaque error. Catch it here instead, before
+        // any output file is created, and say what would make it legal.
+        for (field, value) in [
+            ("description", &self.description),
+            ("copyright", &self.copyright),
+            ("software", &self.software),
+        ] {
+            if let Some(text) = value {
+                if !text.is_ascii() {
+                    return Err(Error::invalid(format!(
+                        "{field} must be pure ASCII (TIFF's ASCII tag type cannot encode \
+                         non-ASCII bytes); got {text:?}"
+                    )));
+                }
+                if text.contains('\0') {
+                    return Err(Error::invalid(format!(
+                        "{field} must not contain an embedded NUL (TIFF's ASCII tag type \
+                         appends its own terminator); got {text:?}"
+                    )));
+                }
+            }
+        }
+
         // Uncompressed payload; compression only ever shrinks it, so a
         // classic container that fits this bound always fits the real file.
         let payload = width
@@ -316,5 +342,46 @@ mod tests {
     fn channel_count_outside_one_to_four_is_rejected() {
         assert!(opts().validate(8, 8, 0).is_err());
         assert!(opts().validate(8, 8, 5).is_err());
+    }
+
+    #[test]
+    fn text_metadata_must_be_ascii_without_embedded_nul() {
+        let o = TiffWriteOptions {
+            description: Some("caf\u{e9}".to_string()),
+            ..opts()
+        };
+        let err = o.validate(8, 8, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("description"),
+            "error should name the field, got: {err}"
+        );
+
+        let o = TiffWriteOptions {
+            copyright: Some("bad\0nul".to_string()),
+            ..opts()
+        };
+        let err = o.validate(8, 8, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("copyright"),
+            "error should name the field, got: {err}"
+        );
+
+        let o = TiffWriteOptions {
+            software: Some("caf\u{e9}".to_string()),
+            ..opts()
+        };
+        let err = o.validate(8, 8, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("software"),
+            "error should name the field, got: {err}"
+        );
+
+        let o = TiffWriteOptions {
+            description: Some("M31 mosaic".to_string()),
+            copyright: Some("Copyright (c) 2026 Astrometrical".to_string()),
+            software: Some("Mega Pixel Processor 0.1.0".to_string()),
+            ..opts()
+        };
+        assert!(o.validate(8, 8, 1).is_ok());
     }
 }
