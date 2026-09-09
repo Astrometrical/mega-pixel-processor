@@ -13,7 +13,7 @@
 // round trip against the real worker, with no PixInsight involved anywhere.
 //
 // Also covers, standalone (no process spawn needed):
-//   - mpp::kProtocolVersion == 2 (protocol v2, static_assert)
+//   - mpp::kProtocolVersion == 3 (protocol v3, static_assert)
 //   - the new tag constants (kTagImageMeta/kTagReadBand/kTagReadBandAck)
 //   - mpp::ParseImageMeta on a literal JSON payload
 // and, using the real worker: mpp::ReadSession::Probe's standalone
@@ -52,7 +52,8 @@ float pixel_value(uint32_t channel, uint64_t row, uint64_t width, uint64_t col) 
 // shaped like the worker's own IMAGE_META frame (docs: crates/mpp-ipc/src/
 // protocol.rs's ImageMeta, mirrored field-for-field by mpp::ImageMeta).
 void check_protocol_constants_and_parse() {
-  static_assert(mpp::kProtocolVersion == 2, "kProtocolVersion must be 2 (read-mode protocol)");
+  static_assert(mpp::kProtocolVersion == 3,
+                "kProtocolVersion must be 3 (native band sample types)");
   static_assert(mpp::kTagImageMeta == 5, "kTagImageMeta must mirror mpp_ipc::protocol::tag::IMAGE_META");
   static_assert(mpp::kTagReadBand == 6, "kTagReadBand must mirror mpp_ipc::protocol::tag::READ_BAND");
   static_assert(mpp::kTagReadBandAck == 132,

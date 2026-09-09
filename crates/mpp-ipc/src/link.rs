@@ -266,6 +266,7 @@ mod tests {
             slot_bytes: 4096,
             slots: 2,
             mode: SessionMode::Write,
+            ..Default::default()
         }
     }
 

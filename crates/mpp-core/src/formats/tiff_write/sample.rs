@@ -8,7 +8,12 @@
 use crate::formats::tiff::BitDepth;
 
 /// A sample type the writer can emit into a TIFF file.
-pub trait Sample: Copy + 'static {
+///
+/// [`bytemuck::Pod`] is a supertrait so callers holding raw sample bytes —
+/// the PixInsight worker's shm slots and its memory-mapped staging file —
+/// can reinterpret them as `&[Self]` without a copy. Every implementor is
+/// a plain numeric primitive, so the bound costs nothing.
+pub trait Sample: bytemuck::Pod {
     /// Value of the `BitsPerSample` tag for this type.
     const BITS_PER_SAMPLE: u16;
     /// Value of the `SampleFormat` tag: `1` unsigned integer, `3` IEEE float.

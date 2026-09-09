@@ -34,7 +34,7 @@ namespace mpp {
 /// contract now lives in `docs/pi-protocol.md` §9 (the wire-shape source of
 /// truth); this header mirrors the Rust definitions in
 /// `crates/mpp-ipc/src/protocol.rs` field-for-field.
-inline constexpr uint32_t kProtocolVersion = 2;
+inline constexpr uint32_t kProtocolVersion = 3;
 
 /// Exact release version of the `mpp-ipc-worker` binary this host library
 /// was built to drive (the worker's `CARGO_PKG_VERSION`). Stamped into

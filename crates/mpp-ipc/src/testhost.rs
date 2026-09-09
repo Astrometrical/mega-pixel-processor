@@ -14,6 +14,10 @@
 //! Slot reuse here is simple and synchronous (fill a slot, send its
 //! `Band`, block for the matching `BandAck` before reusing that slot id):
 //! this module's job is correctness as a reference, not throughput.
+//!
+//! Protocol v3: [`TestHostConfig`] carries the widened `Init` option set,
+//! and [`run_write_session_typed`] pushes bands in the session's own
+//! sample type (`band_format`) rather than always in `f32`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,8 +30,21 @@ use crate::protocol::{
 };
 use crate::shm::ShmSegment;
 
-/// Configuration for one write session: the worker binary to spawn and the
-/// image geometry/band shape to drive it with.
+/// Configuration for one write session: the worker binary to spawn, the
+/// image geometry/band shape to drive it with, and the protocol-v3 write
+/// options to advertise in `Init`.
+///
+/// Every option field mirrors the like-named [`InitMessage`] field and
+/// starts at that field's wire default, so a test spells out only what it
+/// is actually exercising:
+///
+/// ```ignore
+/// TestHostConfig {
+///     bit_depth: "u32".to_string(),
+///     band_format: "u32".to_string(),
+///     ..TestHostConfig::write(worker_exe, out, 6, 1, 1)
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct TestHostConfig {
     /// Path to the `mpp-ipc-worker` binary to spawn.
@@ -38,14 +55,102 @@ pub struct TestHostConfig {
     pub width: u64,
     /// Image height in pixels.
     pub height: u64,
-    /// Channel count: `1` or `3`.
+    /// Channel count: `1`-`4` (2 and 4 need an [`alpha`](Self::alpha) mode).
     pub channels: u64,
-    /// Output sample format: `"f32"`, `"u16"`, or `"u8"`.
+    /// Output sample format: `"f32"`, `"f64"`, `"u32"`, `"u16"` or `"u8"`.
     pub bit_depth: String,
     /// Rows per `Band` frame (the last band of a channel may be shorter).
     pub band_rows: u32,
     /// Number of shm slots to create; bands are round-robined across them.
     pub slots: u32,
+    /// **(v3)** Sample type of the band data placed in shm slots; also
+    /// fixes the slot stride this host computes. Must match the element
+    /// type of the `pixel` closure the session is driven with.
+    pub band_format: String,
+    /// **(v3)** `"auto"`, `"classic"` or `"big"`.
+    pub container: String,
+    /// **(v3)** `"strips"` or `"tiles"`.
+    pub layout: String,
+    /// **(v3)** Tile edge in pixels when `layout == "tiles"`.
+    pub tile_size: u32,
+    /// **(v3)** `"none"`, `"lzw"`, `"deflate"` or `"packbits"`.
+    pub compression: String,
+    /// **(v3)** Deflate level 1-9.
+    pub deflate_level: u8,
+    /// **(v3)** Horizontal differencing predictor.
+    pub predictor: bool,
+    /// **(v3)** `"none"`, `"unassociated"` or `"associated"`.
+    pub alpha: String,
+    /// **(v3)** Base64-encoded ICC profile, empty for none.
+    pub icc_profile: String,
+    /// **(v3)** `ImageDescription`, empty for none.
+    pub description: String,
+    /// **(v3)** `Copyright`, empty for none.
+    pub copyright: String,
+    /// **(v3)** `Software`, empty for none.
+    pub software: String,
+    /// **(v3)** Horizontal resolution; `0` writes no resolution tags.
+    pub x_resolution: f64,
+    /// **(v3)** Vertical resolution; `0` writes no resolution tags.
+    pub y_resolution: f64,
+    /// **(v3)** `"inch"` or `"cm"`.
+    pub resolution_unit: String,
+}
+
+impl TestHostConfig {
+    /// A write-session config for `worker_exe` encoding to `output_path` at
+    /// the given geometry, with every other field at its protocol default
+    /// (f32 bands into an f32 file, uncompressed strips, 8 rows per band,
+    /// 2 slots). Struct-update syntax overrides what a test cares about.
+    pub fn write(
+        worker_exe: PathBuf,
+        output_path: PathBuf,
+        width: u64,
+        height: u64,
+        channels: u64,
+    ) -> Self {
+        let defaults = InitMessage::default();
+        Self {
+            worker_exe,
+            output_path,
+            width,
+            height,
+            channels,
+            bit_depth: defaults.bit_depth,
+            band_rows: 8,
+            slots: 2,
+            band_format: defaults.band_format,
+            container: defaults.container,
+            layout: defaults.layout,
+            tile_size: defaults.tile_size,
+            compression: defaults.compression,
+            deflate_level: defaults.deflate_level,
+            predictor: defaults.predictor,
+            alpha: defaults.alpha,
+            icc_profile: defaults.icc_profile,
+            description: defaults.description,
+            copyright: defaults.copyright,
+            software: defaults.software,
+            x_resolution: defaults.x_resolution,
+            y_resolution: defaults.y_resolution,
+            resolution_unit: defaults.resolution_unit,
+        }
+    }
+
+    /// Bytes per sample of [`band_format`](Self::band_format) — the stride
+    /// this host lays slots out at, and what a band's byte length is
+    /// computed from. Panics on an unknown name, since a config naming a
+    /// sample format the protocol has never had is a test bug, not a
+    /// protocol case worth exercising through the worker.
+    fn band_sample_bytes(&self) -> usize {
+        match self.band_format.as_str() {
+            "u8" => 1,
+            "u16" => 2,
+            "u32" | "f32" => 4,
+            "f64" => 8,
+            other => panic!("TestHostConfig::band_format {other:?} is not a sample format"),
+        }
+    }
 }
 
 /// Spawns the worker, streams `pixel(c, y, x) -> f32` through shm bands in
@@ -60,6 +165,20 @@ pub struct TestHostConfig {
 pub fn run_write_session(
     cfg: &TestHostConfig,
     pixel: impl Fn(u64, u64, u64) -> f32,
+) -> Result<u64, String> {
+    run_write_session_typed(cfg, pixel)
+}
+
+/// [`run_write_session`] for a session whose `band_format` is not `"f32"`:
+/// `pixel` yields the session's own sample type, which this host copies
+/// into shm bit-for-bit (protocol v3's whole point — nothing is routed
+/// through the `f32` domain on the way in).
+///
+/// `S` must match [`TestHostConfig::band_format`]; a mismatch is reported
+/// as `Err` rather than silently laying bands out at the wrong stride.
+pub fn run_write_session_typed<S: bytemuck::Pod>(
+    cfg: &TestHostConfig,
+    pixel: impl Fn(u64, u64, u64) -> S,
 ) -> Result<u64, String> {
     run_bands_in_order(
         cfg,
@@ -169,13 +288,13 @@ pub fn run_oversize_band_session(
 /// `bytes_written` from `Done`. Shared by [`run_write_session`] and
 /// [`run_write_session_shuffled`] — they differ only in the order of the
 /// `bands` list they pass in.
-fn run_bands_in_order(
+fn run_bands_in_order<S: bytemuck::Pod>(
     cfg: &TestHostConfig,
     bands: Vec<BandSpec>,
-    pixel: impl Fn(u64, u64, u64) -> f32,
+    pixel: impl Fn(u64, u64, u64) -> S,
 ) -> Result<u64, String> {
     let mut session = Session::start(cfg)?;
-    let mut buf: Vec<f32> = Vec::new();
+    let mut buf: Vec<S> = Vec::new();
     for (i, (channel, start_row, rows)) in bands.into_iter().enumerate() {
         buf.clear();
         for y in start_row..start_row + rows as u64 {
@@ -227,6 +346,10 @@ struct Session {
     shm: ShmSegment,
     slot_bytes: u64,
     slots: u32,
+    /// Bytes per band sample, from `TestHostConfig::band_format` — the
+    /// stride `slot_bytes` was computed at, checked against the element
+    /// type of every band actually pushed.
+    sample_bytes: usize,
 }
 
 impl Session {
@@ -235,7 +358,7 @@ impl Session {
     /// reply frame is the first `BandAck` (or an `Error`, if `Init` was
     /// rejected).
     fn start(cfg: &TestHostConfig) -> Result<Self, String> {
-        let slot_bytes = cfg.band_rows as u64 * cfg.width * 4;
+        let slot_bytes = cfg.band_rows as u64 * cfg.width * cfg.band_sample_bytes() as u64;
         Self::start_inner(cfg, slot_bytes, slot_bytes)
     }
 
@@ -249,7 +372,7 @@ impl Session {
         cfg: &TestHostConfig,
         advertised_slot_bytes: u64,
     ) -> Result<Self, String> {
-        let physical_slot_bytes = cfg.band_rows as u64 * cfg.width * 4;
+        let physical_slot_bytes = cfg.band_rows as u64 * cfg.width * cfg.band_sample_bytes() as u64;
         Self::start_inner(cfg, physical_slot_bytes, advertised_slot_bytes)
     }
 
@@ -297,6 +420,21 @@ impl Session {
             slot_bytes: advertised_slot_bytes,
             slots: cfg.slots,
             mode: SessionMode::Write,
+            band_format: cfg.band_format.clone(),
+            container: cfg.container.clone(),
+            layout: cfg.layout.clone(),
+            tile_size: cfg.tile_size,
+            compression: cfg.compression.clone(),
+            deflate_level: cfg.deflate_level,
+            predictor: cfg.predictor,
+            alpha: cfg.alpha.clone(),
+            icc_profile: cfg.icc_profile.clone(),
+            description: cfg.description.clone(),
+            copyright: cfg.copyright.clone(),
+            software: cfg.software.clone(),
+            x_resolution: cfg.x_resolution,
+            y_resolution: cfg.y_resolution,
+            resolution_unit: cfg.resolution_unit.clone(),
         };
         let payload = serde_json::to_vec(&init).map_err(|e| format!("encoding Init: {e}"))?;
         write_frame(&mut stdin, tag::INIT, &payload)
@@ -312,6 +450,7 @@ impl Session {
             shm,
             slot_bytes: physical_slot_bytes,
             slots: cfg.slots,
+            sample_bytes: cfg.band_sample_bytes(),
         })
     }
 
@@ -321,16 +460,24 @@ impl Session {
     /// until the corresponding `BandAck` arrives — collecting/ignoring any
     /// interleaved `Progress` frames along the way, and failing loudly on
     /// an `Error` reply or any other unexpected tag.
-    fn send_band_and_await_ack(
+    fn send_band_and_await_ack<S: bytemuck::Pod>(
         &mut self,
         channel: u64,
         start_row: u64,
         rows: u32,
         slot_id: u32,
-        samples: &[f32],
+        samples: &[S],
     ) -> Result<(), String> {
+        if std::mem::size_of::<S>() != self.sample_bytes {
+            return Err(format!(
+                "band sample type is {} bytes but the session's band_format is {} bytes; \
+                 the pixel closure and TestHostConfig::band_format must agree",
+                std::mem::size_of::<S>(),
+                self.sample_bytes
+            ));
+        }
         let offset = self.slot_bytes as usize * slot_id as usize;
-        let byte_len = samples.len() * 4;
+        let byte_len = std::mem::size_of_val(samples);
         self.shm.as_mut_slice()[offset..offset + byte_len]
             .copy_from_slice(bytemuck::cast_slice(samples));
 

@@ -129,6 +129,7 @@ impl ReadSession {
             slot_bytes,
             slots,
             mode: SessionMode::Read,
+            ..Default::default()
         };
         let payload = serde_json::to_vec(&init).unwrap();
         write_frame(&mut stdin, tag::INIT, &payload).expect("write Init frame");

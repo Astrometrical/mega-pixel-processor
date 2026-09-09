@@ -13,6 +13,7 @@ repository = "https://github.com/Astrometrical/mega-pixel-processor"
 mpp-core = { path = "crates/mpp-core" }
 mpp-ipc = { path = "crates/mpp-ipc" }
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

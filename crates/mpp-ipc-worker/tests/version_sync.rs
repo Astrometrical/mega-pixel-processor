@@ -17,9 +17,10 @@
 //! A fourth assertion pins the **wire protocol version** across the language
 //! boundary: the Rust `IPC_PROTOCOL_VERSION` (`crates/mpp-ipc/src/protocol.rs`)
 //! and the C++ host's `kProtocolVersion` (`mpp_protocol.h`) must agree and both
-//! equal `2` (the read-direction protocol; see `docs/pi-protocol.md` §8). The
-//! worker aborts on a `protocol_version` mismatch in `Init`, so a drift here
-//! would break every packaged run exactly like a version-string drift.
+//! equal `3` (native-sample-type bands and the widened write options; see
+//! `docs/pi-protocol.md` §8). The worker aborts on a `protocol_version`
+//! mismatch in `Init`, so a drift here would break every packaged run
+//! exactly like a version-string drift.
 
 use std::path::PathBuf;
 
@@ -73,20 +74,20 @@ fn int_value_on_line(text: &str, name: &str, from: &str) -> u32 {
 }
 
 #[test]
-fn protocol_versions_agree_at_v2() {
+fn protocol_versions_agree_at_v3() {
     let rust = repo_file("crates/mpp-ipc/src/protocol.rs");
     let host = repo_file("integration/pixinsight/host/mpp_protocol.h");
     let rust_version = int_value_on_line(&rust, "IPC_PROTOCOL_VERSION", "protocol.rs");
     let host_version = int_value_on_line(&host, "kProtocolVersion", "mpp_protocol.h");
     assert_eq!(
-        rust_version, 2,
-        "crates/mpp-ipc/src/protocol.rs IPC_PROTOCOL_VERSION must be 2 (the \
-         read-direction wire protocol)"
+        rust_version, 3,
+        "crates/mpp-ipc/src/protocol.rs IPC_PROTOCOL_VERSION must be 3 (native \
+         band sample types and the widened write options)"
     );
     assert_eq!(
-        host_version, 2,
-        "integration/pixinsight/host/mpp_protocol.h kProtocolVersion must be 2 \
-         (the read-direction wire protocol)"
+        host_version, 3,
+        "integration/pixinsight/host/mpp_protocol.h kProtocolVersion must be 3 \
+         (native band sample types and the widened write options)"
     );
     assert_eq!(
         rust_version, host_version,

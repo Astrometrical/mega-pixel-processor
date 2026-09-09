@@ -1,15 +1,20 @@
-//! Mmap-backed planar f32 staging for out-of-order pixel-band arrival.
+//! Mmap-backed planar staging for out-of-order pixel-band arrival.
 //!
 //! The host (PixInsight module) delivers pixel bands over shared memory in
 //! whatever order its own row-generation happens to produce them — not
 //! necessarily row 0 first, not necessarily one channel at a time. [`Staging`]
 //! gives each band a home: a memory-mapped scratch file sized for the whole
-//! image (`width * height * channels * 4` bytes, planar layout — one
-//! contiguous plane per channel, matching [`mpp_core::formats::xisf::XisfImage`]),
-//! plus a per-channel, per-row coverage bitmap so callers can tell when
-//! enough of the image has arrived to resume a paused write, and so a band
-//! landing on already-written rows is rejected rather than silently
-//! corrupting the file.
+//! image (`width * height * channels * size_of::<T>()` bytes, planar layout —
+//! one contiguous plane per channel, matching
+//! [`mpp_core::formats::xisf::XisfImage`]), plus a per-channel, per-row
+//! coverage bitmap so callers can tell when enough of the image has arrived
+//! to resume a paused write, and so a band landing on already-written rows
+//! is rejected rather than silently corrupting the file.
+//!
+//! `T` is the session's negotiated band sample type
+//! (`InitMessage::band_format`, protocol v3): staging the host's own sample
+//! type rather than flattening everything to unit-range `f32` is what lets
+//! `u32` and `f64` pixels reach the encoder intact.
 //!
 //! Once complete (or complete enough for the writer's next strip),
 //! [`Staging`] itself implements [`PlanarRows`], so it drops straight into
@@ -19,6 +24,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use bytemuck::Pod;
 use memmap2::MmapMut;
 use mpp_core::formats::PlanarRows;
 
@@ -74,14 +80,21 @@ pub enum StagingError {
     },
 }
 
-/// Mmap-backed planar f32 staging for out-of-order band arrival.
+/// Mmap-backed planar staging for out-of-order band arrival.
+///
+/// The type parameter is the sample type the session negotiated
+/// (`InitMessage::band_format`). The staging file is
+/// `width * height * channels * size_of::<T>()` bytes, mapped read/write, so
+/// out-of-order bands land at their final position and the encoder drains
+/// the result through [`PlanarRows<T>`] without a second copy or a
+/// conversion.
 ///
 /// Backed by a scratch file (see [`create`](Staging::create)) rather than an
 /// in-memory buffer: staged images run to multiple gigabytes, and mapping a
 /// file lets the OS page staged data out under memory pressure instead of
 /// forcing it all resident. The file is deleted on [`remove`](Staging::remove)
 /// (or best-effort on `Drop` if the caller never calls it).
-pub struct Staging {
+pub struct Staging<T> {
     path: PathBuf,
     mmap: MmapMut,
     width: u64,
@@ -93,15 +106,21 @@ pub struct Staging {
     /// Set by [`remove`](Staging::remove) so `Drop` doesn't attempt (and
     /// silently ignore failing) a second deletion.
     removed: bool,
+    /// `Staging` owns no `T` value — the samples live in the mapping, read
+    /// back through [`PlanarRows`] — so the parameter is carried here.
+    _sample: std::marker::PhantomData<T>,
 }
 
-impl Staging {
+impl<T: Pod> Staging<T> {
+    /// Bytes one sample of `T` occupies in the staging file.
+    const SAMPLE_BYTES: usize = std::mem::size_of::<T>();
+
     /// Create a new staging file at `path`, sized for a `width x height x
-    /// channels` planar f32 image, and map it read/write. The file is
-    /// created (or truncated, if it already exists) and grown to the full
-    /// image size up front — writes never resize it.
+    /// channels` planar image of `T` samples, and map it read/write. The
+    /// file is created (or truncated, if it already exists) and grown to the
+    /// full image size up front — writes never resize it.
     pub fn create(path: &Path, width: u64, height: u64, channels: u64) -> io::Result<Self> {
-        let total_bytes = width * height * channels * 4;
+        let total_bytes = width * height * channels * Self::SAMPLE_BYTES as u64;
         let file: File = OpenOptions::new()
             .read(true)
             .write(true)
@@ -122,12 +141,13 @@ impl Staging {
             channels,
             coverage: vec![vec![false; height as usize]; channels as usize],
             removed: false,
+            _sample: std::marker::PhantomData,
         })
     }
 
     /// Byte offset of the start of channel `c`'s plane.
     fn channel_offset(&self, c: u64) -> usize {
-        (c * self.width * self.height * 4) as usize
+        (c * self.width * self.height * Self::SAMPLE_BYTES as u64) as usize
     }
 
     /// Copy one band (a run of consecutive rows of one channel) into the
@@ -140,7 +160,7 @@ impl Staging {
         &mut self,
         channel: u64,
         start_row: u64,
-        samples: &[f32],
+        samples: &[T],
     ) -> Result<(), StagingError> {
         if self.width == 0 || !(samples.len() as u64).is_multiple_of(self.width) {
             return Err(StagingError::NotRowAligned {
@@ -176,9 +196,9 @@ impl Staging {
             });
         }
 
-        let row_bytes = self.width as usize * 4;
+        let row_bytes = self.width as usize * Self::SAMPLE_BYTES;
         let offset = self.channel_offset(channel) + start_row as usize * row_bytes;
-        let byte_len = samples.len() * 4;
+        let byte_len = samples.len() * Self::SAMPLE_BYTES;
         self.mmap[offset..offset + byte_len].copy_from_slice(bytemuck::cast_slice(samples));
 
         let cov = &mut self.coverage[channel as usize];
@@ -222,7 +242,7 @@ impl Staging {
     }
 }
 
-impl Drop for Staging {
+impl<T> Drop for Staging<T> {
     fn drop(&mut self) {
         if !self.removed {
             let _ = std::fs::remove_file(&self.path);
@@ -230,7 +250,7 @@ impl Drop for Staging {
     }
 }
 
-impl PlanarRows<f32> for Staging {
+impl<T: Pod> PlanarRows<T> for Staging<T> {
     fn width(&self) -> u64 {
         self.width
     }
@@ -253,10 +273,10 @@ impl PlanarRows<f32> for Staging {
     /// call after its `Finish` handler has confirmed
     /// [`Staging::first_uncovered`] returns `None`, so a partially-covered
     /// image is never streamed through the encoder.
-    fn row(&self, c: u64, y: u64) -> &[f32] {
+    fn row(&self, c: u64, y: u64) -> &[T] {
         assert!(c < self.channels, "channel {c} out of range");
         assert!(y < self.height, "row {y} out of range");
-        let row_bytes = self.width as usize * 4;
+        let row_bytes = self.width as usize * Self::SAMPLE_BYTES;
         let offset = self.channel_offset(c) + y as usize * row_bytes;
         bytemuck::cast_slice(&self.mmap[offset..offset + row_bytes])
     }
@@ -287,7 +307,7 @@ mod tests {
     #[test]
     fn out_of_order_bands_land_in_the_right_place() {
         let path = tmp_path("out-of-order");
-        let mut s = Staging::create(&path, 4, 3, 2).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 2).unwrap();
 
         // Deliberately scrambled arrival order across channels and rows.
         s.write_band(1, 2, &band(4, 1, 2, 1)).unwrap(); // ch1 row 2
@@ -306,7 +326,7 @@ mod tests {
     #[test]
     fn overlap_is_rejected() {
         let path = tmp_path("overlap");
-        let mut s = Staging::create(&path, 4, 3, 1).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 1).unwrap();
         s.write_band(0, 0, &band(4, 0, 0, 2)).unwrap(); // rows 0..2
         let err = s.write_band(0, 1, &band(4, 0, 1, 2)).unwrap_err(); // rows 1..3, overlaps row 1
         assert_eq!(
@@ -323,7 +343,7 @@ mod tests {
     #[test]
     fn out_of_range_channel_and_rows_are_rejected() {
         let path = tmp_path("out-of-range");
-        let mut s = Staging::create(&path, 4, 3, 2).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 2).unwrap();
 
         // Channel past the end.
         let err = s.write_band(2, 0, &band(4, 2, 0, 1)).unwrap_err();
@@ -346,7 +366,7 @@ mod tests {
     #[test]
     fn samples_not_a_multiple_of_width_are_rejected() {
         let path = tmp_path("not-aligned");
-        let mut s = Staging::create(&path, 4, 3, 1).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 1).unwrap();
         let err = s.write_band(0, 0, &[0.0; 5]).unwrap_err();
         assert_eq!(
             err,
@@ -363,7 +383,7 @@ mod tests {
     #[test]
     fn first_uncovered_walks_channel_major_then_row() {
         let path = tmp_path("first-uncovered");
-        let mut s = Staging::create(&path, 4, 3, 2).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 2).unwrap();
         assert_eq!(s.first_uncovered(), Some((0, 0)));
 
         s.write_band(0, 0, &band(4, 0, 0, 1)).unwrap(); // ch0 row 0
@@ -388,7 +408,7 @@ mod tests {
     #[test]
     fn rows_received_counts_across_channels() {
         let path = tmp_path("rows-received");
-        let mut s = Staging::create(&path, 4, 3, 2).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 2).unwrap();
         assert_eq!(s.rows_received(), 0);
         s.write_band(0, 0, &band(4, 0, 0, 2)).unwrap();
         assert_eq!(s.rows_received(), 2);
@@ -401,7 +421,7 @@ mod tests {
     #[test]
     fn planar_rows_returns_exactly_what_was_written() {
         let path = tmp_path("planar-rows");
-        let mut s = Staging::create(&path, 4, 3, 2).unwrap();
+        let mut s = Staging::<f32>::create(&path, 4, 3, 2).unwrap();
         s.write_band(0, 1, &[10.0, 20.0, 30.0, 40.0]).unwrap();
         s.write_band(1, 2, &[1.0, 2.0, 3.0, 4.0]).unwrap();
 
@@ -417,7 +437,7 @@ mod tests {
     #[test]
     fn remove_deletes_the_staging_file() {
         let path = tmp_path("remove");
-        let s = Staging::create(&path, 4, 3, 1).unwrap();
+        let s = Staging::<f32>::create(&path, 4, 3, 1).unwrap();
         assert!(path.exists());
         s.remove().unwrap();
         assert!(!path.exists());
@@ -426,9 +446,46 @@ mod tests {
     #[test]
     fn drop_without_remove_best_effort_deletes_the_file() {
         let path = tmp_path("drop");
-        let s = Staging::create(&path, 4, 3, 1).unwrap();
+        let s = Staging::<f32>::create(&path, 4, 3, 1).unwrap();
         assert!(path.exists());
         drop(s);
         assert!(!path.exists());
+    }
+
+    /// Protocol v3's reason for existing, at the staging layer: a `u32`
+    /// staging file must hand back the exact bit patterns it was given,
+    /// including values `f32` cannot represent (16_777_217 is the first
+    /// integer above `f32`'s 24-bit mantissa) and values above `i32::MAX`.
+    #[test]
+    fn u32_samples_survive_staging_bit_exact() {
+        let path = tmp_path("u32-native");
+        let values: [u32; 4] = [0, 16_777_217, 4_000_000_001, u32::MAX];
+        let mut s = Staging::<u32>::create(&path, 4, 2, 1).unwrap();
+        s.write_band(0, 0, &values).unwrap();
+        s.write_band(0, 1, &[7, 8, 9, 10]).unwrap();
+        assert!(s.is_complete());
+        assert_eq!(s.row(0, 0), &values);
+        assert_eq!(s.row(0, 1), &[7u32, 8, 9, 10]);
+        // Sized for u32, not f32: 4 * 2 * 1 * 4 bytes.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 32);
+        s.remove().unwrap();
+    }
+
+    /// The staging file's size follows `size_of::<T>()`, not a hard-coded
+    /// 4 — the change that makes an `f64` or `u8` session possible at all.
+    #[test]
+    fn staging_file_size_follows_the_sample_type() {
+        fn file_size<T: Pod>(tag: &str) -> u64 {
+            let path = tmp_path(tag);
+            let s = Staging::<T>::create(&path, 3, 2, 1).unwrap();
+            let size = std::fs::metadata(&path).unwrap().len();
+            s.remove().unwrap();
+            size
+        }
+        // 3 * 2 * 1 samples, times the sample width.
+        assert_eq!(file_size::<u8>("size-u8"), 6);
+        assert_eq!(file_size::<u16>("size-u16"), 12);
+        assert_eq!(file_size::<f32>("size-f32"), 24);
+        assert_eq!(file_size::<f64>("size-f64"), 48);
     }
 }
