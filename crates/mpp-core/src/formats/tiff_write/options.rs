@@ -102,6 +102,10 @@ pub struct TiffWriteOptions {
     pub compression: Compression,
     /// Deflate level, 1-9; ignored unless [`Compression::Deflate`]. `None`
     /// selects the default level 6.
+    ///
+    /// The underlying encoder offers three levels, not nine, so the value
+    /// buckets into them: 1-3 fastest, 4-6 balanced (the default), 7-9 best.
+    /// A UI should say so rather than promise finer control than exists.
     pub deflate_level: Option<u8>,
     /// Apply the horizontal differencing predictor (TIFF tag 317). Integer
     /// sample formats only.

@@ -10,10 +10,13 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
+use tiff::encoder::compression::{
+    CompressionAlgorithm, Compressor, Deflate, DeflateLevel, Lzw, Packbits, Uncompressed,
+};
 use tiff::encoder::{TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard};
 use tiff::tags::Tag;
 
-use super::options::{AlphaMode, Container, Layout, TiffWriteOptions};
+use super::options::{AlphaMode, Compression, Container, Layout, TiffWriteOptions};
 use super::sample::Sample;
 use crate::formats::PlanarRows;
 use crate::formats::tiff::BitDepth;
@@ -240,6 +243,132 @@ where
     }
 }
 
+/// Build the block compressor and the `Compression` tag value for `opts`.
+///
+/// Each block gets a fresh encoder inside `Compressor::write_to`, which is
+/// what makes strips and tiles independently decodable as TIFF requires.
+///
+/// The `tiff` crate's `DeflateLevel` has three variants, so the 1-9 level
+/// the options carry buckets into fast, balanced and best.
+fn compressor_for(opts: &TiffWriteOptions) -> (Compressor, u16) {
+    match opts.compression {
+        Compression::None => (Compressor::Uncompressed(Uncompressed), 1),
+        Compression::Lzw => (Compressor::Lzw(Lzw), 5),
+        Compression::Deflate => {
+            let level = match opts.effective_deflate_level() {
+                1..=3 => DeflateLevel::Fast,
+                7..=9 => DeflateLevel::Best,
+                _ => DeflateLevel::Balanced,
+            };
+            (Compressor::Deflate(Deflate::with_level(level)), 8)
+        }
+        Compression::Packbits => (Compressor::Packbits(Packbits), 32773),
+    }
+}
+
+/// Apply TIFF's horizontal differencing predictor (tag 317 = 2) in place.
+///
+/// Each sample becomes the difference from the sample `channels` positions
+/// earlier in the same row, so runs of similar values compress far better.
+/// The difference is taken on whole *samples*, not bytes: for 16- and 32-bit
+/// data a byte-wise difference would be a different (and wrong) transform.
+///
+/// Integer sample types only — [`TiffWriteOptions::validate`] rejects the
+/// predictor for float formats, since differencing IEEE bit patterns is not
+/// what tag 317 means, and [`Sample::wrapping_sub_sample`] is unreachable
+/// for them.
+fn predict_horizontal<O: Sample>(block: &mut [O], samples_per_row: usize, channels: usize) {
+    if samples_per_row == 0 || channels >= samples_per_row {
+        return;
+    }
+    for row in block.chunks_exact_mut(samples_per_row) {
+        // Walk backwards so each subtraction sees its original predecessor.
+        for i in (channels..samples_per_row).rev() {
+            row[i] = row[i].wrapping_sub_sample(row[i - channels]);
+        }
+    }
+}
+
+/// The predict/serialise/compress pipeline every strip or tile passes
+/// through, plus the offset and byte-count lists the IFD needs.
+///
+/// Carrying it as one struct rather than a pile of `&mut` parameters keeps
+/// the two call sites (strips and tiles) to a single call each, and keeps
+/// the three reusable buffers alive for the whole image so encoding a
+/// multi-gigabyte file stays allocation-free after the first block.
+struct BlockWriter<K: TiffKind> {
+    /// Reused across blocks; `write_to` builds a fresh encoder per call, so
+    /// no compression state leaks from one block into the next.
+    compressor: Compressor,
+    /// Serialised, native-order bytes of the current block.
+    raw: Vec<u8>,
+    /// Compressed bytes of the current block.
+    packed: Vec<u8>,
+    /// Whether to apply the horizontal differencing predictor.
+    predictor: bool,
+    /// Interleaved samples in one row of a block: `width * channels` for a
+    /// strip, `tile size * channels` for a tile.
+    samples_per_row: usize,
+    /// Channel count — the predictor's stride, in samples.
+    channels: usize,
+    /// Offsets of the blocks written so far.
+    offsets: Vec<K::OffsetType>,
+    /// Compressed lengths of the blocks written so far.
+    byte_counts: Vec<K::OffsetType>,
+}
+
+impl<K: TiffKind> BlockWriter<K> {
+    /// Start a block writer for `opts`, returning it with the `Compression`
+    /// tag value the IFD must carry.
+    fn new(opts: &TiffWriteOptions, samples_per_row: usize, channels: usize) -> (Self, u16) {
+        let (compressor, tag) = compressor_for(opts);
+        (
+            Self {
+                compressor,
+                raw: Vec::new(),
+                packed: Vec::new(),
+                predictor: opts.predictor,
+                samples_per_row,
+                channels,
+                offsets: Vec::new(),
+                byte_counts: Vec::new(),
+            },
+            tag,
+        )
+    }
+
+    /// Append one gathered block to the file, recording its offset and
+    /// compressed length. `block` is differenced in place when the
+    /// predictor is on, so it must not be reused afterwards.
+    fn write<O, W>(
+        &mut self,
+        dir: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
+        block: &mut [O],
+    ) -> tiff::TiffResult<()>
+    where
+        O: Sample,
+        W: Write + Seek,
+    {
+        if self.predictor {
+            predict_horizontal(block, self.samples_per_row, self.channels);
+        }
+        self.raw.clear();
+        for sample in block.iter() {
+            sample.push_ne(&mut self.raw);
+        }
+        self.packed.clear();
+        self.compressor.write_to(&mut self.packed, &self.raw)?;
+        let offset = dir.write_data(&self.packed[..])?;
+        self.offsets.push(K::convert_offset(offset)?);
+        // Byte counts are the same width as offsets in both container kinds;
+        // `OffsetType: TryFrom<usize>` is the crate's own idiom for this
+        // (see its `ImageEncoder::write_strip`).
+        self.byte_counts
+            .push(K::OffsetType::try_from(self.packed.len())?);
+        Ok(())
+    }
+}
+
 /// Photometric interpretation for a colour-channel count: 1 = BlackIsZero,
 /// 2 = RGB (TIFF 6.0 §8).
 fn photometric(colour_channels: u64) -> u16 {
@@ -272,9 +401,16 @@ where
     let mut enc: TiffEncoder<&mut W, K> = TiffEncoder::new_generic(writer).map_err(terr)?;
     let mut dir = enc.image_directory().map_err(terr)?;
 
-    let mut offsets: Vec<K::OffsetType> = Vec::new();
-    let mut byte_counts: Vec<K::OffsetType> = Vec::new();
-    let mut raw = Vec::<u8>::new();
+    // Samples per row of a block: full image width for a strip, the tile
+    // edge for a tile. The predictor needs it, so it is settled before the
+    // block writer is built.
+    let samples_per_block_row = match opts.layout {
+        Layout::Strips => w * c,
+        Layout::Tiles { size } => u64::from(size) * c,
+    } as usize;
+    let (mut blocks, compression_tag) =
+        BlockWriter::<K>::new(opts, samples_per_block_row, c as usize);
+    let mut block = Vec::<O>::new();
     // One reusable row buffer per channel: interleaving needs every
     // channel's row `y` at once, and this way the gather allocates once for
     // the whole image rather than once per row.
@@ -287,9 +423,8 @@ where
             let n_rows = (target_block_bytes / row_bytes.max(1)).clamp(1, h);
             for start in (0..h).step_by(n_rows as usize) {
                 let n = n_rows.min(h - start);
-                gather_strip(src, start, n, &mut rows, &mut raw);
-                write_block::<K, _>(&mut dir, &raw, &mut offsets, &mut byte_counts)
-                    .map_err(terr)?;
+                gather_strip(src, start, n, &mut rows, &mut block);
+                blocks.write(&mut dir, &mut block).map_err(terr)?;
             }
             Some(u32::try_from(n_rows).unwrap_or(u32::MAX))
         }
@@ -297,9 +432,8 @@ where
             let size64 = u64::from(size);
             for ty in (0..h).step_by(size as usize) {
                 for tx in (0..w).step_by(size as usize) {
-                    gather_tile(src, tx, ty, size64, &mut rows, &mut raw);
-                    write_block::<K, _>(&mut dir, &raw, &mut offsets, &mut byte_counts)
-                        .map_err(terr)?;
+                    gather_tile(src, tx, ty, size64, &mut rows, &mut block);
+                    blocks.write(&mut dir, &mut block).map_err(terr)?;
                 }
             }
             None
@@ -320,49 +454,32 @@ where
         .map_err(terr)?;
     dir.write_tag(Tag::PlanarConfiguration, 1u16)
         .map_err(terr)?; // chunky
-    dir.write_tag(Tag::Compression, 1u16).map_err(terr)?; // none, for now
+    dir.write_tag(Tag::Compression, compression_tag)
+        .map_err(terr)?;
+    if opts.predictor {
+        dir.write_tag(Tag::Predictor, 2u16).map_err(terr)?;
+    }
 
     match (opts.layout, rows_per_strip) {
         (Layout::Strips, Some(n_rows)) => {
             dir.write_tag(Tag::RowsPerStrip, n_rows).map_err(terr)?;
-            dir.write_tag(Tag::StripOffsets, K::convert_slice(&offsets))
+            dir.write_tag(Tag::StripOffsets, K::convert_slice(&blocks.offsets))
                 .map_err(terr)?;
-            dir.write_tag(Tag::StripByteCounts, K::convert_slice(&byte_counts))
+            dir.write_tag(Tag::StripByteCounts, K::convert_slice(&blocks.byte_counts))
                 .map_err(terr)?;
         }
         (Layout::Tiles { size }, _) => {
             dir.write_tag(Tag::TileWidth, size).map_err(terr)?;
             dir.write_tag(Tag::TileLength, size).map_err(terr)?;
-            dir.write_tag(Tag::TileOffsets, K::convert_slice(&offsets))
+            dir.write_tag(Tag::TileOffsets, K::convert_slice(&blocks.offsets))
                 .map_err(terr)?;
-            dir.write_tag(Tag::TileByteCounts, K::convert_slice(&byte_counts))
+            dir.write_tag(Tag::TileByteCounts, K::convert_slice(&blocks.byte_counts))
                 .map_err(terr)?;
         }
         _ => unreachable!("rows_per_strip is Some exactly for Layout::Strips"),
     }
 
     dir.finish().map_err(terr)?;
-    Ok(())
-}
-
-/// Append one block of pixel data to the file, recording its offset and
-/// length for the strip/tile offset tags.
-fn write_block<K, W>(
-    dir: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
-    bytes: &[u8],
-    offsets: &mut Vec<K::OffsetType>,
-    byte_counts: &mut Vec<K::OffsetType>,
-) -> tiff::TiffResult<()>
-where
-    K: TiffKind,
-    W: Write + Seek,
-{
-    let offset = dir.write_data(bytes)?;
-    offsets.push(K::convert_offset(offset)?);
-    // Byte counts are the same width as offsets in both container kinds;
-    // `OffsetType: TryFrom<usize>` is the crate's own idiom for this
-    // (see its `ImageEncoder::write_strip`).
-    byte_counts.push(K::OffsetType::try_from(bytes.len())?);
     Ok(())
 }
 
@@ -375,12 +492,16 @@ fn fetch_rows<O: Sample, S: RowSource<O> + ?Sized>(src: &S, y: u64, rows: &mut [
 }
 
 /// Interleave rows `[start, start + n)` of every channel into `out`.
+///
+/// The block is gathered as typed samples rather than bytes so the
+/// horizontal predictor can difference whole samples; serialisation to
+/// native-order bytes happens in [`BlockWriter::write`], after it.
 fn gather_strip<O: Sample, S: RowSource<O> + ?Sized>(
     src: &S,
     start: u64,
     n: u64,
     rows: &mut [Vec<O>],
-    out: &mut Vec<u8>,
+    out: &mut Vec<O>,
 ) {
     let w = src.width() as usize;
     out.clear();
@@ -388,7 +509,7 @@ fn gather_strip<O: Sample, S: RowSource<O> + ?Sized>(
         fetch_rows(src, y, rows);
         for x in 0..w {
             for buf in rows.iter() {
-                buf[x].push_ne(out);
+                out.push(buf[x]);
             }
         }
     }
@@ -403,7 +524,7 @@ fn gather_tile<O: Sample, S: RowSource<O> + ?Sized>(
     ty: u64,
     size: u64,
     rows: &mut [Vec<O>],
-    out: &mut Vec<u8>,
+    out: &mut Vec<O>,
 ) {
     let (w, h, c) = (src.width(), src.height(), src.channels());
     let zero = O::from_unit_f32(0.0);
@@ -413,12 +534,12 @@ fn gather_tile<O: Sample, S: RowSource<O> + ?Sized>(
             fetch_rows(src, y, rows);
             for x in tx..tx + size {
                 for buf in rows.iter() {
-                    if x < w { buf[x as usize] } else { zero }.push_ne(out);
+                    out.push(if x < w { buf[x as usize] } else { zero });
                 }
             }
         } else {
             for _ in 0..size * c {
-                zero.push_ne(out);
+                out.push(zero);
             }
         }
     }
@@ -787,6 +908,153 @@ mod tests {
             [0x49, 0x49, 0x2A, 0x00],
             "an explicit Container::Classic stays classic"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_compression_round_trips_the_same_pixels() {
+        use crate::formats::tiff_write::options::Compression;
+        let dir = tmpdir("compress");
+        let img = Synth::new(37, 23, 1); // deliberately not a block multiple
+        for (name, compression, tag) in [
+            ("none", Compression::None, 1u64),
+            ("lzw", Compression::Lzw, 5),
+            ("deflate", Compression::Deflate, 8),
+            ("packbits", Compression::Packbits, 32773),
+        ] {
+            let out = dir.join(format!("{name}.tif"));
+            let opts = TiffWriteOptions {
+                compression,
+                ..Default::default()
+            };
+            // A small target forces several blocks, so this also proves
+            // each block is compressed independently.
+            write_tiff_with_target(&img, &out, &opts, 512).unwrap();
+
+            let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+            assert_eq!(dec.get_tag_u64(Tag::Compression).unwrap(), tag, "{name}");
+            match dec.read_image().unwrap() {
+                DecodingResult::F32(data) => {
+                    assert_eq!(data.len(), 37 * 23, "{name}");
+                    for (i, v) in data.iter().enumerate() {
+                        assert!(
+                            (v - i as f32 / (37.0 * 23.0)).abs() < 1e-7,
+                            "{name} sample {i}"
+                        );
+                    }
+                }
+                other => panic!("{name}: expected F32, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compression_actually_shrinks_compressible_data() {
+        use crate::formats::tiff_write::options::Compression;
+        // A constant image compresses hard; an incompressible one would
+        // make this assertion meaningless.
+        struct Flat(u64, u64);
+        impl crate::formats::PlanarRows<u8> for Flat {
+            fn width(&self) -> u64 {
+                self.0
+            }
+            fn height(&self) -> u64 {
+                self.1
+            }
+            fn channels(&self) -> u64 {
+                1
+            }
+            fn row(&self, _c: u64, _y: u64) -> &[u8] {
+                const ZEROS: [u8; 512] = [0; 512];
+                &ZEROS[..512]
+            }
+        }
+        let dir = tmpdir("shrink");
+        let img = Flat(512, 512);
+        let plain = dir.join("plain.tif");
+        let packed = dir.join("packed.tif");
+        write_tiff_native(
+            &img,
+            &plain,
+            &TiffWriteOptions {
+                bit_depth: BitDepth::U8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_tiff_native(
+            &img,
+            &packed,
+            &TiffWriteOptions {
+                bit_depth: BitDepth::U8,
+                compression: Compression::Deflate,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plain_len = std::fs::metadata(&plain).unwrap().len();
+        let packed_len = std::fs::metadata(&packed).unwrap().len();
+        assert!(
+            packed_len * 4 < plain_len,
+            "deflate should compress a constant image hard: {packed_len} vs {plain_len}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_predictor_differences_whole_samples_not_bytes() {
+        // Two rows of 2-pixel RGB u16. A byte-wise difference would touch
+        // the low and high halves of each sample independently and produce
+        // entirely different numbers, so this pins the typed transform that
+        // TIFF tag 317 actually specifies.
+        let mut block: Vec<u16> = vec![1000, 2000, 3000, 1005, 2010, 3015, 10, 20, 30, 5, 15, 25];
+        predict_horizontal(&mut block, 6, 3);
+        assert_eq!(
+            block,
+            vec![1000, 2000, 3000, 5, 10, 15, 10, 20, 30, 65531, 65531, 65531],
+            "each sample differences against the one `channels` earlier, wrapping"
+        );
+    }
+
+    #[test]
+    fn the_predictor_is_written_and_round_trips() {
+        use crate::formats::tiff_write::options::Compression;
+        let dir = tmpdir("predictor");
+        let out = dir.join("out.tif");
+        let img = Synth::new(16, 16, 3);
+        let opts = TiffWriteOptions {
+            bit_depth: BitDepth::U16,
+            compression: Compression::Lzw,
+            predictor: true,
+            ..Default::default()
+        };
+        write_tiff(&img, &out, &opts).unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u64(Tag::Predictor).unwrap(), 2);
+        match dec.read_image().unwrap() {
+            DecodingResult::U16(data) => {
+                assert_eq!(data.len(), 16 * 16 * 3);
+                assert_eq!(data[0], 0);
+                // Sample 767 of 768 -> round(767/768 * 65535).
+                assert_eq!(data[767], 65450);
+                // Every sample, not just the ends: a byte-wise predictor
+                // decodes to plausible-looking garbage in the middle of a
+                // row, so the endpoints alone would not catch it. Decoded
+                // sample `j` is pixel `j / 3` of channel `j % 3`, and
+                // `Synth` gives that `(ch * 256 + p) / 768`.
+                for (j, &v) in data.iter().enumerate() {
+                    let (p, ch) = (j / 3, j % 3);
+                    // Through the same unit-range conversion the writer
+                    // uses, so this asserts on the predictor rather than on
+                    // f32 rounding, which `sample.rs` tests separately.
+                    let want = u16::from_unit_f32((ch * 256 + p) as f32 / 768.0);
+                    assert_eq!(v, want, "sample {j}");
+                }
+            }
+            other => panic!("expected U16, got {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

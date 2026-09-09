@@ -28,6 +28,12 @@ pub trait Sample: Copy + 'static {
 
     /// Append this sample's native-order bytes to `out`.
     fn push_ne(self, out: &mut Vec<u8>);
+
+    /// Wrapping subtraction, used by the horizontal differencing predictor
+    /// (TIFF tag 317). Float formats never reach this: the predictor is
+    /// rejected for them by `TiffWriteOptions::validate`, because tag 317 is
+    /// defined for integer samples only.
+    fn wrapping_sub_sample(self, other: Self) -> Self;
 }
 
 macro_rules! uint_sample {
@@ -59,6 +65,10 @@ macro_rules! uint_sample {
             fn push_ne(self, out: &mut Vec<u8>) {
                 out.extend_from_slice(&self.to_ne_bytes());
             }
+
+            fn wrapping_sub_sample(self, other: Self) -> Self {
+                self.wrapping_sub(other)
+            }
         }
     };
 }
@@ -83,6 +93,13 @@ impl Sample for f32 {
     fn push_ne(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
+
+    fn wrapping_sub_sample(self, _other: Self) -> Self {
+        unreachable!(
+            "the horizontal predictor is rejected for float sample formats by \
+             TiffWriteOptions::validate, so f32 samples never reach it"
+        )
+    }
 }
 
 impl Sample for f64 {
@@ -100,6 +117,13 @@ impl Sample for f64 {
 
     fn push_ne(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
+    }
+
+    fn wrapping_sub_sample(self, _other: Self) -> Self {
+        unreachable!(
+            "the horizontal predictor is rejected for float sample formats by \
+             TiffWriteOptions::validate, so f64 samples never reach it"
+        )
     }
 }
 
@@ -151,6 +175,17 @@ mod tests {
         let mut v = Vec::new();
         1.5f32.push_ne(&mut v);
         assert_eq!(v, 1.5f32.to_ne_bytes().to_vec());
+    }
+
+    #[test]
+    fn wrapping_sub_sample_wraps_rather_than_panicking() {
+        // The predictor differences whole samples and relies on wrapping,
+        // so a descending run must produce the two's-complement wrap the
+        // decoder's matching addition undoes.
+        assert_eq!(0u8.wrapping_sub_sample(1), 255);
+        assert_eq!(0u16.wrapping_sub_sample(1), 65535);
+        assert_eq!(0u32.wrapping_sub_sample(1), u32::MAX);
+        assert_eq!(9u16.wrapping_sub_sample(4), 5);
     }
 
     #[test]
