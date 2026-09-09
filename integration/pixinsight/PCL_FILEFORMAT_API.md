@@ -193,50 +193,59 @@ virtual FileFormatImplementation* Create() const = 0;     // MetaFileFormat.h:84
 - `Create()`: factory returning a **new** `FileFormatImplementation`
   instance for each file operation (`MetaFileFormat.h:835-845`).
 
-### 2.1 Capability queries relevant to a write-only incremental format
+### 2.1 Capability queries and what `BigTiffFormat` returns
 
 Every row cites the `MetaFileFormat.h` default implementation (all are
-`bool ...() const override` returning a literal). "Ours" is what the mpp
-behavioral contract implies Task 4 should return.
+`bool ...() const override` returning a literal). "Ours" is what
+`module/BigTiffFormat.{h,cpp}` returns **as shipped**, after the phase-4
+parity work; where the answer changed, the reason is given. Rows that simply
+take the header default are not overridden in our code at all.
 
-| Member | Line | Default | Ours (write-only BigTIFF shim) |
+The governing rule for this table is the truth-in-advertising one: a
+capability answering `true` must be genuinely delivered. Phase 4 existed
+because `CanStore32Bit()`/`CanStoreDouble()` answered `true` while the write
+path silently narrowed both to `f32`.
+
+| Member | Line | Default | Ours (`BigTiffFormat`, as shipped) |
 |---|---|---|---|
-| `CanRead()` | 428 | `true` | **override → `false`** |
-| `CanWrite()` | 439 | `true` | `true` (default OK; explicit override recommended for clarity) |
-| `CanReadIncrementally()` | 453 | `false` | `false` (default) |
-| `CanWriteIncrementally()` | 467 | `false` | **override → `true`** — required, or `WriteSamples` is never called (`FileFormatImplementation.h:718-721`) |
-| `CanStore8Bit()` | 478 | `true` | `true` (shim maps u8 → `"u8"`) |
-| `CanStore16Bit()` | 489 | `true` | `true` (u16 → `"u16"`) |
-| `CanStore32Bit()` | 500 | `false` | **override → `true`** if u32 saves are to be offered (shim converts u32 → f32; document the precision note) — else leave `false` and the u32 `WriteSamples` overload should never fire |
-| `CanStore64Bit()` | 511 | `false` | `false` |
-| `CanStoreFloat()` | 523 | `false` | **override → `true`** (f32 is our native path) |
-| `CanStoreDouble()` | 535 | `false` | **override → `true`** if f64 saves are offered (converted to f32 — a *lossy narrowing*; see `WasLossyWrite`, §3.6 and Unknowns §7.6) — else `false` |
+| `CanRead()` | 428 | `true` | `true` — `Open()` + the five `ReadImage` overloads (phase 3) |
+| `CanWrite()` | 439 | `true` | `true` (explicit override, for clarity) |
+| `CanReadIncrementally()` | 453 | `false` | `false`, **explicitly overridden**: the core drives interactive opens through whole-image `ReadImage` even when this is `true` (verified empirically), so `ReadSamples` is left unimplemented |
+| `CanWriteIncrementally()` | 467 | `false` | **`true`** — required, or `WriteSamples` is never called (`FileFormatImplementation.h:718-721`) |
+| `CanStore8Bit()` | 478 | `true` | `true` (u8 bands and 8-bit output, verbatim) |
+| `CanStore16Bit()` | 489 | `true` | `true` (u16 bands and 16-bit output, verbatim) |
+| `CanStore32Bit()` | 500 | `false` | **`true`, and genuinely so** — protocol v3 carries `u32` bands natively (`band_format`) and the writer emits 32-bit unsigned samples. Before phase 4 this was `true` while the value was narrowed to `f32` |
+| `CanStore64Bit()` | 511 | `false` | `false` — 64-bit *integer* samples; TIFF has no such sample format and neither does the engine. (64-bit *float* is `CanStoreDouble()`.) |
+| `CanStoreFloat()` | 523 | `false` | **`true`** (f32 bands and 32-bit float output, exact) |
+| `CanStoreDouble()` | 535 | `false` | **`true`, and genuinely so** — native `f64` bands and 64-bit float output. Previously `true` while narrowed to `f32`, like `CanStore32Bit()` |
 | `CanStoreComplex()` | 547 | `false` | `false` |
 | `CanStoreDComplex()` | 559 | `false` | `false` |
 | `CanStoreGrayscale()` | 570 | `true` | `true` |
 | `CanStoreRGBColor()` | 581 | `true` | `true` |
-| `CanStoreAlphaChannels()` | 592 | `true` | per contract: only if the worker/protocol accepts >3 channels; else **override → `false`** |
-| `CanStoreResolution()` | 603 | `false` | `false` |
-| `CanStoreKeywords()` | 614 | `false` | `false` (FITS-keyword sidecar is phase-3) |
-| `CanStoreICCProfiles()` | 625 | `false` | `false` |
-| `CanStoreThumbnails()` | 636 | `false` | `false` |
-| `CanStoreProperties()` | 655 | `false` | `false` |
-| `CanStoreImageProperties()` | 668 | `false` | `false` |
+| `CanStoreAlphaChannels()` | 592 | `true` | **`true`** — gray+alpha and RGBA write an `ExtraSamples` tag with the association the options dialog selected; the protocol accepts `channels` in `1..=4`. Was overridden to `false` before phase 4 |
+| `CanStoreResolution()` | 603 | `false` | **`true`** — `XResolution`/`YResolution`/`ResolutionUnit`, taken from `ImageOptions` |
+| `CanStoreKeywords()` | 614 | `false` | `false`, **by decision, permanently**: TIFF has no FITS-keyword equivalent. `ImageDescription`/`Copyright`/`Software` are three specific tags and travel as format-specific data, not keywords |
+| `CanStoreICCProfiles()` | 625 | `false` | **`true`** — tag 34675, written on save (`WriteICCProfile()`) and read back on open (`ReadICCProfile()`) |
+| `CanStoreThumbnails()` | 636 | `false` | `false` (deferred; `docs/DESIGN.md` phase 5) |
+| `CanStoreProperties()` | 655 | `false` | `false` (deferred) |
+| `CanStoreImageProperties()` | 668 | `false` | `false` (deferred) |
 | `CanStoreRGBWS()` | 679 | `false` | `false` |
 | `CanStoreDisplayFunctions()` | 690 | `false` | `false` |
 | `CanStoreColorFilterArrays()` | 701 | `false` | `false` |
-| `SupportsCompression()` | 720 | `false` | `true` **only** if the worker writes compressed pixel data — "The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true" (`MetaFileFormat.h:714-716`); if the worker writes uncompressed BigTIFF in v1, leave `false` |
+| `SupportsCompression()` | 720 | `false` | `false` — **not overridden, and now understated**: the writer does emit LZW, Deflate and PackBits, which is exactly the case the header names ("The optional ZIP and LZW compressions used in TIFF are the exact kind of compressions that must cause this member function to return true", `MetaFileFormat.h:714-716`). Flagged in the task-18 report as a defect to fix in code, not here |
 | `SupportsMultipleImages()` | 736 | `false` | `false` (then `SelectImage`/`SelectedImageIndex` are never called — `FileFormatImplementation.h:165-169`) |
 | `SupportsViewProperties()` | 762 | `false` | `false` |
-| `CanEditPreferences()` | 776 | `false` | `false` (no options dialog in v1; then `EditPreferences()` is never called — `MetaFileFormat.h:829-830`) |
-| `UsesFormatSpecificData()` | 792 | `false` | `false` (then `SetFormatSpecificData` is never called — `FileFormatImplementation.h:563-566`) |
+| `CanEditPreferences()` | 776 | `false` | `false`, **by decision**: no global format preferences — one per-save dialog, defaults in code. `EditPreferences()` is therefore never called (`MetaFileFormat.h:829-830`) |
+| `UsesFormatSpecificData()` | 792 | `false` | **`true`** — the `TiffFormatOptions` block from `QueryOptions()` round-trips through `SetFormatSpecificData()` into `CreateImage()`. Paired with `ValidateFormatSpecificData()` (magic + version) and `DisposeFormatSpecificData()` |
 | `IsDeprecated()` | 807 | `false` | `false` |
 
 Note on capability semantics: the wording throughout is "can **read/write**"
-(e.g. `MetaFileFormat.h:472-474`). For a `CanRead() == false` format these
-effectively advertise which sample formats the *write* path accepts. The
-headers do not state how the core chooses which `WriteSamples` overload to
-call (see Unknowns §7.5) — implement **all five** overloads regardless.
+(e.g. `MetaFileFormat.h:472-474`). These advertise which sample formats the
+*write* path accepts; the read path reports each file's own format through
+`ImageDescription` instead. The headers do not state how the core chooses
+which `WriteSamples` overload to call (see Unknowns §7.5) — **all five** are
+implemented regardless, and each converts its own buffer to the negotiated
+`band_format`, so the choice cannot silently lose data.
 
 ### 2.2 Descriptive members (defaults empty; reimplement)
 
@@ -314,7 +323,12 @@ of call order (see also Unknowns §7.3):
    Called "just before calling Create(). Typically ... as part of a File >
    Save As operation" (`:464-466`). Return `true` to continue, `false` to
    abort the save (`:442-444`). Default returns `true` with no dialog
-   (`:471-472`) — **keep the default for v1 (no options dialog)**.
+   (`:471-472`) — **overridden as of phase 4**: it builds and executes
+   `TiffOptionsDialog`, writes the chosen sample format and resolution into
+   the first `ImageOptions`, and pushes a heap-allocated
+   `TiffFormatOptions` block into `formatOptions`, which
+   `DisposeFormatSpecificData()` later frees. Cancel returns `false` and the
+   save is abandoned before `Create()` runs.
    Client-side mirror: `FileFormatInstance.h:700` ("A module should call
    this function just before calling Create()", `:694-695`).
 
@@ -343,7 +357,8 @@ of call order (see also Unknowns §7.3):
    written or created" (`:537-538`). Default is a no-op — **override and
    store**: `options.bitsPerSample` (`ImageOptions.h:194`) +
    `options.ieeefpSampleFormat` (`:195`) select the `InitMessage.bit_depth`
-   mapping (f32/u16/u8 per contract). Also relevant: `complexSample` (`:196`,
+   mapping — one of `"u8"`/`"u16"`/`"u32"`/`"f32"`/`"f64"`, which since
+   protocol v3 also selects `band_format`. Also relevant: `complexSample` (`:196`,
    reject true), `signedIntegers` (`:197`, reject true). See §5.2.
    Client-side mirror `FileFormatInstance.h:764`; note `FileFormatInstance.h:761-762`
    says a format "may ignore" these options — i.e. they are advisory, and the
@@ -387,8 +402,12 @@ of call order (see also Unknowns §7.3):
    Preconditions (`:718-723`): called only when the metaformat's
    `CanWriteIncrementally()` is true **and** the instance-level
    `CanWriteIncrementally()` (`:699`, default `true` — keep) is true.
-   Per the mpp contract each call is normalized to f32 in [0,1] (integers
-   divide by type max; f64 narrows) and split into ≤ band_rows chunks.
+   Per the mpp contract each call converts its own buffer to the session's
+   `band_format` — the identity, and so a straight copy, whenever the
+   overload's type matches the negotiated sample format — and is split into
+   ≤ band_rows chunks. (Before protocol v3 every buffer was normalized to
+   f32 in [0,1] instead, which is what made `CanStore32Bit`/`CanStoreDouble`
+   dishonest.)
 
 7. **`CloseImage`** — `virtual void CloseImage()`
    (`FileFormatImplementation.h:687`). "Closes the image that has been
@@ -443,8 +462,10 @@ Writer extras gated off by our capabilities: `SetFormatSpecificData`
 default `false`): "invoked ... just after successful completion of a call to
 WriteImage() or Write()" (`:762-764`). Note the doc names only the
 whole-image entry points, not the incremental path (Unknowns §7.6). Since the
-shim narrows f64→f32 and remaps u32, track whether the just-written image
-came from a narrowing source and return `true` then.
+shim converts a buffer to a narrower `band_format` than its own type — an
+f32 view saved as 16-bit by user choice, say — track that and return `true`
+then. Since protocol v3 no format is narrowed *unconditionally*, so this is
+a per-conversion answer, reset per file.
 
 ---
 
@@ -476,8 +497,11 @@ bool  signedIntegers     : 1;  // :197 — reject true
 ```
 
 Mapping to `InitMessage.bit_depth` (mpp behavioral contract):
-`(ieeefp, 32) → "f32"`, `(ieeefp, 64) → "f32"` (narrowed, lossy),
-`(int, 16) → "u16"`, `(int, 8) → "u8"`, `(int, 32) → "f32"` (u32/2^32-1).
+`(ieeefp, 32) → "f32"`, `(ieeefp, 64) → "f64"` (native since protocol v3;
+was narrowed and lossy before phase 4),
+`(int, 16) → "u16"`, `(int, 8) → "u8"`, `(int, 32) → "u32"` (native since
+protocol v3; was `"f32"` via `v/(2^32-1)` before phase 4). `band_format`
+takes the same value as `bit_depth`.
 If `SetOptions` was never called, default-constructed values apply
 (`Reset()`, `ImageOptions.h:244-271`: 16-bit integer) — but prefer selecting
 the mapping from which `WriteSamples` overload actually fires (Unknowns §7.5).
@@ -572,7 +596,7 @@ guarantee about the core's exact behavior — hence §7.3.
 5. **Which `WriteSamples` overload fires.** Presumably matches the source
    image's sample type, but the headers don't bind overload choice to
    `SetOptions` values. Defense: make every overload self-contained
-   (normalize its own buffer to f32); don't assume the overload agrees with
+   (convert its own buffer to the session's `band_format`); don't assume the overload agrees with
    `ImageOptions.bitsPerSample`; if the first `WriteSamples` overload
    disagrees with the stored options, trust the overload for conversion and
    keep the Init bit_depth already negotiated.
