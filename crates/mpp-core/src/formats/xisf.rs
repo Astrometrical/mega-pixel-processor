@@ -369,8 +369,10 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
                         )));
                     }
                     bytes
-                        .chunks_exact(8)
-                        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| f64::from_le_bytes(*c))
                         .collect()
                 }
                 Some(loc) if loc.starts_with("attachment:") => {
@@ -477,7 +479,14 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !digits.len().is_multiple_of(2) {
         return None;
     }
-    Some(digits.chunks_exact(2).map(|p| (p[0] << 4) | p[1]).collect())
+    Some(
+        digits
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[hi, lo]| (hi << 4) | lo)
+            .collect(),
+    )
 }
 
 /// Typed reader for an attachment-located f64 vector/matrix property: reads
@@ -506,8 +515,10 @@ fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<P
         ));
     }
     let data: Vec<f64> = bytes
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_le_bytes(*c))
         .collect();
     match &prop.value {
         PropertyValue::F64Vec(_) => Ok(PropertyValue::F64Vec(data)),
@@ -807,8 +818,10 @@ mod tests {
         // (PCL:AstrometricSolution:LinearTransformationMatrix).
         let bytes = base64_decode("qj/NbcwTPb8AAAAAAAAAAAAAAAAAAAAAqj/NbcwTPT8=").unwrap();
         let vals: Vec<f64> = bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect();
         assert_eq!(
             vals,

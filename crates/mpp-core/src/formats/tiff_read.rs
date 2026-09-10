@@ -1148,7 +1148,7 @@ fn read_ycbcr_transform<R: Read + Seek>(
             // coding range: every sample of it would descale to the same
             // number, so the file's pixels cannot be recovered at all.
             // Reporting that beats decoding a plausible-looking black.
-            if let Some(pair) = reference.chunks_exact(2).find(|p| p[0] == p[1]) {
+            if let Some(pair) = reference.as_chunks::<2>().0.iter().find(|p| p[0] == p[1]) {
                 return Err(Error::format(
                     path,
                     format!(
@@ -1278,7 +1278,7 @@ fn convert_ycbcr(
     }
     let pixels = samples.len() / 3;
     let mut planes: Vec<Vec<u8>> = (0..3).map(|_| Vec::with_capacity(pixels)).collect();
-    for triple in samples.chunks_exact(3) {
+    for triple in samples.as_chunks::<3>().0 {
         let rgb = transform.to_rgb(triple[0], triple[1], triple[2]);
         for (plane, value) in planes.iter_mut().zip(rgb) {
             plane.push(value);
