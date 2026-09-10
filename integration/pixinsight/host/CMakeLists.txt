@@ -150,3 +150,16 @@ add_test(NAME test_v2_init_compat COMMAND test_v2_init_compat)
 add_executable(test_native_band test/test_native_band.cpp)
 target_link_libraries(test_native_band PRIVATE mpp_host)
 add_test(NAME test_native_band COMMAND test_native_band)
+
+# test_sectionbar_order -- a source-text invariant check, not a link test: it
+# needs no mpp_host and no PCL. pcl::SectionBar's destructor dereferences the
+# Control that SetSection() gave it, so a SectionBar declared before its
+# section is destroyed after it and calls through freed memory. That shipped
+# once and aborted PixInsight on every TIFF save. The module has no runtime
+# test harness, so this reads the two dialog sources as text -- the only
+# automated guard available for a module-side invariant.
+add_executable(test_sectionbar_order test/test_sectionbar_order.cpp)
+add_test(NAME test_sectionbar_order
+         COMMAND test_sectionbar_order
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../module/TiffOptionsDialog.h
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../module/TiffOptionsDialog.cpp)

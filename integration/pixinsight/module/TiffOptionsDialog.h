@@ -107,9 +107,20 @@ private:
    Label           KofiLink_Label;        // -> https://ko-fi.com/astrometrical
    Bitmap          Logo_Bitmap;           // rendered from MPP_CHEVRON_SVG
 
+   // NOTE ON ORDER: each section Control is declared BEFORE the SectionBar
+   // that manages it, and must stay that way. pcl::SectionBar holds a raw
+   // Control* (SectionBar.h:358) that SetSection() fills in, and
+   // ~SectionBar dereferences it. Members are destroyed in reverse
+   // declaration order, so a SectionBar declared first would be destroyed
+   // last -- calling through a Control that no longer exists. PCL answers
+   // the dead handle with pcl::APIFunctionError, which escapes the
+   // implicitly-noexcept ~TiffOptionsDialog and terminates the process.
+   // That shipped once and aborted PixInsight on every File > Save As;
+   // test_sectionbar_order in the host CTest suite now guards it.
+
    // --- Sample Format -----------------------------------------------------
-   SectionBar      SampleFormat_SectionBar;
    Control         SampleFormat_Control;
+   SectionBar      SampleFormat_SectionBar;
    VerticalSizer   SampleFormat_Sizer;
    RadioButton     UInt8_RadioButton;
    RadioButton     UInt16_RadioButton;
@@ -118,8 +129,8 @@ private:
    RadioButton     Float64_RadioButton;
 
    // --- Compression -------------------------------------------------------
-   SectionBar      Compression_SectionBar;
    Control         Compression_Control;
+   SectionBar      Compression_SectionBar;
    VerticalSizer   Compression_Sizer;
    HorizontalSizer CompressionMethod_Sizer;
    Label           CompressionMethod_Label;
@@ -131,8 +142,8 @@ private:
    CheckBox        Predictor_CheckBox;
 
    // --- Layout (our addition; not in the stock dialog) ---------------------
-   SectionBar      Layout_SectionBar;
    Control         Layout_Control;
+   SectionBar      Layout_SectionBar;
    VerticalSizer   Layout_Sizer;
    HorizontalSizer Container_Sizer;
    Label           Container_Label;
@@ -146,8 +157,8 @@ private:
    ComboBox        TileSize_ComboBox;
 
    // --- Embedded Data -----------------------------------------------------
-   SectionBar      EmbeddedData_SectionBar;
    Control         EmbeddedData_Control;
+   SectionBar      EmbeddedData_SectionBar;
    VerticalSizer   EmbeddedData_Sizer;
    HorizontalSizer EmbedICC_Sizer;
    CheckBox        EmbedICC_CheckBox;
@@ -156,8 +167,8 @@ private:
    ComboBox        Alpha_ComboBox;
 
    // --- Metadata ----------------------------------------------------------
-   SectionBar      Metadata_SectionBar;
    Control         Metadata_Control;
+   SectionBar      Metadata_SectionBar;
    VerticalSizer   Metadata_Sizer;
    HorizontalSizer Description_Sizer;
    Label           Description_Label;
