@@ -41,7 +41,8 @@ int main() {
 
     const std::string json = "{\"message\":\"slow\"}";
     mpp::write_frame(out_h, static_cast<uint8_t>(mpp::WorkerTag::Error),
-                      reinterpret_cast<const uint8_t*>(json.data()), json.size());
+                      reinterpret_cast<const uint8_t*>(json.data()),
+                      static_cast<uint32_t>(json.size()));
   } catch (...) {
     return 1;
   }
