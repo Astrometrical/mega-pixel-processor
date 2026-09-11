@@ -61,13 +61,7 @@ StringList BigTiffFormat::FileExtensions() const
    // ".big.tiff"/".big.tif" are deliberately NOT claimed any more: owning the
    // ".tiff" tail routes existing files here regardless, and re-adding a
    // compound extension would reintroduce the collision described above.
-   return ClaimedExtensions();
-}
-
-const StringList& BigTiffFormat::ClaimedExtensions()
-{
-   static const StringList extensions{ ".tif", ".tiff", ".btf", ".tf8" };
-   return extensions;
+   return StringList{ ".tif", ".tiff", ".btf", ".tf8" };
 }
 
 IsoStringList BigTiffFormat::MimeTypes() const
