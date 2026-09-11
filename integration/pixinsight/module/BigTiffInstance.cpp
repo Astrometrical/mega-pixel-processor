@@ -1039,6 +1039,12 @@ void BigTiffInstance::CloseImage()
       return;
    std::unique_ptr<mpp::WriteSession> session = std::move( session_ );
    std::unique_ptr<ConsoleProgress> progress = std::move( progress_ );
+   // The idle callback CreateImage() registered dereferences the progress_
+   // member, which the move above just emptied -- re-point it at the local
+   // that owns the bar for the rest of this call, or the first silent
+   // stretch of the encode (>= kIdleWaitMs with no frame, routine on a
+   // large image) would fire it on a null pointer and take PixInsight down.
+   session->SetIdleCallback( [&]{ progress->Idle(); } );
    try
    {
       // Finish pumps every remaining Progress frame: the band phase's own
@@ -1046,7 +1052,7 @@ void BigTiffInstance::CloseImage()
       // docs/pi-protocol.md §7.3) and then the encoder's, each tagged with
       // its stage. Done's bytes_written is not needed here -- the worker's
       // exit code and Done frame are validated inside Finish. The idle
-      // callback registered at CreateImage() keeps pumping the GUI through
+      // callback re-registered just above keeps pumping the GUI through
       // the encode's silent stretches.
       (void)session->Finish(
          [&]( mpp::ProgressInfo p )
