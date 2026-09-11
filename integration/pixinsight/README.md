@@ -528,6 +528,14 @@ is the quickest independent second opinion.
    recording here because it was inferred from the PCL headers rather
    than observed.
 
+   Also confirm the format carries the **Astrometrical page icon** — a teal
+   document with a folded corner, the chevron, and a TIFF label — rather
+   than the core's generic blue cube. The cube means `IconImageSVG()` was
+   ignored, which PCL does *silently* for a malformed SVG; a page with no
+   TIFF label means the platform's SVG renderer dropped the text element,
+   which is worth recording here. Check it at list size (Format Explorer)
+   and at full size (an image-window icon).
+
 2. **The dialog is ours.** Save any image as TIFF. Confirm the options
    dialog appears before the file is written, and that it is visibly *not*
    the stock TIFF dialog: the Astrometrical chevron, the title *"Mega Pixel

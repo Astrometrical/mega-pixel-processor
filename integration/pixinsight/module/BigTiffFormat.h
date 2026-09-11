@@ -50,6 +50,7 @@ public:
    uint32 Version() const override;
    String Description() const override;
    String Implementation() const override;
+   IsoString IconImageSVG() const override;   // MPP_TIFF_FORMAT_ICON_SVG; default is the core's generic cube
 
    // -- Capabilities (PCL_FILEFORMAT_API.md §2.1). Only members whose value
    //    differs from the MetaFileFormat.h default -- or whose value is

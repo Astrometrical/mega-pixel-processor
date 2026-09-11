@@ -3,6 +3,7 @@
 #include "BigTiffFormat.h"
 
 #include "BigTiffInstance.h"
+#include "MppIcon.h"
 #include "MppVersion.h"
 #include "TiffFormatOptions.h"
 
@@ -95,6 +96,17 @@ String BigTiffFormat::Implementation() const
           "public PCL API only; see the module's provenance README "
           "(integration/pixinsight/README.md in the mpp source "
           "distribution). Version " MPP_MODULE_VERSION_STRING ".";
+}
+
+IsoString BigTiffFormat::IconImageSVG() const
+{
+   // The icon the core shows for this format everywhere it appears
+   // graphically (MetaFileFormat.h:240-265) -- without an override it
+   // assigns a generic blue cube. Ours is the Astrometrical page-with-
+   // chevron in MppIcon.h, the same mechanism MMM uses for its process icon.
+   // A malformed document falls back to the cube silently, so the SVG's
+   // well-formedness is worth guarding in review, not just at runtime.
+   return MPP_TIFF_FORMAT_ICON_SVG;
 }
 
 // ----------------------------------------------------------------------------
