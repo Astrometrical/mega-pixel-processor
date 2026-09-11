@@ -68,7 +68,7 @@ two channels:
 The worker's job, end to end: read `Init`, attach to the shm segment,
 receive a stream of `Band` frames (each naming a slot already filled by the
 host with one contiguous run of rows of one channel), copy each slot's
-contents into an mmap'd staging file, ack the slot so the host can reuse it,
+contents into an in-memory staging area, ack the slot so the host can reuse it,
 and — once `Finish` arrives and every row of every channel has been
 covered — stream the fully-covered staging planes through the BigTIFF
 encoder and report `Done`.
@@ -164,7 +164,7 @@ byte:   0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  1
 | tag | name       | payload encoding | payload |
 |----:|------------|-------------------|---------|
 |   1 | `BandAck`  | binary (4 bytes)  | `slot: u32` — slot is free for reuse |
-|   2 | `Progress` | JSON              | `ProgressMessage { rows_done: u64, rows_total: u64 }` |
+|   2 | `Progress` | JSON              | `ProgressMessage { rows_done: u64, rows_total: u64, stage: "bands" \| "encode" }` — `stage` is additive with a wire default of `"bands"` (see §7.3) |
 |   3 | `Done`     | JSON              | `DoneMessage { bytes_written: u64 }`, then the worker exits 0 (on a read session, `bytes_written` is always `0` and carries no meaning — see §9) |
 |   4 | `Error`    | JSON              | `ErrorMessage { message: String }`, then the worker exits nonzero |
 |   5 | `ImageMeta` **(v2)** | JSON     | `ImageMeta` — the worker's authoritative geometry for a read session, sent once right after `Init`; see §9 |
@@ -479,7 +479,7 @@ host                                          worker (mpp-ipc-worker)
  |                                             |-- checks protocol_version == IPC_PROTOCOL_VERSION
  |                                             |-- checks worker_version == env!("CARGO_PKG_VERSION")
  |                                             |-- attaches to shm "shm_name" (must match total_bytes)
- |                                             |-- opens/mmaps its staging file
+ |                                             |-- maps its staging area
  |                                     (band streaming — see 7.2)
 ```
 
@@ -499,7 +499,7 @@ host                                          worker
  |   rows*width native-endian f32 samples     |
  |------------- Band (tag 129) --------------> |
  |                                             |-- validates rows*width*4 <= slot_bytes
- |                                             |-- copies shm slot into staging file at
+ |                                             |-- copies shm slot into the staging area at
  |                                             |   (channel, start_row..start_row+rows)
  |                                             |-- marks that range covered
  |<------------ BandAck (tag 1) ---------------|
@@ -524,12 +524,30 @@ host                                          worker
  |------------- Finish (tag 130) ------------> |
  |                                             |-- checks every (channel, row) is covered
  |                                             |-- streams staging planes through the encoder
- |                                             |   (as of this version, no further Progress is
- |                                             |    emitted during encoding itself — the last
- |                                             |    Progress a host sees is from band streaming)
+ |<------------ Progress (tag 2, "encode") -----|   (one per strip / completed tile row)
+ |                 ...                          |
  |<-------------- Done (tag 3) -----------------|
  |                                             |-- exits 0
 ```
+
+**Encode-phase progress.** While encoding, the worker emits a `Progress`
+frame after every block row it writes (a strip, or a full row of tiles —
+about 4 MiB of pixels either way), with `stage: "encode"`. In that stage
+`rows_done`/`rows_total` count **output rows**, so `rows_total == height`;
+the final encode report always has `rows_done == rows_total`. Band-phase
+reports (§7.2) carry `stage: "bands"` and count staged rows summed over
+every channel, so `rows_total == height * channels` there.
+
+`stage` is the reason the two are distinguishable at all: the worker acks
+the last band *before* reporting its coverage, so the band phase's own final
+`Progress` routinely reaches the host only after `Finish` has gone out,
+interleaved with the encoder's first reports. A host must not infer the
+phase from a frame's position relative to `Finish`; it reads `stage`. The
+field is `#[serde(default)]` on the Rust side and decoded as optional by the
+C++ host, so a `Progress` payload from a worker built before it existed —
+which has no `stage` — still deserializes, as the band-phase report it could
+only have been. Additive, no version bump, by the same rule as
+`ImageMeta.icc_profile` (§8's version history).
 
 If coverage is incomplete when `Finish` arrives, the worker sends `Error`
 naming the **first** uncovered `(channel, row)` pair it finds (scanning
@@ -541,7 +559,7 @@ a partially-covered image.
 
 `Cancel` (tag 131) is only guaranteed to be observed if the host sends it
 **before** it sends `Finish`. In that window, the worker responds with
-best-effort cleanup — deleting its staging file and any partial output
+best-effort cleanup — dropping its staged pixels and deleting any partial output
 file already written — then sends `Error { message: "cancelled" }` and
 exits nonzero. A host should treat that specific message as an intentional
 stop, not a crash.
@@ -560,23 +578,21 @@ If a host genuinely needs to abort an in-progress encode after sending
 is safe in the sense that matters for host-side bookkeeping — the worker's
 exit code is still the authoritative completion signal (§4), and a killed
 process's nonzero (or signal-terminated) exit status is unambiguous — but
-it bypasses the worker's own in-process cleanup: `Staging`'s cleanup runs
-via that type's `Drop` impl (or the explicit `cleanup()` path on the
-`Cancel`/host-gone arms), and neither runs if the process is killed rather
-than allowed to unwind. Concretely, a `kill()`-based abort after `Finish`
-can leave the staging scratch file behind on disk — it is named
-`<output-filename>.mpp-stage-<worker-pid>` and lives next to the output
-file (same directory as `output_path`). A host that kills a worker for
-this reason should, on a best-effort basis, delete any
-`<output-filename>.mpp-stage-*` file it finds next to the output path
-afterward.
+it bypasses the worker's own in-process cleanup, so a partially written
+output file can be left behind at `output_path`; a host that kills a worker
+for this reason should delete it on a best-effort basis. The staged pixels
+themselves live in an anonymous memory mapping and vanish with the
+process. (Earlier workers staged into a scratch file named
+`<output-filename>.mpp-stage-<worker-pid>` next to the output, which a
+kill could orphan; a host that also wants to tidy up after such a worker
+may still delete any `<output-filename>.mpp-stage-*` it finds there.)
 
 ### 7.5 Host-gone (stdin EOF before Finish)
 
 If the worker's stdin reaches EOF before a `Finish` frame has been
 received, that means the host is gone (crashed, or closed the pipe without
 finishing the handshake). The worker treats this identically to `Cancel`'s
-cleanup path — staging file and partial output deleted — then exits
+cleanup path — staged pixels dropped, partial output deleted — then exits
 nonzero. **No frame is written** in this case: unlike `Cancel`, there is no
 host left to read one, so the worker skips straight to cleanup and exit. A
 host-side process supervisor detects this run's failure via the worker's
@@ -598,17 +614,14 @@ only ever appears in one specific spot, or that a zero-row `Band` is
 malformed) will misbehave against the real worker:
 
 - **`Progress` may arrive at any point before the terminal frame.** The
-  worker emits `Progress` during band streaming (§7.2, after a `BandAck`);
-  as of this protocol version it does not emit further `Progress` frames
-  during encoding itself (§7.3) — the last `Progress` a host sees is from
-  band streaming, and then `Done`/`Error` follows once encoding finishes.
-  A host's read loop must still tolerate an interleaved `Progress` frame
-  between any two frames it is otherwise waiting on (a `BandAck`, or the
-  final `Done`/`Error`) rather than treating an unexpected `Progress` as a
-  protocol violation at a specific point in the exchange — a future
-  protocol version may start emitting encode-time `Progress` without that
-  being a breaking wire-format change, precisely because hosts are already
-  required to tolerate it anywhere.
+  worker emits `Progress` during band streaming (§7.2, after a `BandAck`,
+  `stage: "bands"`) and during encoding (§7.3, after every block row,
+  `stage: "encode"`). A host's read loop must tolerate an interleaved
+  `Progress` frame between any two frames it is otherwise waiting on (a
+  `BandAck`, or the final `Done`/`Error`) rather than treating an
+  unexpected `Progress` as a protocol violation at a specific point in the
+  exchange; encode-time `Progress` was added under exactly that rule,
+  without a wire-format change.
 - **`BandAck`s arrive in band-processing order.** The worker processes
   `Band` frames strictly one at a time, synchronously, off a single read
   loop — it acks band *N* before it reads band *N+1* — so the sequence of
@@ -628,13 +641,14 @@ malformed) will misbehave against the real worker:
   receiving `Done` — encoding a large image (streaming the staged planes
   through the BigTIFF encoder) can legitimately take far longer than any
   single band-transfer step, and that duration scales with image size in a
-  way no fixed constant can safely bound. Since (as just noted) this
-  version sends no `Progress` during that specific interval, the health
-  signal available to a host here is the worker process's own liveness
-  (still running, not defunct/zombie) rather than any frame; a host should
-  treat the encode phase as healthy for as long as the process is alive
-  and reserve any hang detection for process-level signals, not elapsed
-  time since `Finish`.
+  way no fixed constant can safely bound. Encode-phase `Progress` (§7.3)
+  is a convenience for the user, not a heartbeat a host may key off: a
+  single ~4 MiB block can take arbitrarily long on a slow disk or at a high
+  Deflate level. The health signal is the worker process's own liveness
+  (still running, not defunct/zombie); a host should treat the encode phase
+  as healthy for as long as the process is alive and reserve any hang
+  detection for process-level signals, not elapsed time since `Finish` or
+  since the last `Progress`.
 
 ## 8. Versioning
 
@@ -675,7 +689,7 @@ malformed) will misbehave against the real worker:
 |---:|---|
 | 1 | Initial write-only host-push protocol: `Init`/`Band`/`Finish`/`Cancel` in, `BandAck`/`Progress`/`Done`/`Error` out. |
 | 2 | Adds a worker-pull **read** direction alongside v1's write path (§9): `InitMessage.mode` (`"write"` default / `"read"`); worker→host `ImageMeta` (tag 5) and `ReadBand` (tag 6, reuses the `Band`/`BandHeader` binary layout, direction reversed); host→worker `ReadBandAck` (tag 132, 4-byte `slot: u32`). A v1 `Init` payload (no `mode` field) still deserializes correctly, as `"write"`. |
-| 3 | Widens `InitMessage` (§10) — additive over v2 exactly as v2 was over v1. Fifteen new `Init` fields, every one with a wire default: `band_format` (the shm payload's sample type, separate from `bit_depth`, the output file's), `container`, `layout`, `tile_size`, `compression`, `deflate_level`, `predictor`, `alpha`, `icc_profile`, `description`, `copyright`, `software`, `x_resolution`, `y_resolution`, `resolution_unit`. **No new frame tags, no change to the `Band`/`BandHeader` binary layout, no lifecycle change.** A v2 `Init` payload (none of the fifteen present) still deserializes correctly, into exactly the v2 behaviour. The one rule §6 restates: slot alignment/size is measured in the `band_format` sample width rather than a fixed 4 bytes. A later, still-v3 change widens `ImageMeta` (§9.2) the same way: one new field, `icc_profile`, `#[serde(default)]`, no version bump — the read-side mirror of `InitMessage.icc_profile` above. |
+| 3 | Widens `InitMessage` (§10) — additive over v2 exactly as v2 was over v1. Fifteen new `Init` fields, every one with a wire default: `band_format` (the shm payload's sample type, separate from `bit_depth`, the output file's), `container`, `layout`, `tile_size`, `compression`, `deflate_level`, `predictor`, `alpha`, `icc_profile`, `description`, `copyright`, `software`, `x_resolution`, `y_resolution`, `resolution_unit`. **No new frame tags, no change to the `Band`/`BandHeader` binary layout, no lifecycle change.** A v2 `Init` payload (none of the fifteen present) still deserializes correctly, into exactly the v2 behaviour. The one rule §6 restates: slot alignment/size is measured in the `band_format` sample width rather than a fixed 4 bytes. A later, still-v3 change widens `ImageMeta` (§9.2) the same way: one new field, `icc_profile`, `#[serde(default)]`, no version bump — the read-side mirror of `InitMessage.icc_profile` above. Another still-v3 change adds `stage` to `ProgressMessage` (§7.3), `#[serde(default)]` to `"bands"`, and starts emitting `stage: "encode"` reports during encoding — which §7.7 had already required hosts to tolerate. |
 
 ## 9. Read mode (protocol v2)
 

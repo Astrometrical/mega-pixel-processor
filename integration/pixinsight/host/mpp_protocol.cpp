@@ -197,6 +197,18 @@ bool read_worker_frame(os_handle h, WorkerFrame& out) {
       // not just InitMessage's).
       out.progress.rows_done = j.at("rows_done").get<uint64_t>();
       out.progress.rows_total = j.at("rows_total").get<uint64_t>();
+      // `stage` is additive (serde default "bands" on the Rust side), so an
+      // older worker's payload without it is a band-phase report. Any other
+      // spelling is refused by name, like every string enum on this wire.
+      out.progress.stage = ProgressStage::Bands;
+      if (j.contains("stage")) {
+        const std::string stage = j.at("stage").get<std::string>();
+        if (stage == "encode") {
+          out.progress.stage = ProgressStage::Encode;
+        } else if (stage != "bands") {
+          throw std::runtime_error("read_worker_frame: unknown Progress stage \"" + stage + "\"");
+        }
+      }
       break;
     }
     case static_cast<uint8_t>(WorkerTag::Done): {

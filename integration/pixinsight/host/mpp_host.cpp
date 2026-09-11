@@ -115,6 +115,19 @@ WriteSessionConfig ValidateConfig(const WriteSessionConfig& cfg) {
   return cfg;
 }
 
+// Blocks until `h` has a frame (or EOF/error) to read, firing `idle` every
+// WriteSession::kIdleWaitMs of silence in between. With no callback
+// registered this returns at once and the caller's read blocks as before:
+// the poll is only worth its syscall when someone wants the idle ticks.
+// os_wait_readable never returns 0 for a closed pipe, so an exiting worker
+// still reaches the read (and its EOF handling) promptly.
+void WaitReadableFiringIdle(os_handle h, const std::function<void()>& idle) {
+  if (!idle) return;
+  while (os_wait_readable(h, WriteSession::kIdleWaitMs) == 0) {
+    idle();
+  }
+}
+
 uint64_t ComputeSlotBytes(const WriteSessionConfig& cfg) {
   // Sized in the session's negotiated shm sample width, not sizeof(float):
   // protocol v3's whole point is that a band need not cross shm as f32.
@@ -332,7 +345,7 @@ uint64_t WriteSession::Finish(const std::function<void(ProgressInfo)>& cb) {
         FreeSlot(f.band_ack_slot);
         break;
       case WorkerTag::Progress:
-        if (cb) cb(ProgressInfo{f.progress.rows_done, f.progress.rows_total});
+        if (cb) cb(ProgressInfo{f.progress.rows_done, f.progress.rows_total, f.progress.stage});
         break;
       case WorkerTag::Error:
         finished_ = true;
@@ -353,7 +366,7 @@ uint64_t WriteSession::Finish(const std::function<void(ProgressInfo)>& cb) {
     WorkerFrame f = ReadFrameOrThrow();
     switch (f.tag) {
       case WorkerTag::Progress:
-        if (cb) cb(ProgressInfo{f.progress.rows_done, f.progress.rows_total});
+        if (cb) cb(ProgressInfo{f.progress.rows_done, f.progress.rows_total, f.progress.stage});
         break;
       case WorkerTag::Done: {
         finished_ = true;
@@ -464,6 +477,7 @@ WorkerFrame WriteSession::ReadFrameOrThrow() {
   WorkerFrame f;
   bool got;
   try {
+    WaitReadableFiringIdle(out_pipe_.read_end, idle_cb_);
     got = read_worker_frame(out_pipe_.read_end, f);
   } catch (const std::exception& e) {
     finished_ = true;
@@ -720,6 +734,7 @@ WorkerFrame ReadSession::ReadFrameOrThrow() {
   WorkerFrame f;
   bool got;
   try {
+    WaitReadableFiringIdle(out_pipe_.read_end, idle_cb_);
     got = read_worker_frame(out_pipe_.read_end, f);
   } catch (const std::exception& e) {
     finished_ = true;

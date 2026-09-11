@@ -23,13 +23,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use mpp_ipc::protocol::{
-    BandHeader, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, SessionMode, read_frame, tag,
-    write_frame,
+    BandHeader, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, ProgressStage, SessionMode,
+    read_frame, tag, write_frame,
 };
 use mpp_ipc::shm::ShmSegment;
 use mpp_ipc::testhost::{
     TestHostConfig, run_cancel_after_first_band, run_oversize_band_session, run_write_session,
-    run_write_session_incomplete, run_write_session_shuffled, run_write_session_typed,
+    run_write_session_collecting_encode_progress, run_write_session_incomplete,
+    run_write_session_shuffled, run_write_session_typed,
 };
 use tiff::decoder::{Decoder, DecodingResult};
 
@@ -43,10 +44,10 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 /// Lists any files in `dir` whose name contains `.mpp-stage-` — the
-/// worker's staging-scratch-file naming convention
-/// (`crates/mpp-ipc-worker/src/main.rs`'s `staging_path_for`,
-/// `<output-filename>.mpp-stage-<pid>`). Used to assert "no staging file
-/// leftover" without needing to know the worker's own pid.
+/// scratch-file naming convention earlier workers staged into
+/// (`<output-filename>.mpp-stage-<pid>`). Staging is an anonymous mapping
+/// now, so this guards against a scratch file ever coming back; the
+/// assertions read "no staging file leftover" without needing the pid.
 fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .into_iter()
@@ -912,6 +913,65 @@ fn u8_bands_reach_the_file_bit_exact() {
         DecodingResult::U8(data) => assert_eq!(data, expected),
         other => panic!("expected U8 samples, got {other:?}"),
     }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Encode-phase progress
+// ---------------------------------------------------------------------------
+
+/// After `Finish`, the worker reports the encoder's own progress as
+/// `Progress` frames tagged `stage: "encode"` (docs/pi-protocol.md §7.3),
+/// so a host can keep a bar moving while a large file is written. Those
+/// reports count output rows (`rows_total == height`, not `height *
+/// channels` as the band phase does), rise monotonically, and the last one
+/// is complete. The band phase's own final report may legitimately arrive
+/// after `Finish` too (the worker acks the last band before reporting it),
+/// which is exactly why the stage travels on the wire.
+#[test]
+fn encode_progress_is_reported_after_finish() {
+    let dir = tmpdir("encode-progress");
+    let out = dir.join("out.tif");
+    let (width, height) = (16u64, 24u64);
+    let cfg = TestHostConfig::write(
+        env!("CARGO_BIN_EXE_mpp-ipc-worker").into(),
+        out.clone(),
+        width,
+        height,
+        3,
+    );
+    let (_bytes, progress) =
+        run_write_session_collecting_encode_progress(&cfg, |c, y, x| (c + y + x) as f32 / 64.0)
+            .expect("write session should succeed");
+
+    for p in progress.iter().filter(|p| p.stage == ProgressStage::Bands) {
+        assert_eq!(
+            p.rows_total,
+            height * 3,
+            "band progress counts staged rows: {p:?}"
+        );
+    }
+    let encode: Vec<_> = progress
+        .iter()
+        .filter(|p| p.stage == ProgressStage::Encode)
+        .collect();
+    assert!(
+        !encode.is_empty(),
+        "expected at least one encode-stage Progress frame after Finish, got {progress:?}"
+    );
+    for w in encode.windows(2) {
+        assert!(
+            w[0].rows_done <= w[1].rows_done,
+            "progress went backwards: {encode:?}"
+        );
+    }
+    let last = encode.last().unwrap();
+    assert_eq!(
+        last.rows_total, height,
+        "encode progress counts output rows"
+    );
+    assert_eq!(last.rows_done, height, "the final report must be complete");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

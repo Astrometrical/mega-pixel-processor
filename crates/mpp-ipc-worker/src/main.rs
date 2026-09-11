@@ -5,12 +5,12 @@
 //!
 //! - [`SessionMode::Write`] (the original v1 flow, [`run_write`]): the
 //!   worker attaches to the host's shm segment, stages every `Band` the
-//!   host sends into a memory-mapped scratch file ([`staging::Staging`]),
+//!   host sends into an anonymous memory mapping ([`staging::Staging`]),
 //!   and — once `Finish` confirms every row of every channel arrived —
 //!   streams the staged planes through
 //!   [`mpp_core::formats::tiff_write::write_tiff`] and reports `Done`. `Cancel`
 //!   (or the host disappearing before `Finish`) tears down cleanly instead.
-//!   Since protocol v3 the staging file holds the session's *own* sample
+//!   Since protocol v3 the staging area holds the session's *own* sample
 //!   type (`Init.band_format`), not unit-range `f32`: [`run_write`] parses
 //!   that field and dispatches to [`run_write_typed`], so `u32` and `f64`
 //!   pixels reach the encoder with every bit intact.
@@ -36,11 +36,11 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use mpp_core::formats::tiff_read::TiffReader;
 use mpp_core::formats::tiff_write::{
-    AlphaMode, BitDepth, Compression, Container, Layout, Resolution, ResolutionUnit, Sample,
-    TiffWriteOptions, write_tiff, write_tiff_native,
+    AlphaMode, BitDepth, Compression, Container, Layout, ProgressFn, Resolution, ResolutionUnit,
+    Sample, TiffWriteOptions, write_tiff_native_with_progress, write_tiff_with_progress,
 };
 use mpp_ipc::link::{HostEvent, HostLink};
-use mpp_ipc::protocol::{InitMessage, SessionMode};
+use mpp_ipc::protocol::{InitMessage, ProgressStage, SessionMode};
 use mpp_ipc::shm::ShmSegment;
 
 use staging::Staging;
@@ -146,19 +146,21 @@ struct WriteSetup {
 ///
 /// Two shapes, and only two, because `mpp-core` offers exactly two entry
 /// points: `f32` bands are the unit-range domain
-/// [`write_tiff`] converts from,
+/// [`write_tiff_with_progress`] converts from,
 /// so an `f32` session can target any output `bit_depth` (this is the v1/v2
 /// behaviour, unchanged); every other band type is written verbatim by
-/// [`write_tiff_native`],
+/// [`write_tiff_native_with_progress`],
 /// which is the whole point of protocol v3 and requires the output format
 /// to match — [`validate_init`] rejects a mismatch up front rather than
 /// letting it surface after a multi-gigabyte staging run.
 trait BandSample: Sample {
-    /// Encode the (fully covered) `staging` image to `path` per `opts`.
+    /// Encode the (fully covered) `staging` image to `path` per `opts`,
+    /// reporting encode progress to `progress` after every block row.
     fn encode_staging(
         staging: &Staging<Self>,
         path: &Path,
         opts: &TiffWriteOptions,
+        progress: ProgressFn<'_>,
     ) -> mpp_core::Result<()>;
 }
 
@@ -167,9 +169,10 @@ impl BandSample for f32 {
         staging: &Staging<Self>,
         path: &Path,
         opts: &TiffWriteOptions,
+        progress: ProgressFn<'_>,
     ) -> mpp_core::Result<()> {
         // The converting path: unit-range f32 in, any `opts.bit_depth` out.
-        write_tiff(staging, path, opts)
+        write_tiff_with_progress(staging, path, opts, progress)
     }
 }
 
@@ -181,8 +184,9 @@ macro_rules! native_band_sample {
                 staging: &Staging<Self>,
                 path: &Path,
                 opts: &TiffWriteOptions,
+                progress: ProgressFn<'_>,
             ) -> mpp_core::Result<()> {
-                write_tiff_native(staging, path, opts)
+                write_tiff_native_with_progress(staging, path, opts, progress)
             }
         }
     };
@@ -248,17 +252,18 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
     };
 
     let output_path = PathBuf::from(&init.output_path);
-    let staging_path = staging_path_for(&output_path);
-    let mut staging =
-        match Staging::<T>::create(&staging_path, init.width, init.height, init.channels) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(fail(
-                    link,
-                    &format!("creating staging file {}: {e}", staging_path.display()),
-                ));
-            }
-        };
+    let mut staging = match Staging::<T>::create(init.width, init.height, init.channels) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(fail(
+                link,
+                &format!(
+                    "reserving staging memory for a {}x{}x{} {} image: {e}",
+                    init.width, init.height, init.channels, init.band_format
+                ),
+            ));
+        }
+    };
 
     let rows_total = init.height.saturating_mul(init.channels);
     let progress_every = (init.height / 100).max(1);
@@ -344,7 +349,8 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
                 if rows_done.saturating_sub(last_progress) >= progress_every
                     || rows_done >= rows_total
                 {
-                    if let Err(e) = link.send_progress(rows_done, rows_total) {
+                    if let Err(e) = link.send_progress(ProgressStage::Bands, rows_done, rows_total)
+                    {
                         return Err(fail(link, &e.to_string()));
                     }
                     last_progress = rows_done;
@@ -394,7 +400,24 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
     // call the encoder makes below reads real data, never the zero-filled
     // uncovered case documented on `Staging`'s `PlanarRows` impl (see
     // `staging.rs`).
-    if let Err(e) = T::encode_staging(&staging, &output_path, &setup.options) {
+    //
+    // Encode-phase progress (docs/pi-protocol.md §7.3): every block row the
+    // encoder finishes becomes a `Progress` frame counting OUTPUT rows
+    // (`rows_total == height`), distinct from the band phase's
+    // `height * channels`. A block row is ~4 MiB of pixels, so no further
+    // throttling is needed. A link failure mid-encode is remembered rather
+    // than aborting the encode — the file is still worth finishing, and the
+    // host-gone/`Done` bookkeeping below reports it as usual.
+    let mut progress_err: Option<mpp_ipc::link::LinkError> = None;
+    let mut progress = |rows_done: u64, rows_total: u64| {
+        if progress_err.is_none()
+            && let Err(e) = link.send_progress(ProgressStage::Encode, rows_done, rows_total)
+        {
+            progress_err = Some(e);
+        }
+    };
+    let encoded = T::encode_staging(&staging, &output_path, &setup.options, &mut progress);
+    if let Err(e) = encoded {
         // The encoder may have left a partial file behind; best-effort
         // clean it up rather than leaving a corrupt-looking output file
         // for the host to trip over after we've already reported failure.
@@ -404,18 +427,11 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
             &format!("encoding {}: {e}", output_path.display()),
         ));
     }
-
-    if let Err(e) = staging.remove() {
-        // Cosmetic cleanup failure only: the output file is already
-        // written and correct, so this does not fail the run — just note
-        // it on stderr. (`Staging::drop` won't retry: `remove` marks
-        // itself done regardless of whether the filesystem call
-        // succeeded.)
-        eprintln!(
-            "mpp-ipc-worker: warning: failed to remove staging file {}: {e}",
-            staging_path.display()
-        );
+    if let Some(e) = progress_err {
+        return Err(fail(link, &e.to_string()));
     }
+
+    drop(staging); // release the staged pixels before the final bookkeeping
 
     let bytes_written = match std::fs::metadata(&output_path) {
         Ok(m) => m.len(),
@@ -499,7 +515,7 @@ fn parse_depth(s: &str, field: &str) -> Result<BitDepth, String> {
 ///
 /// Per Task 5's carried review finding, `width == 0 || height == 0` is
 /// rejected here rather than left to fail obscurely inside
-/// `Staging::create`'s zero-length mmap.
+/// `Staging::create`'s zero-length mapping.
 fn validate_init(init: &InitMessage) -> Result<WriteSetup, String> {
     if init.width == 0 || init.height == 0 {
         return Err(format!(
@@ -657,31 +673,12 @@ fn band_byte_len(rows: u32, width: u64, sample_bytes: u64) -> Option<u64> {
     (rows as u64).checked_mul(width)?.checked_mul(sample_bytes)
 }
 
-/// The staging scratch file path for `output_path`: `<output>.mpp-stage-<pid>`
-/// in the same directory as the output file. Co-locating keeps the staging
-/// file on the same filesystem as the final output (relevant if the output
-/// directory is a mount with more room than a system temp dir), and the
-/// pid suffix keeps concurrent runs targeting the same output path from
-/// colliding.
-fn staging_path_for(output_path: &Path) -> PathBuf {
-    let mut name = output_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("mpp-ipc-worker-output"))
-        .to_os_string();
-    name.push(format!(".mpp-stage-{}", std::process::id()));
-    match output_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-/// Best-effort cleanup for the `Cancel`/`HostGone` paths: removes the
-/// staging file (via `Staging::remove`, consuming it) and any partial
-/// output file. Errors from either removal are ignored — this runs on an
-/// already-failing path where there's no further frame to report a
-/// secondary cleanup failure through.
+/// Best-effort cleanup for the `Cancel`/`HostGone` paths: drops the staged
+/// pixels and removes any partial output file. A removal error is ignored —
+/// this runs on an already-failing path where there's no further frame to
+/// report a secondary cleanup failure through.
 fn cleanup<T: bytemuck::Pod>(staging: Staging<T>, output_path: &Path) {
-    let _ = staging.remove();
+    drop(staging);
     let _ = std::fs::remove_file(output_path);
 }
 

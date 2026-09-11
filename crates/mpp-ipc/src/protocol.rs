@@ -305,13 +305,36 @@ fn default_resolution_unit() -> String {
     "inch".to_string()
 }
 
+/// Which phase of a write session a [`ProgressMessage`] describes.
+///
+/// Defaults to [`ProgressStage::Bands`] so a `Progress` payload from a
+/// worker built before the field existed — which has no `stage` at all —
+/// still deserializes, as the band-phase report it could only have been.
+/// Additive, no protocol version bump (docs/pi-protocol.md §8's precedent
+/// is `ImageMeta::icc_profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressStage {
+    /// Band streaming (before `Finish`): `rows_done`/`rows_total` count
+    /// staged rows summed across channels, so `rows_total == height *
+    /// channels`.
+    #[default]
+    Bands,
+    /// Encoding (after `Finish`): `rows_done`/`rows_total` count output
+    /// rows written to the file, so `rows_total == height`.
+    Encode,
+}
+
 /// Worker→host `Progress` message (tag [`tag::PROGRESS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressMessage {
-    /// Rows completed so far, summed across channels.
+    /// Rows completed so far, in the unit [`stage`](Self::stage) defines.
     pub rows_done: u64,
-    /// Total rows expected, summed across channels.
+    /// Total rows expected, in the unit [`stage`](Self::stage) defines.
     pub rows_total: u64,
+    /// Which phase this report belongs to; see [`ProgressStage`].
+    #[serde(default)]
+    pub stage: ProgressStage,
 }
 
 /// Worker→host `Done` message (tag [`tag::DONE`]); the last frame the
@@ -631,10 +654,15 @@ mod tests {
         let progress = ProgressMessage {
             rows_done: 100,
             rows_total: 9000,
+            stage: ProgressStage::Encode,
         };
         let back: ProgressMessage =
             serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
         assert_eq!(back, progress);
+        // A pre-`stage` payload is a band-phase report.
+        let old: ProgressMessage =
+            serde_json::from_slice(br#"{"rows_done":1,"rows_total":2}"#).unwrap();
+        assert_eq!(old.stage, ProgressStage::Bands);
 
         let done = DoneMessage {
             bytes_written: 123_456,

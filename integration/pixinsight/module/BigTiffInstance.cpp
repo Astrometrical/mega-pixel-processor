@@ -14,6 +14,8 @@
 #include <pcl/Console.h>
 #include <pcl/Exception.h>
 #include <pcl/File.h>
+#include <pcl/MetaModule.h>
+#include <pcl/Thread.h>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -26,6 +28,8 @@
 #include <limits>
 #include <type_traits>
 #include <vector>
+
+#include "ProgressBar.h"
 
 namespace pcl
 {
@@ -266,6 +270,135 @@ std::string TagText( const char ( &field )[N] )
 
 } // anonymous namespace
 
+// --- Console progress bar (namespace pcl, forward-declared in the header so
+// the instance can own one by unique_ptr) -----------------------------------
+//
+// One in-place line per stage on the Process Console, in MergeMosaic's style
+// (MmmExecution.cpp's ConsoleProgress): bold stage name, teal [####----]
+// bar, percent; redrawn only when the percent changes, committed with a
+// newline at 100% or when this object is destroyed mid-way (an error path),
+// so whatever the core prints next starts on a fresh line. The text itself
+// comes from ProgressBar.h, which is PCL-free and unit-tested in the host
+// suite; this class owns only the Console calls around it.
+//
+// Two deliberate differences from MMM, because a file-format instance is not
+// a process's ExecuteGlobal():
+//
+//   * Everything here is a no-op unless Thread::IsRootThread(): PCL says
+//     Module->ProcessEvents() may only be called from the root thread, and a
+//     format instance can be driven from a worker thread by a process that
+//     reads or writes files in parallel (PCL_FILEFORMAT_API.md §7 item 7,
+//     which is why this file used to avoid the Console entirely). On the
+//     root thread the save/load is synchronous and the GUI is frozen until
+//     it returns -- exactly the case a bar helps.
+//   * The pump passes excludeUserInputEvents = true: the console repaints
+//     and Windows does not flag the window as "not responding", but the user
+//     cannot click on (or close) the image mid-save. No abort polling either:
+//     Console::AbortRequested() is only meaningful inside a process's execute
+//     thread, and the format API has no cancel hook (§7 item 8).
+//
+// Idle(): the host sessions invoke this every ~100 ms of pipe silence
+// (WriteSession::SetIdleCallback), so the GUI keeps getting pumped through
+// the stretches that emit no Progress -- the worker decoding a large chunk
+// on a read, or a slow block on an encode.
+class ConsoleProgress
+{
+public:
+
+   ConsoleProgress() : m_active( Thread::IsRootThread() )
+   {
+   }
+
+   ~ConsoleProgress()
+   {
+      // Never let a Console failure escape a destructor; the line is
+      // cosmetic and the instance is already unwinding.
+      try
+      {
+         if ( m_lineLen > 0 )
+            CommitLine();
+      }
+      catch ( ... )
+      {
+      }
+   }
+
+   ConsoleProgress( const ConsoleProgress& ) = delete;
+   ConsoleProgress& operator =( const ConsoleProgress& ) = delete;
+
+   // Draws (or redraws) the bar for \a stage at \a done of \a total. A change
+   // of stage commits the previous stage's line first.
+   void Update( const char* stage, uint64_t done, uint64_t total )
+   {
+      if ( !m_active )
+         return;
+      if ( m_stage != stage )
+      {
+         if ( m_lineLen > 0 )
+            CommitLine();
+         m_stage = stage;
+         m_lastPercent = -1;
+      }
+      const int percent = mpp::PercentOf( done, total );
+      if ( percent == m_lastPercent )
+         return;
+      m_lastPercent = percent;
+      Redraw( mpp::RenderProgressBar( m_stage, percent ) );
+      if ( percent == 100 )
+         CommitLine();
+      Pump();
+   }
+
+   // Quiet pipe: keep the GUI responsive without touching the line.
+   void Idle()
+   {
+      if ( m_active )
+         Pump();
+   }
+
+private:
+
+   // Erase the previous glyphs with backspaces (the console's <bsp> deletes
+   // a glyph; <bol>+write would insert, so \r cannot be used), then draw.
+   // <end><cbr> before the first draw of a line moves to the end of the
+   // console text and breaks the line only if it is not already empty, so
+   // the bar never appends to whatever the core printed last.
+   void Redraw( const mpp::ProgressBarText& text )
+   {
+      String s = "<end>";
+      if ( m_lineLen > 0 )
+         s.Append( String( '\b', size_type( m_lineLen ) ) );
+      else
+         s += "<cbr>";
+      s += String::UTF8ToUTF16( text.markup.c_str() );
+      m_console.Write( s );
+      m_lineLen = text.visible;
+   }
+
+   void CommitLine()
+   {
+      m_console.WriteLn();
+      m_lineLen = 0;
+   }
+
+   void Pump()
+   {
+      Module->ProcessEvents( true/*excludeUserInputEvents*/ );
+   }
+
+   const bool  m_active;           // root thread: draw and pump; otherwise inert
+   Console     m_console;
+   std::string m_stage;
+   int         m_lastPercent = -1;
+   int         m_lineLen = 0;      // visible glyphs currently on the in-progress line
+};
+
+// Stage names on the Console. The write path has two: bands crossing to
+// the worker, then the worker encoding the file (docs/pi-protocol.md §7.3).
+constexpr const char* kStageTransferring = "Transferring";
+constexpr const char* kStageEncoding = "Encoding";
+constexpr const char* kStageReading = "Reading";
+
 // ----------------------------------------------------------------------------
 
 BigTiffInstance::BigTiffInstance( const BigTiffFormat* format )
@@ -392,6 +525,7 @@ void BigTiffInstance::Close()
       }
       session_.reset();
    }
+   progress_.reset();
    open_ = false;
    read_mode_ = false;   // a read instance carries no live session; just clear state
 
@@ -468,6 +602,15 @@ void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
       // throwing.
       mpp::ReadSession rs( cfg );
 
+      // One "Reading" bar for the whole decode, driven host-side from the
+      // rows each band delivers (the worker sends no read-mode Progress).
+      // Coarse for a single-strip file, whose whole channel decodes before
+      // its first band arrives, smooth for anything striped or tiled.
+      ConsoleProgress progress;
+      rs.SetIdleCallback( [&]{ progress.Idle(); } );
+      const uint64_t rowsTotal = read_height_*read_channels_;
+      uint64_t rowsRead = 0;
+
       // Cross-check the session's authoritative geometry against Open()'s
       // probe: if the file changed on disk between the two opens, the
       // destination we just allocated would not match the incoming bands.
@@ -494,6 +637,9 @@ void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
             // startRow full rows.
             sample* dst = image.PixelData( int( ch ) ) + size_t( startRow )*size_t( width );
             std::memcpy( dst, samples, size_t( rows )*size_t( width )*sizeof( sample ) );
+
+            rowsRead += rows;
+            progress.Update( kStageReading, rowsRead, rowsTotal );
          } );
    }
    catch ( const mpp::HostError& e )
@@ -874,6 +1020,14 @@ void BigTiffInstance::CreateImage( const ImageInfo& info )
    {
       throw Error( String( "BigTIFF: " ) + String( e.what() ) );
    }
+
+   // Progress spans the whole image: "Transferring" while WriteSamples
+   // pushes bands (counted here, host-side), then "Encoding" from the
+   // worker's own reports after Finish. Destroyed with the session, so an
+   // aborted save still ends its console line.
+   progress_ = std::make_unique<ConsoleProgress>();
+   rows_pushed_ = 0;
+   session_->SetIdleCallback( [this]{ progress_->Idle(); } );
 }
 
 void BigTiffInstance::CloseImage()
@@ -884,13 +1038,23 @@ void BigTiffInstance::CloseImage()
    if ( session_ == nullptr )
       return;
    std::unique_ptr<mpp::WriteSession> session = std::move( session_ );
+   std::unique_ptr<ConsoleProgress> progress = std::move( progress_ );
    try
    {
-      // No progress callback: nothing documents which thread drives this
-      // instance (Unknowns §7), so the shim never touches GUI/Console.
-      // Done's bytes_written is not needed here -- the worker's exit code
-      // and Done frame are validated inside Finish.
-      (void)session->Finish( std::function<void( mpp::ProgressInfo )>() );
+      // Finish pumps every remaining Progress frame: the band phase's own
+      // final report (which routinely arrives only now, see
+      // docs/pi-protocol.md §7.3) and then the encoder's, each tagged with
+      // its stage. Done's bytes_written is not needed here -- the worker's
+      // exit code and Done frame are validated inside Finish. The idle
+      // callback registered at CreateImage() keeps pumping the GUI through
+      // the encode's silent stretches.
+      (void)session->Finish(
+         [&]( mpp::ProgressInfo p )
+         {
+            progress->Update( p.stage == mpp::ProgressStage::Encode ? kStageEncoding
+                                                                    : kStageTransferring,
+                              p.rows_done, p.rows_total );
+         } );
    }
    catch ( const mpp::HostError& e )
    {
@@ -964,12 +1128,20 @@ void BigTiffInstance::PushTyped( const T* buffer, int startRow, int rowCount, in
          p += n;
          row += rows;
          remaining -= rows;
+
+         // Host-side count: every row pushed is a row the worker will stage,
+         // so this is the same quantity the worker's band-phase Progress
+         // reports, available without waiting for the frame.
+         rows_pushed_ += rows;
+         progress_->Update( kStageTransferring, rows_pushed_, height_*channels_ );
       }
    }
    catch ( const mpp::HostError& e )
    {
       // The session is no longer usable after a fault; dropping it kills and
       // reaps the worker (RAII) so a failed save never leaves one running.
+      // The bar goes with it, ending its line before the error is shown.
+      progress_.reset();
       session_.reset();
       throw Error( String( "BigTIFF: " ) + String( e.what() ) );
    }

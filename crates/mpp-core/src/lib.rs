@@ -28,6 +28,8 @@ pub use error::{Error, Result};
 
 pub mod formats;
 
+pub(crate) mod pipeline;
+
 pub mod wcs;
 
 pub mod convert;

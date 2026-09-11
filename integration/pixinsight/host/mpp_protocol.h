@@ -176,9 +176,19 @@ struct BandHeader {
 };
 
 /// Worker -> host `Progress` message (tag `WorkerTag::Progress`).
+/// Which phase of a write session a `ProgressMessage` describes
+/// (docs/pi-protocol.md §7.3). Optional on the wire: a `Progress` payload
+/// from a worker built before the field existed carries no `stage`, and
+/// decodes as `Bands`, the only phase it could have reported.
+enum class ProgressStage {
+  Bands,   ///< Band streaming: rows_total == height * channels (staged rows).
+  Encode,  ///< Encoding after Finish: rows_total == height (output rows).
+};
+
 struct ProgressMessage {
   uint64_t rows_done = 0;
   uint64_t rows_total = 0;
+  ProgressStage stage = ProgressStage::Bands;
 };
 
 /// Worker -> host `Done` message (tag `WorkerTag::Done`); the last frame the

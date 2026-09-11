@@ -25,8 +25,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::protocol::{
-    BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, SessionMode,
-    read_frame, tag, write_frame,
+    BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, InitMessage, ProgressMessage,
+    SessionMode, read_frame, tag, write_frame,
 };
 use crate::shm::ShmSegment;
 
@@ -187,6 +187,24 @@ pub fn run_write_session_typed<S: bytemuck::Pod>(
     )
 }
 
+/// As [`run_write_session`], but also returns every `Progress` frame the
+/// worker sent *after* `Finish` — the encode-phase reports a host uses to
+/// drive a progress bar while the file is being written (docs/pi-protocol.md
+/// §7.3). Band-phase `Progress` (before `Finish`) is not collected.
+pub fn run_write_session_collecting_encode_progress(
+    cfg: &TestHostConfig,
+    pixel: impl Fn(u64, u64, u64) -> f32,
+) -> Result<(u64, Vec<ProgressMessage>), String> {
+    let mut session = Session::start(cfg)?;
+    send_bands_in_order(
+        &mut session,
+        cfg,
+        band_plan(cfg.height, cfg.channels, cfg.band_rows),
+        pixel,
+    )?;
+    session.finish_and_await_done_collecting_progress()
+}
+
 /// As [`run_write_session`], but sends the same bands in reverse order — a
 /// deterministic non-monotonic delivery order (no RNG dependency) that
 /// exercises the worker's out-of-order coverage tracking, per
@@ -294,6 +312,17 @@ fn run_bands_in_order<S: bytemuck::Pod>(
     pixel: impl Fn(u64, u64, u64) -> S,
 ) -> Result<u64, String> {
     let mut session = Session::start(cfg)?;
+    send_bands_in_order(&mut session, cfg, bands, pixel)?;
+    session.finish_and_await_done()
+}
+
+/// Streams `bands` through `session` one at a time, each awaited to its ack.
+fn send_bands_in_order<S: bytemuck::Pod>(
+    session: &mut Session,
+    cfg: &TestHostConfig,
+    bands: Vec<BandSpec>,
+    pixel: impl Fn(u64, u64, u64) -> S,
+) -> Result<(), String> {
     let mut buf: Vec<S> = Vec::new();
     for (i, (channel, start_row, rows)) in bands.into_iter().enumerate() {
         buf.clear();
@@ -305,7 +334,7 @@ fn run_bands_in_order<S: bytemuck::Pod>(
         let slot_id = (i as u32) % session.slots;
         session.send_band_and_await_ack(channel, start_row, rows, slot_id, &buf)?;
     }
-    session.finish_and_await_done()
+    Ok(())
 }
 
 /// One `(channel, start_row, rows)` band to send, in the order
@@ -519,20 +548,34 @@ impl Session {
     /// `bytes_written`) or `Error` (returns `Err`), collecting/ignoring any
     /// interleaved `Progress` frames. Checks the worker's exit code agrees
     /// with which terminal frame it sent.
-    fn finish_and_await_done(mut self) -> Result<u64, String> {
+    fn finish_and_await_done(self) -> Result<u64, String> {
+        self.finish_and_await_done_collecting_progress()
+            .map(|(bytes_written, _progress)| bytes_written)
+    }
+
+    /// [`finish_and_await_done`](Self::finish_and_await_done), also
+    /// returning the `Progress` frames read between `Finish` and `Done`,
+    /// in arrival order.
+    fn finish_and_await_done_collecting_progress(
+        mut self,
+    ) -> Result<(u64, Vec<ProgressMessage>), String> {
         write_frame(&mut self.stdin, tag::FINISH, &[])
             .map_err(|e| format!("writing Finish frame: {e}"))?;
         self.stdin
             .flush()
             .map_err(|e| format!("flushing Finish frame: {e}"))?;
 
+        let mut progress = Vec::new();
         let outcome: Result<u64, String> = loop {
             let (t, payload) = match read_frame(&mut self.stdout) {
                 Ok(f) => f,
                 Err(e) => break Err(format!("reading reply to Finish: {e}")),
             };
             match t {
-                tag::PROGRESS => continue,
+                tag::PROGRESS => match serde_json::from_slice::<ProgressMessage>(&payload) {
+                    Ok(p) => progress.push(p),
+                    Err(e) => break Err(format!("malformed Progress payload: {e}")),
+                },
                 tag::DONE => break decode_done(&payload),
                 tag::ERROR => break decode_error(&payload),
                 other => break Err(format!("unexpected tag {other} while waiting for Done")),
@@ -540,7 +583,7 @@ impl Session {
         };
 
         self.expect_exit(outcome.is_ok())?;
-        outcome
+        outcome.map(|bytes_written| (bytes_written, progress))
     }
 
     /// Sends `Finish` and reads frames until `Error` (returns the error
