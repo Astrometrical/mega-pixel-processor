@@ -68,7 +68,7 @@ two channels:
 The worker's job, end to end: read `Init`, attach to the shm segment,
 receive a stream of `Band` frames (each naming a slot already filled by the
 host with one contiguous run of rows of one channel), copy each slot's
-contents into an mmap'd staging file, ack the slot so the host can reuse it,
+contents into an in-memory staging area, ack the slot so the host can reuse it,
 and — once `Finish` arrives and every row of every channel has been
 covered — stream the fully-covered staging planes through the BigTIFF
 encoder and report `Done`.
@@ -479,7 +479,7 @@ host                                          worker (mpp-ipc-worker)
  |                                             |-- checks protocol_version == IPC_PROTOCOL_VERSION
  |                                             |-- checks worker_version == env!("CARGO_PKG_VERSION")
  |                                             |-- attaches to shm "shm_name" (must match total_bytes)
- |                                             |-- opens/mmaps its staging file
+ |                                             |-- maps its staging area
  |                                     (band streaming — see 7.2)
 ```
 
@@ -499,7 +499,7 @@ host                                          worker
  |   rows*width native-endian f32 samples     |
  |------------- Band (tag 129) --------------> |
  |                                             |-- validates rows*width*4 <= slot_bytes
- |                                             |-- copies shm slot into staging file at
+ |                                             |-- copies shm slot into the staging area at
  |                                             |   (channel, start_row..start_row+rows)
  |                                             |-- marks that range covered
  |<------------ BandAck (tag 1) ---------------|
@@ -559,7 +559,7 @@ a partially-covered image.
 
 `Cancel` (tag 131) is only guaranteed to be observed if the host sends it
 **before** it sends `Finish`. In that window, the worker responds with
-best-effort cleanup — deleting its staging file and any partial output
+best-effort cleanup — dropping its staged pixels and deleting any partial output
 file already written — then sends `Error { message: "cancelled" }` and
 exits nonzero. A host should treat that specific message as an intentional
 stop, not a crash.
@@ -578,23 +578,21 @@ If a host genuinely needs to abort an in-progress encode after sending
 is safe in the sense that matters for host-side bookkeeping — the worker's
 exit code is still the authoritative completion signal (§4), and a killed
 process's nonzero (or signal-terminated) exit status is unambiguous — but
-it bypasses the worker's own in-process cleanup: `Staging`'s cleanup runs
-via that type's `Drop` impl (or the explicit `cleanup()` path on the
-`Cancel`/host-gone arms), and neither runs if the process is killed rather
-than allowed to unwind. Concretely, a `kill()`-based abort after `Finish`
-can leave the staging scratch file behind on disk — it is named
-`<output-filename>.mpp-stage-<worker-pid>` and lives next to the output
-file (same directory as `output_path`). A host that kills a worker for
-this reason should, on a best-effort basis, delete any
-`<output-filename>.mpp-stage-*` file it finds next to the output path
-afterward.
+it bypasses the worker's own in-process cleanup, so a partially written
+output file can be left behind at `output_path`; a host that kills a worker
+for this reason should delete it on a best-effort basis. The staged pixels
+themselves live in an anonymous memory mapping and vanish with the
+process. (Earlier workers staged into a scratch file named
+`<output-filename>.mpp-stage-<worker-pid>` next to the output, which a
+kill could orphan; a host that also wants to tidy up after such a worker
+may still delete any `<output-filename>.mpp-stage-*` it finds there.)
 
 ### 7.5 Host-gone (stdin EOF before Finish)
 
 If the worker's stdin reaches EOF before a `Finish` frame has been
 received, that means the host is gone (crashed, or closed the pipe without
 finishing the handshake). The worker treats this identically to `Cancel`'s
-cleanup path — staging file and partial output deleted — then exits
+cleanup path — staged pixels dropped, partial output deleted — then exits
 nonzero. **No frame is written** in this case: unlike `Cancel`, there is no
 host left to read one, so the worker skips straight to cleanup and exit. A
 host-side process supervisor detects this run's failure via the worker's

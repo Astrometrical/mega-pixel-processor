@@ -5,12 +5,12 @@
 //!
 //! - [`SessionMode::Write`] (the original v1 flow, [`run_write`]): the
 //!   worker attaches to the host's shm segment, stages every `Band` the
-//!   host sends into a memory-mapped scratch file ([`staging::Staging`]),
+//!   host sends into an anonymous memory mapping ([`staging::Staging`]),
 //!   and — once `Finish` confirms every row of every channel arrived —
 //!   streams the staged planes through
 //!   [`mpp_core::formats::tiff_write::write_tiff`] and reports `Done`. `Cancel`
 //!   (or the host disappearing before `Finish`) tears down cleanly instead.
-//!   Since protocol v3 the staging file holds the session's *own* sample
+//!   Since protocol v3 the staging area holds the session's *own* sample
 //!   type (`Init.band_format`), not unit-range `f32`: [`run_write`] parses
 //!   that field and dispatches to [`run_write_typed`], so `u32` and `f64`
 //!   pixels reach the encoder with every bit intact.
@@ -252,17 +252,18 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
     };
 
     let output_path = PathBuf::from(&init.output_path);
-    let staging_path = staging_path_for(&output_path);
-    let mut staging =
-        match Staging::<T>::create(&staging_path, init.width, init.height, init.channels) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(fail(
-                    link,
-                    &format!("creating staging file {}: {e}", staging_path.display()),
-                ));
-            }
-        };
+    let mut staging = match Staging::<T>::create(init.width, init.height, init.channels) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(fail(
+                link,
+                &format!(
+                    "reserving staging memory for a {}x{}x{} {} image: {e}",
+                    init.width, init.height, init.channels, init.band_format
+                ),
+            ));
+        }
+    };
 
     let rows_total = init.height.saturating_mul(init.channels);
     let progress_every = (init.height / 100).max(1);
@@ -430,17 +431,7 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
         return Err(fail(link, &e.to_string()));
     }
 
-    if let Err(e) = staging.remove() {
-        // Cosmetic cleanup failure only: the output file is already
-        // written and correct, so this does not fail the run — just note
-        // it on stderr. (`Staging::drop` won't retry: `remove` marks
-        // itself done regardless of whether the filesystem call
-        // succeeded.)
-        eprintln!(
-            "mpp-ipc-worker: warning: failed to remove staging file {}: {e}",
-            staging_path.display()
-        );
-    }
+    drop(staging); // release the staged pixels before the final bookkeeping
 
     let bytes_written = match std::fs::metadata(&output_path) {
         Ok(m) => m.len(),
@@ -524,7 +515,7 @@ fn parse_depth(s: &str, field: &str) -> Result<BitDepth, String> {
 ///
 /// Per Task 5's carried review finding, `width == 0 || height == 0` is
 /// rejected here rather than left to fail obscurely inside
-/// `Staging::create`'s zero-length mmap.
+/// `Staging::create`'s zero-length mapping.
 fn validate_init(init: &InitMessage) -> Result<WriteSetup, String> {
     if init.width == 0 || init.height == 0 {
         return Err(format!(
@@ -682,31 +673,12 @@ fn band_byte_len(rows: u32, width: u64, sample_bytes: u64) -> Option<u64> {
     (rows as u64).checked_mul(width)?.checked_mul(sample_bytes)
 }
 
-/// The staging scratch file path for `output_path`: `<output>.mpp-stage-<pid>`
-/// in the same directory as the output file. Co-locating keeps the staging
-/// file on the same filesystem as the final output (relevant if the output
-/// directory is a mount with more room than a system temp dir), and the
-/// pid suffix keeps concurrent runs targeting the same output path from
-/// colliding.
-fn staging_path_for(output_path: &Path) -> PathBuf {
-    let mut name = output_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("mpp-ipc-worker-output"))
-        .to_os_string();
-    name.push(format!(".mpp-stage-{}", std::process::id()));
-    match output_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-/// Best-effort cleanup for the `Cancel`/`HostGone` paths: removes the
-/// staging file (via `Staging::remove`, consuming it) and any partial
-/// output file. Errors from either removal are ignored — this runs on an
-/// already-failing path where there's no further frame to report a
-/// secondary cleanup failure through.
+/// Best-effort cleanup for the `Cancel`/`HostGone` paths: drops the staged
+/// pixels and removes any partial output file. A removal error is ignored —
+/// this runs on an already-failing path where there's no further frame to
+/// report a secondary cleanup failure through.
 fn cleanup<T: bytemuck::Pod>(staging: Staging<T>, output_path: &Path) {
-    let _ = staging.remove();
+    drop(staging);
     let _ = std::fs::remove_file(output_path);
 }
 

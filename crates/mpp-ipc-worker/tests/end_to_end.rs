@@ -44,10 +44,10 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 /// Lists any files in `dir` whose name contains `.mpp-stage-` — the
-/// worker's staging-scratch-file naming convention
-/// (`crates/mpp-ipc-worker/src/main.rs`'s `staging_path_for`,
-/// `<output-filename>.mpp-stage-<pid>`). Used to assert "no staging file
-/// leftover" without needing to know the worker's own pid.
+/// scratch-file naming convention earlier workers staged into
+/// (`<output-filename>.mpp-stage-<pid>`). Staging is an anonymous mapping
+/// now, so this guards against a scratch file ever coming back; the
+/// assertions read "no staging file leftover" without needing the pid.
 fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .into_iter()
