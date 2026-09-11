@@ -13,7 +13,10 @@ pub mod options;
 pub mod sample;
 
 pub use crate::formats::tiff::BitDepth;
-pub use encode::{write_tiff, write_tiff_native};
+pub use encode::{
+    ProgressFn, write_tiff, write_tiff_native, write_tiff_native_with_progress,
+    write_tiff_with_progress,
+};
 pub use options::{
     AlphaMode, Compression, Container, Layout, Resolution, ResolutionUnit, TiffWriteOptions,
 };

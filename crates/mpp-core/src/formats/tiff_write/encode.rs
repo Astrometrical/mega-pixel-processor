@@ -25,6 +25,16 @@ use crate::{Error, Result};
 /// Target uncompressed bytes per strip; rows per strip derives from this.
 const TARGET_BLOCK_BYTES: u64 = 4 << 20;
 
+/// Encode-progress observer: called as `(rows_done, rows_total)` each time a
+/// whole block row (a strip, or a full row of tiles) has reached the file,
+/// where `rows_total` is the image height. The final call always reports
+/// `rows_done == rows_total`. Callers that want no reports pass
+/// [`no_progress`].
+pub type ProgressFn<'a> = &'a mut dyn FnMut(u64, u64);
+
+/// A [`ProgressFn`] that ignores every report.
+fn no_progress(_rows_done: u64, _rows_total: u64) {}
+
 /// A source of image rows, converted to the writer's output sample type.
 ///
 /// Two adapters implement this: [`UnitF32Source`] for the unit-range `f32`
@@ -93,16 +103,39 @@ impl<O: Sample, I: PlanarRows<O> + ?Sized> RowSource<O> for NativeSource<'_, I> 
 /// output file is created. Grayscale, gray+alpha, RGB and RGBA are
 /// supported; planar source planes are interleaved to TIFF's chunky order.
 pub fn write_tiff(img: &impl PlanarRows<f32>, path: &Path, opts: &TiffWriteOptions) -> Result<()> {
-    write_tiff_with_target(img, path, opts, TARGET_BLOCK_BYTES)
+    write_tiff_with_target_and_progress(img, path, opts, TARGET_BLOCK_BYTES, &mut no_progress)
+}
+
+/// [`write_tiff`], reporting progress to `progress` after every block row
+/// (see [`ProgressFn`]).
+pub fn write_tiff_with_progress(
+    img: &impl PlanarRows<f32>,
+    path: &Path,
+    opts: &TiffWriteOptions,
+    progress: ProgressFn<'_>,
+) -> Result<()> {
+    write_tiff_with_target_and_progress(img, path, opts, TARGET_BLOCK_BYTES, progress)
 }
 
 /// [`write_tiff`], parameterized on the target block size — split out so
 /// tests can force multi-block output without a multi-gigabyte image.
-pub(crate) fn write_tiff_with_target(
+#[cfg(test)]
+fn write_tiff_with_target(
     img: &impl PlanarRows<f32>,
     path: &Path,
     opts: &TiffWriteOptions,
     target_block_bytes: u64,
+) -> Result<()> {
+    write_tiff_with_target_and_progress(img, path, opts, target_block_bytes, &mut no_progress)
+}
+
+/// The one body behind every `write_tiff*` entry point above.
+pub(crate) fn write_tiff_with_target_and_progress(
+    img: &impl PlanarRows<f32>,
+    path: &Path,
+    opts: &TiffWriteOptions,
+    target_block_bytes: u64,
+    progress: ProgressFn<'_>,
 ) -> Result<()> {
     let container = resolve_container(
         opts,
@@ -113,21 +146,51 @@ pub(crate) fn write_tiff_with_target(
     let mut buf = create(path)?;
     // One arm per output sample format: `O` is chosen here and nowhere else.
     let result = match opts.bit_depth {
-        BitDepth::U8 => {
-            encode_container::<u8, _, _>(container, &src, &mut buf, opts, target_block_bytes, path)
-        }
-        BitDepth::U16 => {
-            encode_container::<u16, _, _>(container, &src, &mut buf, opts, target_block_bytes, path)
-        }
-        BitDepth::U32 => {
-            encode_container::<u32, _, _>(container, &src, &mut buf, opts, target_block_bytes, path)
-        }
-        BitDepth::F32 => {
-            encode_container::<f32, _, _>(container, &src, &mut buf, opts, target_block_bytes, path)
-        }
-        BitDepth::F64 => {
-            encode_container::<f64, _, _>(container, &src, &mut buf, opts, target_block_bytes, path)
-        }
+        BitDepth::U8 => encode_container::<u8, _, _>(
+            container,
+            &src,
+            &mut buf,
+            opts,
+            target_block_bytes,
+            path,
+            progress,
+        ),
+        BitDepth::U16 => encode_container::<u16, _, _>(
+            container,
+            &src,
+            &mut buf,
+            opts,
+            target_block_bytes,
+            path,
+            progress,
+        ),
+        BitDepth::U32 => encode_container::<u32, _, _>(
+            container,
+            &src,
+            &mut buf,
+            opts,
+            target_block_bytes,
+            path,
+            progress,
+        ),
+        BitDepth::F32 => encode_container::<f32, _, _>(
+            container,
+            &src,
+            &mut buf,
+            opts,
+            target_block_bytes,
+            path,
+            progress,
+        ),
+        BitDepth::F64 => encode_container::<f64, _, _>(
+            container,
+            &src,
+            &mut buf,
+            opts,
+            target_block_bytes,
+            path,
+            progress,
+        ),
     };
     finish_file(result, buf, path)
 }
@@ -142,6 +205,17 @@ pub fn write_tiff_native<T: Sample>(
     img: &impl PlanarRows<T>,
     path: &Path,
     opts: &TiffWriteOptions,
+) -> Result<()> {
+    write_tiff_native_with_progress(img, path, opts, &mut no_progress)
+}
+
+/// [`write_tiff_native`], reporting progress to `progress` after every
+/// block row (see [`ProgressFn`]).
+pub fn write_tiff_native_with_progress<T: Sample>(
+    img: &impl PlanarRows<T>,
+    path: &Path,
+    opts: &TiffWriteOptions,
+    progress: ProgressFn<'_>,
 ) -> Result<()> {
     if opts.bit_depth != T::DEPTH {
         return Err(Error::invalid(format!(
@@ -158,8 +232,15 @@ pub fn write_tiff_native<T: Sample>(
     );
     let src = NativeSource(img);
     let mut buf = create(path)?;
-    let result =
-        encode_container::<T, _, _>(container, &src, &mut buf, opts, TARGET_BLOCK_BYTES, path);
+    let result = encode_container::<T, _, _>(
+        container,
+        &src,
+        &mut buf,
+        opts,
+        TARGET_BLOCK_BYTES,
+        path,
+        progress,
+    );
     finish_file(result, buf, path)
 }
 
@@ -229,6 +310,7 @@ fn encode_container<O, W, S>(
     opts: &TiffWriteOptions,
     target_block_bytes: u64,
     path: &Path,
+    progress: ProgressFn<'_>,
 ) -> Result<()>
 where
     O: Sample,
@@ -236,10 +318,15 @@ where
     S: RowSource<O> + ?Sized,
 {
     match container {
-        Container::Classic => {
-            encode::<TiffKindStandard, O, _, _>(src, writer, opts, target_block_bytes, path)
-        }
-        _ => encode::<TiffKindBig, O, _, _>(src, writer, opts, target_block_bytes, path),
+        Container::Classic => encode::<TiffKindStandard, O, _, _>(
+            src,
+            writer,
+            opts,
+            target_block_bytes,
+            path,
+            progress,
+        ),
+        _ => encode::<TiffKindBig, O, _, _>(src, writer, opts, target_block_bytes, path, progress),
     }
 }
 
@@ -382,6 +469,7 @@ fn encode<K, O, W, S>(
     opts: &TiffWriteOptions,
     target_block_bytes: u64,
     path: &Path,
+    progress: ProgressFn<'_>,
 ) -> Result<()>
 where
     K: TiffKind,
@@ -425,6 +513,7 @@ where
                 let n = n_rows.min(h - start);
                 gather_strip(src, start, n, &mut rows, &mut block);
                 blocks.write(&mut dir, &mut block).map_err(terr)?;
+                progress(start + n, h);
             }
             Some(u32::try_from(n_rows).unwrap_or(u32::MAX))
         }
@@ -435,6 +524,7 @@ where
                     gather_tile(src, tx, ty, size64, &mut rows, &mut block);
                     blocks.write(&mut dir, &mut block).map_err(terr)?;
                 }
+                progress((ty + size64).min(h), h);
             }
             None
         }
@@ -1428,6 +1518,68 @@ mod tests {
         ] {
             assert!(dec.get_tag(tag).is_err(), "{tag:?} should be absent");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn strip_progress_reports_rows_written_monotonically_up_to_height() {
+        // 3x7 gray f32 with a 64-byte target: 5 rows per strip, so two
+        // strips and therefore two progress reports, the last one complete.
+        let dir = tmpdir("progress-strips");
+        let out = dir.join("out.tif");
+        let img = Synth::new(3, 7, 1);
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        write_tiff_with_target_and_progress(
+            &img,
+            &out,
+            &TiffWriteOptions::default(),
+            64,
+            &mut |done, total| seen.push((done, total)),
+        )
+        .unwrap();
+        assert_eq!(seen, vec![(5, 7), (7, 7)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tile_progress_reports_rows_after_each_completed_tile_row() {
+        use crate::formats::tiff_write::options::Layout;
+        let dir = tmpdir("progress-tiles");
+        let out = dir.join("out.tif");
+        // 300x200 in 128-pixel tiles: two tile rows, the second partial.
+        let img = Synth::new(300, 200, 1);
+        let opts = TiffWriteOptions {
+            layout: Layout::Tiles { size: 128 },
+            ..Default::default()
+        };
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        write_tiff_with_progress(&img, &out, &opts, &mut |done, total| {
+            seen.push((done, total))
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(128, 200), (200, 200)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn native_write_reports_progress_too() {
+        let dir = tmpdir("progress-native");
+        let out = dir.join("out.tif");
+        let img = NativeSynth {
+            w: 3,
+            h: 7,
+            plane: vec![40_000u16; 21],
+        };
+        let opts = TiffWriteOptions {
+            bit_depth: BitDepth::U16,
+            ..Default::default()
+        };
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        write_tiff_native_with_progress(&img, &out, &opts, &mut |done, total| {
+            seen.push((done, total))
+        })
+        .unwrap();
+        // One 4 MiB strip holds the whole image, so a single, complete report.
+        assert_eq!(seen, vec![(7, 7)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
