@@ -6,9 +6,12 @@
 //! encode loop through the crate-internal `RowSource` trait, which adapts a
 //! [`PlanarRows`] of one type to the writer's output type `O`.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use tiff::encoder::compression::{
     CompressionAlgorithm, Compressor, Deflate, DeflateLevel, Lzw, Packbits, Uncompressed,
@@ -24,6 +27,34 @@ use crate::{Error, Result};
 
 /// Target uncompressed bytes per strip; rows per strip derives from this.
 const TARGET_BLOCK_BYTES: u64 = 4 << 20;
+
+/// Most worker threads the encoder will use. Compression on this many cores
+/// already outruns any disk the file could be going to, and each thread
+/// keeps two blocks in flight, so more would only cost memory.
+const MAX_ENCODE_THREADS: usize = 16;
+
+/// Knobs the encoder is parameterised on internally. Production callers get
+/// [`EncodeTuning::default`]; tests use small blocks to force multi-block
+/// output from a small image, and pin thread-count independence.
+#[derive(Debug, Clone, Copy)]
+struct EncodeTuning {
+    /// Target uncompressed bytes per strip.
+    target_block_bytes: u64,
+    /// Gather+compress worker threads; the writer is the calling thread.
+    threads: usize,
+}
+
+impl Default for EncodeTuning {
+    fn default() -> Self {
+        Self {
+            target_block_bytes: TARGET_BLOCK_BYTES,
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, MAX_ENCODE_THREADS),
+        }
+    }
+}
 
 /// Encode-progress observer: called as `(rows_done, rows_total)` each time a
 /// whole block row (a strip, or a full row of tiles) has reached the file,
@@ -102,26 +133,30 @@ impl<O: Sample, I: PlanarRows<O> + ?Sized> RowSource<O> for NativeSource<'_, I> 
 /// Options are validated first, so an impossible request fails before the
 /// output file is created. Grayscale, gray+alpha, RGB and RGBA are
 /// supported; planar source planes are interleaved to TIFF's chunky order.
-pub fn write_tiff(img: &impl PlanarRows<f32>, path: &Path, opts: &TiffWriteOptions) -> Result<()> {
-    write_tiff_with_target_and_progress(img, path, opts, TARGET_BLOCK_BYTES, &mut no_progress)
+pub fn write_tiff(
+    img: &(impl PlanarRows<f32> + Sync),
+    path: &Path,
+    opts: &TiffWriteOptions,
+) -> Result<()> {
+    write_tiff_tuned(img, path, opts, EncodeTuning::default(), &mut no_progress)
 }
 
 /// [`write_tiff`], reporting progress to `progress` after every block row
 /// (see [`ProgressFn`]).
 pub fn write_tiff_with_progress(
-    img: &impl PlanarRows<f32>,
+    img: &(impl PlanarRows<f32> + Sync),
     path: &Path,
     opts: &TiffWriteOptions,
     progress: ProgressFn<'_>,
 ) -> Result<()> {
-    write_tiff_with_target_and_progress(img, path, opts, TARGET_BLOCK_BYTES, progress)
+    write_tiff_tuned(img, path, opts, EncodeTuning::default(), progress)
 }
 
 /// [`write_tiff`], parameterized on the target block size — split out so
 /// tests can force multi-block output without a multi-gigabyte image.
 #[cfg(test)]
 fn write_tiff_with_target(
-    img: &impl PlanarRows<f32>,
+    img: &(impl PlanarRows<f32> + Sync),
     path: &Path,
     opts: &TiffWriteOptions,
     target_block_bytes: u64,
@@ -129,12 +164,28 @@ fn write_tiff_with_target(
     write_tiff_with_target_and_progress(img, path, opts, target_block_bytes, &mut no_progress)
 }
 
-/// The one body behind every `write_tiff*` entry point above.
-pub(crate) fn write_tiff_with_target_and_progress(
-    img: &impl PlanarRows<f32>,
+/// [`write_tiff_with_target`] with a progress observer.
+#[cfg(test)]
+fn write_tiff_with_target_and_progress(
+    img: &(impl PlanarRows<f32> + Sync),
     path: &Path,
     opts: &TiffWriteOptions,
     target_block_bytes: u64,
+    progress: ProgressFn<'_>,
+) -> Result<()> {
+    let tuning = EncodeTuning {
+        target_block_bytes,
+        ..EncodeTuning::default()
+    };
+    write_tiff_tuned(img, path, opts, tuning, progress)
+}
+
+/// The one body behind every `write_tiff*` entry point above.
+fn write_tiff_tuned(
+    img: &(impl PlanarRows<f32> + Sync),
+    path: &Path,
+    opts: &TiffWriteOptions,
+    tuning: EncodeTuning,
     progress: ProgressFn<'_>,
 ) -> Result<()> {
     let container = resolve_container(
@@ -146,51 +197,21 @@ pub(crate) fn write_tiff_with_target_and_progress(
     let mut buf = create(path)?;
     // One arm per output sample format: `O` is chosen here and nowhere else.
     let result = match opts.bit_depth {
-        BitDepth::U8 => encode_container::<u8, _, _>(
-            container,
-            &src,
-            &mut buf,
-            opts,
-            target_block_bytes,
-            path,
-            progress,
-        ),
-        BitDepth::U16 => encode_container::<u16, _, _>(
-            container,
-            &src,
-            &mut buf,
-            opts,
-            target_block_bytes,
-            path,
-            progress,
-        ),
-        BitDepth::U32 => encode_container::<u32, _, _>(
-            container,
-            &src,
-            &mut buf,
-            opts,
-            target_block_bytes,
-            path,
-            progress,
-        ),
-        BitDepth::F32 => encode_container::<f32, _, _>(
-            container,
-            &src,
-            &mut buf,
-            opts,
-            target_block_bytes,
-            path,
-            progress,
-        ),
-        BitDepth::F64 => encode_container::<f64, _, _>(
-            container,
-            &src,
-            &mut buf,
-            opts,
-            target_block_bytes,
-            path,
-            progress,
-        ),
+        BitDepth::U8 => {
+            encode_container::<u8, _, _>(container, &src, &mut buf, opts, tuning, path, progress)
+        }
+        BitDepth::U16 => {
+            encode_container::<u16, _, _>(container, &src, &mut buf, opts, tuning, path, progress)
+        }
+        BitDepth::U32 => {
+            encode_container::<u32, _, _>(container, &src, &mut buf, opts, tuning, path, progress)
+        }
+        BitDepth::F32 => {
+            encode_container::<f32, _, _>(container, &src, &mut buf, opts, tuning, path, progress)
+        }
+        BitDepth::F64 => {
+            encode_container::<f64, _, _>(container, &src, &mut buf, opts, tuning, path, progress)
+        }
     };
     finish_file(result, buf, path)
 }
@@ -202,7 +223,7 @@ pub(crate) fn write_tiff_with_target_and_progress(
 /// mismatch here means the caller intended a conversion, which this entry
 /// point does not do.
 pub fn write_tiff_native<T: Sample>(
-    img: &impl PlanarRows<T>,
+    img: &(impl PlanarRows<T> + Sync),
     path: &Path,
     opts: &TiffWriteOptions,
 ) -> Result<()> {
@@ -212,7 +233,7 @@ pub fn write_tiff_native<T: Sample>(
 /// [`write_tiff_native`], reporting progress to `progress` after every
 /// block row (see [`ProgressFn`]).
 pub fn write_tiff_native_with_progress<T: Sample>(
-    img: &impl PlanarRows<T>,
+    img: &(impl PlanarRows<T> + Sync),
     path: &Path,
     opts: &TiffWriteOptions,
     progress: ProgressFn<'_>,
@@ -237,7 +258,7 @@ pub fn write_tiff_native_with_progress<T: Sample>(
         &src,
         &mut buf,
         opts,
-        TARGET_BLOCK_BYTES,
+        EncodeTuning::default(),
         path,
         progress,
     );
@@ -308,25 +329,20 @@ fn encode_container<O, W, S>(
     src: &S,
     writer: &mut W,
     opts: &TiffWriteOptions,
-    target_block_bytes: u64,
+    tuning: EncodeTuning,
     path: &Path,
     progress: ProgressFn<'_>,
 ) -> Result<()>
 where
     O: Sample,
     W: Write + Seek,
-    S: RowSource<O> + ?Sized,
+    S: RowSource<O> + Sync + ?Sized,
 {
     match container {
-        Container::Classic => encode::<TiffKindStandard, O, _, _>(
-            src,
-            writer,
-            opts,
-            target_block_bytes,
-            path,
-            progress,
-        ),
-        _ => encode::<TiffKindBig, O, _, _>(src, writer, opts, target_block_bytes, path, progress),
+        Container::Classic => {
+            encode::<TiffKindStandard, O, _, _>(src, writer, opts, tuning, path, progress)
+        }
+        _ => encode::<TiffKindBig, O, _, _>(src, writer, opts, tuning, path, progress),
     }
 }
 
@@ -376,84 +392,317 @@ fn predict_horizontal<O: Sample>(block: &mut [O], samples_per_row: usize, channe
     }
 }
 
-/// The predict/serialise/compress pipeline every strip or tile passes
-/// through, plus the offset and byte-count lists the IFD needs.
-///
-/// Carrying it as one struct rather than a pile of `&mut` parameters keeps
-/// the two call sites (strips and tiles) to a single call each, and keeps
-/// the three reusable buffers alive for the whole image so encoding a
-/// multi-gigabyte file stays allocation-free after the first block.
-struct BlockWriter<K: TiffKind> {
-    /// Reused across blocks; `write_to` builds a fresh encoder per call, so
-    /// no compression state leaks from one block into the next.
-    compressor: Compressor,
-    /// Serialised, native-order bytes of the current block.
-    raw: Vec<u8>,
-    /// Compressed bytes of the current block.
-    packed: Vec<u8>,
+/// One strip or tile to encode, in file order.
+#[derive(Debug, Clone, Copy)]
+struct BlockSpec {
+    /// Kind and position.
+    kind: BlockKind,
+    /// Rows of the image complete once this block is written — set on every
+    /// strip and on the last tile of each tile row, so progress is reported
+    /// per block row in both layouts.
+    rows_done_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BlockKind {
+    /// Rows `[start, start + n)`, full width.
+    Strip { start: u64, n: u64 },
+    /// The `size x size` tile whose top-left pixel is `(tx, ty)`.
+    Tile { tx: u64, ty: u64, size: u64 },
+}
+
+/// Every block of the image in the order the file stores them: strips top
+/// to bottom, or tiles row-major. Returns the specs and, for strips, the
+/// `RowsPerStrip` tag value.
+fn plan_blocks(
+    opts: &TiffWriteOptions,
+    w: u64,
+    h: u64,
+    row_bytes: u64,
+    target_block_bytes: u64,
+) -> (Vec<BlockSpec>, Option<u32>) {
+    match opts.layout {
+        Layout::Strips => {
+            let n_rows = (target_block_bytes / row_bytes.max(1)).clamp(1, h);
+            let specs = (0..h)
+                .step_by(n_rows as usize)
+                .map(|start| {
+                    let n = n_rows.min(h - start);
+                    BlockSpec {
+                        kind: BlockKind::Strip { start, n },
+                        rows_done_after: Some(start + n),
+                    }
+                })
+                .collect();
+            (specs, Some(u32::try_from(n_rows).unwrap_or(u32::MAX)))
+        }
+        Layout::Tiles { size } => {
+            let size64 = u64::from(size);
+            let last_tx = ((w - 1) / size64) * size64;
+            let mut specs = Vec::new();
+            for ty in (0..h).step_by(size as usize) {
+                for tx in (0..w).step_by(size as usize) {
+                    specs.push(BlockSpec {
+                        kind: BlockKind::Tile {
+                            tx,
+                            ty,
+                            size: size64,
+                        },
+                        rows_done_after: (tx == last_tx).then_some((ty + size64).min(h)),
+                    });
+                }
+            }
+            (specs, None)
+        }
+    }
+}
+
+/// Per-worker state for turning a [`BlockSpec`] into its on-disk bytes:
+/// gather, predict, serialise, compress. Each worker owns one, so the
+/// reusable buffers are allocated once per thread rather than once per
+/// block, and each block gets a fresh compressor state inside
+/// `Compressor::write_to`, which is what makes strips and tiles
+/// independently decodable as TIFF requires.
+struct BlockEncoder<O> {
+    /// `None` when uncompressed: the raw bytes are the output, no copy.
+    compressor: Option<Compressor>,
     /// Whether to apply the horizontal differencing predictor.
     predictor: bool,
     /// Interleaved samples in one row of a block: `width * channels` for a
-    /// strip, `tile size * channels` for a tile.
+    /// strip, `tile size * channels` for a tile — the predictor's row length.
     samples_per_row: usize,
     /// Channel count — the predictor's stride, in samples.
     channels: usize,
-    /// Offsets of the blocks written so far.
+    /// Interleaved, typed samples of the block being built.
+    block: Vec<O>,
+    /// One row buffer per channel for the gather.
+    rows: Vec<Vec<O>>,
+}
+
+impl<O: Sample> BlockEncoder<O> {
+    fn new(opts: &TiffWriteOptions, w: u64, c: u64, samples_per_row: usize) -> Self {
+        Self {
+            compressor: match opts.compression {
+                Compression::None => None,
+                _ => Some(compressor_for(opts).0),
+            },
+            predictor: opts.predictor,
+            samples_per_row,
+            channels: c as usize,
+            block: Vec::new(),
+            rows: (0..c).map(|_| Vec::with_capacity(w as usize)).collect(),
+        }
+    }
+
+    /// The bytes to store for `spec`: native-order samples, differenced if
+    /// the predictor is on, compressed if compression is on.
+    fn encode<S: RowSource<O> + ?Sized>(
+        &mut self,
+        src: &S,
+        spec: &BlockSpec,
+    ) -> tiff::TiffResult<Vec<u8>> {
+        match spec.kind {
+            BlockKind::Strip { start, n } => {
+                gather_strip(src, start, n, &mut self.rows, &mut self.block)
+            }
+            BlockKind::Tile { tx, ty, size } => {
+                gather_tile(src, tx, ty, size, &mut self.rows, &mut self.block)
+            }
+        }
+        if self.predictor {
+            predict_horizontal(&mut self.block, self.samples_per_row, self.channels);
+        }
+        // Samples are `Pod` and the file is native-order (see `sample.rs`),
+        // so the block's bytes are its serialisation: one copy out of the
+        // reusable buffer, no per-sample work.
+        let raw: &[u8] = bytemuck::cast_slice(&self.block);
+        match &mut self.compressor {
+            None => Ok(raw.to_vec()),
+            Some(compressor) => {
+                let mut packed = Vec::with_capacity(raw.len() / 2);
+                compressor.write_to(&mut packed, raw)?;
+                Ok(packed)
+            }
+        }
+    }
+}
+
+/// Shared state of the encode pipeline: workers claim block indices from
+/// `next`, encode them, and park the bytes in `ready`; the writer drains
+/// `ready` in index order. `window` bounds how far ahead of the writer a
+/// worker may claim, so no more than that many encoded blocks are ever held
+/// in memory whatever the thread count.
+struct Pipeline {
+    next: AtomicUsize,
+    window: usize,
+    state: Mutex<PipelineState>,
+    changed: Condvar,
+}
+
+struct PipelineState {
+    /// Blocks the writer has written so far (`0..written` are on disk).
+    written: usize,
+    /// Encoded blocks awaiting the writer, by index.
+    ready: BTreeMap<usize, Vec<u8>>,
+    /// First failure from either side; stops everyone.
+    failed: Option<String>,
+}
+
+impl Pipeline {
+    fn new(window: usize) -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+            window,
+            state: Mutex::new(PipelineState {
+                written: 0,
+                ready: BTreeMap::new(),
+                failed: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn fail(&self, message: String) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.failed.get_or_insert(message);
+        self.changed.notify_all();
+    }
+
+    /// Worker loop: encode blocks until none are left or someone failed.
+    fn run_worker<O, S>(&self, src: &S, blocks: &[BlockSpec], mut enc: BlockEncoder<O>)
+    where
+        O: Sample,
+        S: RowSource<O> + ?Sized,
+    {
+        loop {
+            let idx = self.next.fetch_add(1, Ordering::Relaxed);
+            if idx >= blocks.len() {
+                return;
+            }
+            // Stay within the window: block `idx` may only be encoded once
+            // the writer is within `window` blocks of it.
+            {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                while st.failed.is_none() && idx >= st.written + self.window {
+                    st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                if st.failed.is_some() {
+                    return;
+                }
+            }
+            match enc.encode(src, &blocks[idx]) {
+                Ok(bytes) => {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.ready.insert(idx, bytes);
+                    self.changed.notify_all();
+                }
+                Err(e) => {
+                    self.fail(format!("TIFF encode: {e}"));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Writer side: the bytes of block `idx`, once a worker has produced
+    /// them, or the pipeline's failure.
+    fn take(&self, idx: usize) -> std::result::Result<Vec<u8>, String> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(failed) = &st.failed {
+                return Err(failed.clone());
+            }
+            if let Some(bytes) = st.ready.remove(&idx) {
+                return Ok(bytes);
+            }
+            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Writer side: block `idx` is on disk; workers may advance the window.
+    fn written(&self, idx: usize) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.written = idx + 1;
+        self.changed.notify_all();
+    }
+}
+
+/// Where each block landed in the file: the `StripOffsets`/`StripByteCounts`
+/// (or tile) lists the IFD needs, in block order.
+struct BlockTables<K: TiffKind> {
     offsets: Vec<K::OffsetType>,
-    /// Compressed lengths of the blocks written so far.
     byte_counts: Vec<K::OffsetType>,
 }
 
-impl<K: TiffKind> BlockWriter<K> {
-    /// Start a block writer for `opts`, returning it with the `Compression`
-    /// tag value the IFD must carry.
-    fn new(opts: &TiffWriteOptions, samples_per_row: usize, channels: usize) -> (Self, u16) {
-        let (compressor, tag) = compressor_for(opts);
-        (
-            Self {
-                compressor,
-                raw: Vec::new(),
-                packed: Vec::new(),
-                predictor: opts.predictor,
-                samples_per_row,
-                channels,
-                offsets: Vec::new(),
-                byte_counts: Vec::new(),
-            },
-            tag,
-        )
-    }
+/// Encode every block of `blocks` through `tuning.threads` workers and write
+/// them to `dir` in order on the calling thread, returning where each block
+/// landed. Progress is reported as each block row completes.
+///
+/// Compute and I/O overlap: while the writer is blocked in `write_data` on
+/// block `i`, the workers are already encoding `i + 1 ..= i + window`. The
+/// window is two blocks per worker — enough to keep every worker busy while
+/// the writer catches up, small enough that a 16-thread encode holds under
+/// 32 raw blocks (~128 MiB at the default block size) at any moment.
+#[allow(clippy::too_many_arguments)]
+fn encode_blocks<K, O, W, S>(
+    src: &S,
+    dir: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
+    blocks: &[BlockSpec],
+    opts: &TiffWriteOptions,
+    tuning: EncodeTuning,
+    samples_per_row: usize,
+    path: &Path,
+    progress: ProgressFn<'_>,
+) -> Result<BlockTables<K>>
+where
+    K: TiffKind,
+    O: Sample,
+    W: Write + Seek,
+    S: RowSource<O> + Sync + ?Sized,
+{
+    let (w, h, c) = (src.width(), src.height(), src.channels());
+    let threads = tuning.threads.clamp(1, blocks.len().max(1));
+    let pipeline = Pipeline::new(threads * 2);
+    let mut offsets = Vec::with_capacity(blocks.len());
+    let mut byte_counts = Vec::with_capacity(blocks.len());
 
-    /// Append one gathered block to the file, recording its offset and
-    /// compressed length. `block` is differenced in place when the
-    /// predictor is on, so it must not be reused afterwards.
-    fn write<O, W>(
-        &mut self,
-        dir: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
-        block: &mut [O],
-    ) -> tiff::TiffResult<()>
-    where
-        O: Sample,
-        W: Write + Seek,
-    {
-        if self.predictor {
-            predict_horizontal(block, self.samples_per_row, self.channels);
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..threads {
+            let pipeline = &pipeline;
+            let enc = BlockEncoder::<O>::new(opts, w, c, samples_per_row);
+            scope.spawn(move || pipeline.run_worker(src, blocks, enc));
         }
-        self.raw.clear();
-        for sample in block.iter() {
-            sample.push_ne(&mut self.raw);
+
+        for (idx, spec) in blocks.iter().enumerate() {
+            let bytes = pipeline.take(idx).map_err(|msg| Error::format(path, msg))?;
+            let written = (|| -> tiff::TiffResult<()> {
+                let offset = dir.write_data(&bytes[..])?;
+                offsets.push(K::convert_offset(offset)?);
+                // Byte counts are the same width as offsets in both
+                // container kinds; `OffsetType: TryFrom<usize>` is the
+                // crate's own idiom for this (see its
+                // `ImageEncoder::write_strip`).
+                byte_counts.push(K::OffsetType::try_from(bytes.len())?);
+                Ok(())
+            })();
+            if let Err(e) = written {
+                // Wake any worker parked on the window so the scope can
+                // join them, then surface the I/O error.
+                pipeline.fail(format!("TIFF encode: {e}"));
+                return Err(Error::format(path, format!("TIFF encode: {e}")));
+            }
+            pipeline.written(idx);
+            if let Some(rows) = spec.rows_done_after {
+                progress(rows, h);
+            }
         }
-        self.packed.clear();
-        self.compressor.write_to(&mut self.packed, &self.raw)?;
-        let offset = dir.write_data(&self.packed[..])?;
-        self.offsets.push(K::convert_offset(offset)?);
-        // Byte counts are the same width as offsets in both container kinds;
-        // `OffsetType: TryFrom<usize>` is the crate's own idiom for this
-        // (see its `ImageEncoder::write_strip`).
-        self.byte_counts
-            .push(K::OffsetType::try_from(self.packed.len())?);
         Ok(())
-    }
+    })?;
+
+    Ok(BlockTables {
+        offsets,
+        byte_counts,
+    })
 }
 
 /// Photometric interpretation for a colour-channel count: 1 = BlackIsZero,
@@ -467,7 +716,7 @@ fn encode<K, O, W, S>(
     src: &S,
     writer: &mut W,
     opts: &TiffWriteOptions,
-    target_block_bytes: u64,
+    tuning: EncodeTuning,
     path: &Path,
     progress: ProgressFn<'_>,
 ) -> Result<()>
@@ -475,7 +724,7 @@ where
     K: TiffKind,
     O: Sample,
     W: Write + Seek,
-    S: RowSource<O> + ?Sized,
+    S: RowSource<O> + Sync + ?Sized,
 {
     let terr = |e: tiff::TiffError| Error::format(path, format!("TIFF encode: {e}"));
     let (w, h, c) = (src.width(), src.height(), src.channels());
@@ -490,45 +739,26 @@ where
     let mut dir = enc.image_directory().map_err(terr)?;
 
     // Samples per row of a block: full image width for a strip, the tile
-    // edge for a tile. The predictor needs it, so it is settled before the
-    // block writer is built.
+    // edge for a tile — the predictor's row length.
     let samples_per_block_row = match opts.layout {
         Layout::Strips => w * c,
         Layout::Tiles { size } => u64::from(size) * c,
     } as usize;
-    let (mut blocks, compression_tag) =
-        BlockWriter::<K>::new(opts, samples_per_block_row, c as usize);
-    let mut block = Vec::<O>::new();
-    // One reusable row buffer per channel: interleaving needs every
-    // channel's row `y` at once, and this way the gather allocates once for
-    // the whole image rather than once per row.
-    let mut rows: Vec<Vec<O>> = (0..c).map(|_| Vec::with_capacity(w as usize)).collect();
+    let (_, compression_tag) = compressor_for(opts);
 
     // -- pixel data ---------------------------------------------------------
-    let rows_per_strip = match opts.layout {
-        Layout::Strips => {
-            let row_bytes = w * c * u64::from(O::BITS_PER_SAMPLE) / 8;
-            let n_rows = (target_block_bytes / row_bytes.max(1)).clamp(1, h);
-            for start in (0..h).step_by(n_rows as usize) {
-                let n = n_rows.min(h - start);
-                gather_strip(src, start, n, &mut rows, &mut block);
-                blocks.write(&mut dir, &mut block).map_err(terr)?;
-                progress(start + n, h);
-            }
-            Some(u32::try_from(n_rows).unwrap_or(u32::MAX))
-        }
-        Layout::Tiles { size } => {
-            let size64 = u64::from(size);
-            for ty in (0..h).step_by(size as usize) {
-                for tx in (0..w).step_by(size as usize) {
-                    gather_tile(src, tx, ty, size64, &mut rows, &mut block);
-                    blocks.write(&mut dir, &mut block).map_err(terr)?;
-                }
-                progress((ty + size64).min(h), h);
-            }
-            None
-        }
-    };
+    let row_bytes = w * c * u64::from(O::BITS_PER_SAMPLE) / 8;
+    let (blocks, rows_per_strip) = plan_blocks(opts, w, h, row_bytes, tuning.target_block_bytes);
+    let tables = encode_blocks::<K, O, &mut W, S>(
+        src,
+        &mut dir,
+        &blocks,
+        opts,
+        tuning,
+        samples_per_block_row,
+        path,
+        progress,
+    )?;
 
     // -- tags ---------------------------------------------------------------
     dir.write_tag(Tag::ImageWidth, w32).map_err(terr)?;
@@ -566,17 +796,17 @@ where
     match (opts.layout, rows_per_strip) {
         (Layout::Strips, Some(n_rows)) => {
             dir.write_tag(Tag::RowsPerStrip, n_rows).map_err(terr)?;
-            dir.write_tag(Tag::StripOffsets, K::convert_slice(&blocks.offsets))
+            dir.write_tag(Tag::StripOffsets, K::convert_slice(&tables.offsets))
                 .map_err(terr)?;
-            dir.write_tag(Tag::StripByteCounts, K::convert_slice(&blocks.byte_counts))
+            dir.write_tag(Tag::StripByteCounts, K::convert_slice(&tables.byte_counts))
                 .map_err(terr)?;
         }
         (Layout::Tiles { size }, _) => {
             dir.write_tag(Tag::TileWidth, size).map_err(terr)?;
             dir.write_tag(Tag::TileLength, size).map_err(terr)?;
-            dir.write_tag(Tag::TileOffsets, K::convert_slice(&blocks.offsets))
+            dir.write_tag(Tag::TileOffsets, K::convert_slice(&tables.offsets))
                 .map_err(terr)?;
-            dir.write_tag(Tag::TileByteCounts, K::convert_slice(&blocks.byte_counts))
+            dir.write_tag(Tag::TileByteCounts, K::convert_slice(&tables.byte_counts))
                 .map_err(terr)?;
         }
         _ => unreachable!("rows_per_strip is Some exactly for Layout::Strips"),
@@ -642,7 +872,7 @@ fn fetch_rows<O: Sample, S: RowSource<O> + ?Sized>(src: &S, y: u64, rows: &mut [
 ///
 /// The block is gathered as typed samples rather than bytes so the
 /// horizontal predictor can difference whole samples; serialisation to
-/// native-order bytes happens in [`BlockWriter::write`], after it.
+/// native-order bytes is a slice cast in [`BlockEncoder::encode`], after it.
 fn gather_strip<O: Sample, S: RowSource<O> + ?Sized>(
     src: &S,
     start: u64,
@@ -651,14 +881,12 @@ fn gather_strip<O: Sample, S: RowSource<O> + ?Sized>(
     out: &mut Vec<O>,
 ) {
     let w = src.width() as usize;
+    let c = rows.len();
     out.clear();
-    for y in start..start + n {
+    out.resize(n as usize * w * c, O::from_unit_f32(0.0));
+    for (i, y) in (start..start + n).enumerate() {
         fetch_rows(src, y, rows);
-        for x in 0..w {
-            for buf in rows.iter() {
-                out.push(buf[x]);
-            }
-        }
+        interleave_row(rows, &mut out[i * w * c..(i + 1) * w * c], 0, w);
     }
 }
 
@@ -673,21 +901,41 @@ fn gather_tile<O: Sample, S: RowSource<O> + ?Sized>(
     rows: &mut [Vec<O>],
     out: &mut Vec<O>,
 ) {
-    let (w, h, c) = (src.width(), src.height(), src.channels());
+    let (w, h) = (src.width(), src.height());
+    let c = rows.len();
+    let size = size as usize;
     let zero = O::from_unit_f32(0.0);
     out.clear();
-    for y in ty..ty + size {
-        if y < h {
-            fetch_rows(src, y, rows);
-            for x in tx..tx + size {
-                for buf in rows.iter() {
-                    out.push(if x < w { buf[x as usize] } else { zero });
-                }
-            }
-        } else {
-            for _ in 0..size * c {
-                out.push(zero);
-            }
+    out.resize(size * size * c, zero);
+    // Columns of the image this tile actually covers; the rest stays zero.
+    let cols = (w.saturating_sub(tx) as usize).min(size);
+    for (i, y) in (ty..ty + size as u64).enumerate() {
+        if y >= h {
+            break; // rows below the image are already zero
+        }
+        fetch_rows(src, y, rows);
+        interleave_row(
+            rows,
+            &mut out[i * size * c..(i + 1) * size * c],
+            tx as usize,
+            cols,
+        );
+    }
+}
+
+/// Interleave `cols` samples starting at column `x0` of every channel's
+/// row buffer into `out`, pixel-major (`out[x * c + ch]`). One channel is a
+/// straight copy; more are a strided scatter over `chunks_exact_mut`, which
+/// keeps the inner loop free of bounds checks.
+fn interleave_row<O: Sample>(rows: &[Vec<O>], out: &mut [O], x0: usize, cols: usize) {
+    let c = rows.len();
+    if c == 1 {
+        out[..cols].copy_from_slice(&rows[0][x0..x0 + cols]);
+        return;
+    }
+    for (ch, row) in rows.iter().enumerate() {
+        for (px, v) in out[..cols * c].chunks_exact_mut(c).zip(&row[x0..x0 + cols]) {
+            px[ch] = *v;
         }
     }
 }
@@ -1580,6 +1828,80 @@ mod tests {
         .unwrap();
         // One 4 MiB strip holds the whole image, so a single, complete report.
         assert_eq!(seen, vec![(7, 7)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn parallel_encode_is_byte_identical_to_single_threaded() {
+        // 64-byte blocks on a 5x37 RGB image: many strips, most threads
+        // busy at once, and a partial final strip. Block order in the file
+        // must not depend on which worker finished first.
+        let dir = tmpdir("parallel-strips");
+        let img = Synth::new(5, 37, 3);
+        let mut files = Vec::new();
+        for threads in [1usize, 4, 7] {
+            let out = dir.join(format!("t{threads}.tif"));
+            let tuning = EncodeTuning {
+                target_block_bytes: 64,
+                threads,
+            };
+            write_tiff_tuned(
+                &img,
+                &out,
+                &TiffWriteOptions::default(),
+                tuning,
+                &mut |_, _| {},
+            )
+            .unwrap();
+            files.push(std::fs::read(&out).unwrap());
+        }
+        assert_eq!(files[0], files[1], "4 threads differ from 1");
+        assert_eq!(files[0], files[2], "7 threads differ from 1");
+        assert!(
+            files[0].len() > 5 * 37 * 3 * 4,
+            "the file should hold all the pixels"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_compressed_tiles_round_trip_with_progress_in_order() {
+        use crate::formats::tiff_write::options::{Compression, Layout};
+        // 300x200 RGB u16 in 128-pixel deflate tiles: six tiles, two tile
+        // rows, encoded on four threads. Pixels must land where they belong
+        // and the two progress reports must still arrive in order.
+        let dir = tmpdir("parallel-tiles");
+        let out = dir.join("out.tif");
+        let img = Synth::new(300, 200, 3);
+        let opts = TiffWriteOptions {
+            bit_depth: BitDepth::U16,
+            layout: Layout::Tiles { size: 128 },
+            compression: Compression::Deflate,
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+        let tuning = EncodeTuning {
+            target_block_bytes: TARGET_BLOCK_BYTES,
+            threads: 4,
+        };
+        write_tiff_tuned(&img, &out, &opts, tuning, &mut |d, t| seen.push((d, t))).unwrap();
+        assert_eq!(seen, vec![(128, 200), (200, 200)]);
+
+        let mut dec = Decoder::new(std::fs::File::open(&out).unwrap()).unwrap();
+        match dec.read_image().unwrap() {
+            DecodingResult::U16(data) => {
+                assert_eq!(data.len(), 300 * 200 * 3);
+                for y in [0u64, 127, 128, 199] {
+                    for x in [0u64, 127, 128, 255, 256, 299] {
+                        for c in 0..3u64 {
+                            let want = u16::from_unit_f32(img.row(c, y)[x as usize]);
+                            let got = data[((y * 300 + x) * 3 + c) as usize];
+                            assert_eq!(got, want, "pixel ({x},{y}) channel {c}");
+                        }
+                    }
+                }
+            }
+            other => panic!("expected U16 samples, got {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
