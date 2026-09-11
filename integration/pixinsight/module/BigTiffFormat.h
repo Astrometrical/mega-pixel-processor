@@ -46,6 +46,14 @@ public:
 
    IsoString Name() const override;
    StringList FileExtensions() const override;
+
+   // The extensions this format claims, as one static list. FileExtensions()
+   // returns it, and InstallPixInsightModule (Mpp.cpp) checks each entry
+   // against the formats already installed BEFORE constructing this class --
+   // it cannot construct one to ask, because MetaFileFormat's constructor is
+   // what registers the format, and registering is the thing being decided.
+   // One list, so the guard and the registration cannot drift apart.
+   static const StringList& ClaimedExtensions();
    IsoStringList MimeTypes() const override;
    uint32 Version() const override;
    String Description() const override;
