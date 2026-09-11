@@ -161,13 +161,26 @@ sign: $(TARGET)
 	  && echo "signed: mpp-pxm.xsgn written beside the module" \
 	  || echo "note: mpp-pxm.xsgn not found — check the signing output above (flags/password)."
 
+# Header dependency tracking: -MMD writes a .d file per object listing the
+# project headers it included (-isystem PCL headers are excluded), and -MP
+# adds phony targets so a deleted header does not break the build. Without
+# this a header change (e.g. a new BigTiffInstance member) recompiled only
+# the .cpp files touched since the last build and linked the rest stale,
+# so BigTiffFormat.o allocated the old sizeof(BigTiffInstance) while the
+# fresh BigTiffInstance.o wrote members past its end -- heap corruption
+# on every file open.
+DEPFLAGS = -MMD -MP
+DEPS = $(OBJS:.o=.d)
+
 # Module sources (this directory).
 $(OBJDIR)/%.o: %.cpp | $(OBJDIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $<
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDES) -o $@ $<
 
 # Host library sources (../host), compiled into the module link.
 $(OBJDIR)/%.o: $(HOSTDIR)/%.cpp | $(OBJDIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $<
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDES) -o $@ $<
+
+-include $(DEPS)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
