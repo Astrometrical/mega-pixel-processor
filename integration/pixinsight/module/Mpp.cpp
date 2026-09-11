@@ -22,6 +22,8 @@
 // PCL_FILEFORMAT_API.md reference, and MergeMosaic's own mmm.cpp (our code).
 // No PCL module implementation source was consulted.
 
+#include <pcl/Console.h>
+#include <pcl/Exception.h>
 #include <pcl/MetaModule.h>
 
 #include "BigTiffFormat.h"
@@ -60,9 +62,20 @@ public:
 
    String Description() const override
    {
+      // Shown in the Install Modules dialog when the user selects this
+      // module -- PCL's own doc says Description() exists "to provide
+      // meaningful information to the users during module installation
+      // procedures" (MetaModule.h). That is BEFORE installation, so it is
+      // the one place a prerequisite can be stated before it bites. Most
+      // users install without clicking through to it; the console message
+      // below covers them at the moment of collision.
       return "Mega Pixel Processor: file format support for astronomically large "
-             "images. Provides the BigTIFF/TIFF format (read+write); further "
-             "formats register under this module as they are added.";
+             "images. Provides the TIFF format (read+write, classic TIFF and "
+             "BigTIFF). REPLACES PixInsight's stock TIFF module, which must be "
+             "uninstalled first (Process > Modules > Manage Modules) -- otherwise "
+             "this module's installation fails with \"Duplicate file format "
+             "identifier\". Further formats register under this module as they "
+             "are added.";
    }
 
    String Company() const override
@@ -99,8 +112,39 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
    new pcl::MppModule;   // sets pcl::Module
 
    if ( mode == pcl::InstallMode::FullInstall )
-      new pcl::BigTiffFormat;   // self-registers under pcl::Module
-                                // (further formats: one `new` each, here)
+   {
+      try
+      {
+         new pcl::BigTiffFormat;   // self-registers under pcl::Module
+                                   // (further formats: one `new` each, here)
+      }
+      catch ( const pcl::Exception& )
+      {
+         // Registration was refused -- in practice because the stock TIFF
+         // module is still installed and owns the "TIFF" identifier and the
+         // .tif/.tiff extensions. The core is about to report its own error
+         // and uninstall this module; that cannot be prevented (see the
+         // README: querying the registry here segfaults, and swallowing this
+         // exception leaves a dangling child in the module tree). What CAN
+         // be done is put the fix directly above the core's error, where
+         // the user is already looking.
+         //
+         // This block runs ONLY when the install is already failing, so a
+         // normal install never executes it. The Console call is the one
+         // thing here not proven safe inside InstallPixInsightModule --
+         // registration calls work at this point and the format-registry
+         // query did not; Console touches neither -- so if this crashes,
+         // it crashes an install that was failing anyway. Smoke step 1 says
+         // which happened.
+         pcl::Console console;
+         console.CriticalLn( "*** Mega Pixel Processor could not register its TIFF format." );
+         console.CriticalLn( "This module replaces PixInsight's stock TIFF module, and both cannot "
+                             "be installed at once. To fix: Process > Modules > Manage Modules, "
+                             "uninstall the stock TIFF module (TIFF-pxm), restart PixInsight, "
+                             "then install Mega Pixel Processor again." );
+         throw;   // let the core fail the install exactly as it did before
+      }
+   }
 
    return 0;
 }

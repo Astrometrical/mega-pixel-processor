@@ -425,8 +425,30 @@ delete either.
 the core refuses our registration — since the format is named `TIFF`, on
 the *identifier* ("Duplicate file format identifier"), before it ever
 reaches the extension check — and then **uninstalls this module**. So after
-removing the stock TIFF you must also reinstall ours by hand. The console
-reports both steps in red.
+removing the stock TIFF you must also reinstall ours by hand.
+
+Two things tell the user what to do. The module's description, shown in
+the Install Modules dialog when the module is selected (most users install
+without looking, but it is there), states the prerequisite up front. And
+at the moment of collision the module catches the refusal, writes the fix
+to the Process Console in red, and re-throws so the core fails the install
+exactly as before — the instructions land directly above the core's own
+error:
+
+```
+*** Mega Pixel Processor could not register its TIFF format.
+This module replaces PixInsight's stock TIFF module, and both cannot be
+installed at once. To fix: Process > Modules > Manage Modules, uninstall
+the stock TIFF module (TIFF-pxm), restart PixInsight, then install Mega
+Pixel Processor again.
+*** PixInsight API Error: MetaFileFormat: TIFF: Duplicate file format identifier
+```
+
+That console write is the one call in the collision path not proven safe
+inside `InstallPixInsightModule` — see the dead ends below for why the
+registry *query* segfaults there. It runs only when the install is already
+failing, so a normal install never executes it; smoke step 1 records which
+way it went.
 
 That is not what we wanted, and it was tried: a guard in
 `InstallPixInsightModule` that asked the core whether `.tif` was already
@@ -540,7 +562,21 @@ You will need `xxd` (or any hex dump), and `tiffinfo` (libtiff-tools) or
 prints the geometry and sample format of any file this module can read, and
 is the quickest independent second opinion.
 
-1. **The format is called TIFF, and PixInsight accepted the identifier.**
+1. **[ASSUMPTION] The collision message appears, and does not crash.** With
+   the stock `TIFF-pxm.so` still installed, install this module. Expected:
+   the Process Console shows our red *"could not register its TIFF format"*
+   instructions immediately followed by the core's own *"Duplicate file
+   format identifier"* error, the install fails, and this module is
+   uninstalled — the same outcome as before, with the fix now stated. Also
+   select the module in the Install Modules dialog beforehand and confirm
+   its description states the prerequisite. Two outcomes to record: if
+   PixInsight segfaults instead, the `Console` call is not usable inside
+   `InstallPixInsightModule` and the catch block must be removed (the
+   crash is contained to an install that was failing anyway); if only the
+   core's error appears with no red text of ours above it, the exception
+   was not a `pcl::Exception` and the catch did not fire.
+
+2. **The format is called TIFF, and PixInsight accepted the identifier.**
    Open **File > Save As** and confirm the format list offers **TIFF** —
    not *BigTIFF*, which is what it was called before phase 4. The format
    also has to *register*: `Name()` must be a unique valid C identifier
@@ -560,17 +596,17 @@ is the quickest independent second opinion.
    which is worth recording here. Check it at list size (Format Explorer)
    and at full size (an image-window icon).
 
-2. **The dialog is ours.** Save any image as TIFF. Confirm the options
+3. **The dialog is ours.** Save any image as TIFF. Confirm the options
    dialog appears before the file is written, and that it is visibly *not*
    the stock TIFF dialog: the Astrometrical chevron, the title *"Mega Pixel
    Processor — TIFF Options"*, the tagline and copyright line, and three
    clickable links (astrometrical.com · Astrometrical Tools · Ko-fi) that
    show a pointing-hand cursor. Expand and collapse each of the five section
    bars and confirm the dialog grows and shrinks with them.
-3. **Cancel aborts.** Press Cancel. Confirm **no file is written** (not an
+4. **Cancel aborts.** Press Cancel. Confirm **no file is written** (not an
    empty one, not a truncated one — check the target directory) and that
    PixInsight reports the save as cancelled rather than failed.
-4. **[REGRESSION] Every sample format survives.** Save the same image five
+5. **[REGRESSION] Every sample format survives.** Save the same image five
    times, once per Sample Format radio button: 8-bit unsigned, 16-bit
    unsigned, 32-bit unsigned, 32-bit float, 64-bit float. Reopen each in
    PixInsight and confirm the sample format survived — the 32-bit-integer
@@ -582,7 +618,7 @@ is the quickest independent second opinion.
    (Expect `u8`/`u16` values to differ from a pre-phase-4 build by at most
    1 LSB: integer scaling now goes through `f64` and is strictly more
    accurate.)
-5. **[REGRESSION] Compression works and is independent per block.** Save the
+6. **[REGRESSION] Compression works and is independent per block.** Save the
    same image with LZW, with Deflate (try levels 1 and 9), and with
    PackBits. Confirm each reopens with identical pixels, and that each
    compressed file is smaller than the uncompressed one. Then repeat one of
@@ -592,7 +628,7 @@ is the quickest independent second opinion.
    `BigTiffFormat::SupportsCompression()` reported `false` to match; it now
    returns `true`, as `MetaFileFormat.h` requires of a format offering
    LZW/ZIP over its source pixels.
-6. **[REGRESSION] Automatic picks classic TIFF for a small image.** Save a
+7. **[REGRESSION] Automatic picks classic TIFF for a small image.** Save a
    small image (a few MB) with the container combo on Automatic to a `.tif`
    path. Confirm the first four bytes are the *classic* magic:
    `xxd -l 4 out.tif` shows `4949 2a00` (`II*\0`), **not** `4949 2b00`
@@ -601,19 +637,19 @@ is the quickest independent second opinion.
    declares the container and overrides the size heuristic. Before phase 4
    every save was BigTIFF regardless, which is exactly the behaviour change
    most likely to surprise an existing user.
-7. **[REGRESSION] Tiles.** Save with Layout set to Tiles (try 256 and one
+8. **[REGRESSION] Tiles.** Save with Layout set to Tiles (try 256 and one
    other tile size). Confirm the file reopens in PixInsight with correct
    geometry and pixels, and that `tiffinfo out.tif` reports
    `TileWidth`/`TileLength` (and tile offsets/byte counts) rather than
    `RowsPerStrip`. Use an image whose width and height are **not** multiples
    of the tile size, so the padded right-column, bottom-row and corner tiles
    are exercised.
-8. **[REGRESSION] Alpha round trip.** Open or construct an image with an
+9. **[REGRESSION] Alpha round trip.** Open or construct an image with an
    alpha channel (RGBA or gray+alpha), save it with the alpha combo set to
    Unassociated, and reopen. Confirm the alpha channel is present and
    correct, and that `tiffinfo` shows an `ExtraSamples` entry. Repeat with
    Associated. Alpha was refused outright before phase 4.
-9. **[ASSUMPTION] Alpha set to "Not written" — check the colour channels,
+10. **[ASSUMPTION] Alpha set to "Not written" — check the colour channels,
    not just the count.** Save an RGBA image with the alpha combo on *Not
    written*, then **reopen it and compare the R, G and B planes against the
    source**. The drop path opens the session for the colour channels alone
@@ -623,7 +659,7 @@ is the quickest independent second opinion.
    writes the **alpha plane into the red channel** and silently corrupts the
    image. A file that merely "opens as RGB with no alpha" is not a pass;
    the pixels must match.
-10. **[ASSUMPTION] Save from a colour-managed window.** Take a window that
+11. **[ASSUMPTION] Save from a colour-managed window.** Take a window that
    carries an ICC profile (assign one via PixInsight's colour management if
    you must), save it with *Embed ICC profile* ticked, and confirm the save
    **completes** and that `exiftool out.tif` (or `tiffinfo`) shows an ICC
@@ -636,7 +672,7 @@ is the quickest independent second opinion.
    ICC-bearing save fails hard rather than degrading to a profile-less
    file — so exercise this from more than one route if you can (Save,
    Save As, and a script-driven `FileFormat` write).
-11. **[REGRESSION] Text tags and resolution.** Fill in Image Description,
+12. **[REGRESSION] Text tags and resolution.** Fill in Image Description,
     Copyright and Software, set the resolution to something distinctive
     (say 300, unit inch), and save. Confirm with `exiftool out.tif` or
     `tiffinfo out.tif` that tags 270, 33432 and 305 carry your text and that
@@ -646,7 +682,7 @@ is the quickest independent second opinion.
     where before phase 4 none were written at all. Also confirm a non-ASCII
     character in one of the text fields is refused with a message naming the
     field, **before** any output file appears.
-12. **Photoshop round trip.** Open a tiled, Deflate-compressed **BigTIFF**
+13. **Photoshop round trip.** Open a tiled, Deflate-compressed **BigTIFF**
     written by this module in Photoshop (PS >= 26.2) and confirm it renders
     correctly at full size. This is the check that a hand-rolled IFD is
     correct by more than our own decoder's opinion — the failure mode this
