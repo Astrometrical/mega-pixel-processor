@@ -39,6 +39,7 @@ namespace pcl
 {
 
 class BigTiffFormat;
+class ConsoleProgress;
 
 // ----------------------------------------------------------------------------
 
@@ -214,6 +215,14 @@ private:
 
    uint32_t band_rows_ = 0;       // rows per shm band (~4 MiB per band, min 1)
    std::unique_ptr<mpp::WriteSession> session_;       // live between CreateImage() and CloseImage()
+
+   // Console progress bar for the live write session (see ConsoleProgress in
+   // the .cpp): created with session_, destroyed with it, so an abandoned
+   // save still ends its console line. rows_pushed_ drives the
+   // "Transferring" stage host-side, summed over channels like the worker's
+   // own band-phase Progress.
+   std::unique_ptr<ConsoleProgress> progress_;
+   uint64_t rows_pushed_ = 0;
 };
 
 // ----------------------------------------------------------------------------

@@ -180,3 +180,9 @@ target_link_libraries(test_idle_callback PRIVATE mpp_host)
 target_compile_definitions(test_idle_callback PRIVATE
   FAKE_WORKER_SLOW_ERROR_PATH="$<TARGET_FILE:fake_worker_slow_error>")
 add_test(NAME test_idle_callback COMMAND test_idle_callback)
+
+# test_progress_bar -- the PCL-free renderer behind the module's Console
+# progress bar (module/ProgressBar.h): pins that the visible-glyph count the
+# in-place redraw erases with backspaces matches the markup exactly.
+add_executable(test_progress_bar test/test_progress_bar.cpp)
+add_test(NAME test_progress_bar COMMAND test_progress_bar)
