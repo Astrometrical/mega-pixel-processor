@@ -13,8 +13,26 @@ namespace pcl
 
 IsoString BigTiffFormat::Name() const
 {
-   // Unique valid-C-identifier format id (FileFormatBase.h:81-83).
-   return "BigTIFF";
+   // Unique valid-C-identifier format id (FileFormatBase.h:81-83) -- the
+   // header's own examples are "FITS", "TIFF", "JPEG2000", i.e. the format is
+   // named for its container. A slash is not a valid C identifier character,
+   // so "TIFF/BigTIFF" is impossible here; it lives in Description() instead,
+   // which is a free String.
+   //
+   // "TIFF" rather than "BigTIFF", for two reasons. Discoverability: this
+   // module claims .tif/.tiff and displaces PixInsight's stock TIFF module,
+   // so a user looking for TIFF support should find it under that name.
+   // Accuracy: since phase 4's container work, Container::Auto writes a
+   // CLASSIC TIFF for any payload under 4 GB, so "BigTIFF" would misname the
+   // common case -- a 20 MB .tif save is not a BigTIFF. BigTIFF is the
+   // variant we reach for above 4 GB (and always for .btf/.tf8), not the
+   // whole of what this format writes.
+   //
+   // The C++ classes deliberately keep their BigTiffFormat/BigTiffInstance
+   // names: the format identifier is user-facing and persisted by the core,
+   // the class names are not, and renaming them would churn the makefile,
+   // CMake and CI source lists for no user-visible gain.
+   return "TIFF";
 }
 
 StringList BigTiffFormat::FileExtensions() const
@@ -62,17 +80,17 @@ String BigTiffFormat::Description() const
 {
    // Product first, container second: this is one of the formats the Mega
    // Pixel Processor module provides, not the module's whole identity.
-   return "Mega Pixel Processor: BigTIFF/TIFF (read+write)";
+   return "Mega Pixel Processor: TIFF/BigTIFF (read+write)";
 }
 
 String BigTiffFormat::Implementation() const
 {
    return "Astrometrical Mega Pixel Processor (mpp): file format support for "
           "astronomically large images. This format is mpp's clean-room "
-          "BigTIFF/TIFF reader and BigTIFF encoder. Pixel data are streamed "
+          "TIFF/BigTIFF reader and encoder. Pixel data are streamed "
           "over shared memory to and from the mpp-ipc-worker process "
           "installed beside this module, which performs the actual "
-          "TIFF/BigTIFF decoding (read) and BigTIFF encoding (write). "
+          "TIFF/BigTIFF decoding (read) and encoding (write). "
           "Implemented from the public TIFF/BigTIFF specifications and the "
           "public PCL API only; see the module's provenance README "
           "(integration/pixinsight/README.md in the mpp source "

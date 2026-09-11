@@ -44,8 +44,14 @@ being better, not on being the only place the files work.
   as `MegaPixelProcessor` ("Mega Pixel Processor: file format support for
   astronomically large images"). The *formats* it provides register beneath
   it individually and are named for their container, per PixInsight's own
-  convention (`TIFF`, `XISF`, `FITS`) — today just `BigTIFF`, described as
-  "Mega Pixel Processor: BigTIFF/TIFF (read+write)". BigTIFF was the first
+  convention (`TIFF`, `XISF`, `FITS`) — today just `TIFF`, described as
+  "Mega Pixel Processor: TIFF/BigTIFF (read+write)". The format was named
+  `BigTIFF` until phase 4 renamed it: this module displaces the stock TIFF
+  module, so users look for it under `TIFF`, and since `Container::Auto`
+  writes a classic TIFF below 4 GB, `BigTIFF` had come to misname the common
+  case. The C++ classes keep their `BigTiffFormat`/`BigTiffInstance` names —
+  the identifier is user-facing, the class names are not. BigTIFF was the
+  first
   format, never the module's identity; adding a second format is additive
   (a new `<Format>Format`/`<Format>Instance` pair constructed in
   `InstallPixInsightModule`) and changes no binary name, CI job, or install
