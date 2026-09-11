@@ -327,7 +327,13 @@ public:
    ConsoleProgress& operator =( const ConsoleProgress& ) = delete;
 
    // Draws (or redraws) the bar for \a stage at \a done of \a total. A change
-   // of stage commits the previous stage's line first.
+   // of stage commits the previous stage's line first. Within a stage the
+   // bar only ever advances: an update that does not raise the percent is
+   // dropped, which is what keeps a committed 100% line from being drawn
+   // again -- the write path counts "Transferring" host-side and commits
+   // it as the last band is pushed, then Finish drains the worker's own
+   // "bands" Progress frames for those final bands (docs/pi-protocol.md
+   // §7.2/§7.3), each reporting a lower percent for the same stage.
    void Update( const char* stage, uint64_t done, uint64_t total )
    {
       if ( !m_active )
@@ -340,7 +346,7 @@ public:
          m_lastPercent = -1;
       }
       const int percent = mpp::PercentOf( done, total );
-      if ( percent == m_lastPercent )
+      if ( percent <= m_lastPercent )
          return;
       m_lastPercent = percent;
       Redraw( mpp::RenderProgressBar( m_stage, percent ) );
