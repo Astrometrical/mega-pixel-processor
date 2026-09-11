@@ -22,8 +22,6 @@
 // PCL_FILEFORMAT_API.md reference, and MergeMosaic's own mmm.cpp (our code).
 // No PCL module implementation source was consulted.
 
-#include <pcl/Console.h>
-#include <pcl/Exception.h>
 #include <pcl/MetaModule.h>
 
 #include "BigTiffFormat.h"
@@ -112,39 +110,16 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
    new pcl::MppModule;   // sets pcl::Module
 
    if ( mode == pcl::InstallMode::FullInstall )
-   {
-      try
-      {
-         new pcl::BigTiffFormat;   // self-registers under pcl::Module
-                                   // (further formats: one `new` each, here)
-      }
-      catch ( const pcl::Exception& )
-      {
-         // Registration was refused -- in practice because the stock TIFF
-         // module is still installed and owns the "TIFF" identifier and the
-         // .tif/.tiff extensions. The core is about to report its own error
-         // and uninstall this module; that cannot be prevented (see the
-         // README: querying the registry here segfaults, and swallowing this
-         // exception leaves a dangling child in the module tree). What CAN
-         // be done is put the fix directly above the core's error, where
-         // the user is already looking.
-         //
-         // This block runs ONLY when the install is already failing, so a
-         // normal install never executes it. The Console call is the one
-         // thing here not proven safe inside InstallPixInsightModule --
-         // registration calls work at this point and the format-registry
-         // query did not; Console touches neither -- so if this crashes,
-         // it crashes an install that was failing anyway. Smoke step 1 says
-         // which happened.
-         pcl::Console console;
-         console.CriticalLn( "*** Mega Pixel Processor could not register its TIFF format." );
-         console.CriticalLn( "This module replaces PixInsight's stock TIFF module, and both cannot "
-                             "be installed at once. To fix: Process > Modules > Manage Modules, "
-                             "uninstall the stock TIFF module (TIFF-pxm), restart PixInsight, "
-                             "then install Mega Pixel Processor again." );
-         throw;   // let the core fail the install exactly as it did before
-      }
-   }
+      new pcl::BigTiffFormat;   // self-registers under pcl::Module
+                                // (further formats: one `new` each, here)
+      //
+      // If registration is refused (the stock TIFF module is still installed
+      // and owns the "TIFF" identifier), the exception escapes to the core,
+      // which reports it and uninstalls this module. Nothing can be done
+      // about that from here, and it has been tried twice against a real
+      // core: querying the format registry first segfaults, and writing the
+      // fix to the Console from inside this function segfaults too. See the
+      // README, "Replacing the stock TIFF module", before trying a third.
 
    return 0;
 }

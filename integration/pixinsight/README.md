@@ -427,28 +427,11 @@ the *identifier* ("Duplicate file format identifier"), before it ever
 reaches the extension check — and then **uninstalls this module**. So after
 removing the stock TIFF you must also reinstall ours by hand.
 
-Two things tell the user what to do. The module's description, shown in
-the Install Modules dialog when the module is selected (most users install
-without looking, but it is there), states the prerequisite up front. And
-at the moment of collision the module catches the refusal, writes the fix
-to the Process Console in red, and re-throws so the core fails the install
-exactly as before — the instructions land directly above the core's own
-error:
-
-```
-*** Mega Pixel Processor could not register its TIFF format.
-This module replaces PixInsight's stock TIFF module, and both cannot be
-installed at once. To fix: Process > Modules > Manage Modules, uninstall
-the stock TIFF module (TIFF-pxm), restart PixInsight, then install Mega
-Pixel Processor again.
-*** PixInsight API Error: MetaFileFormat: TIFF: Duplicate file format identifier
-```
-
-That console write is the one call in the collision path not proven safe
-inside `InstallPixInsightModule` — see the dead ends below for why the
-registry *query* segfaults there. It runs only when the install is already
-failing, so a normal install never executes it; smoke step 1 records which
-way it went.
+One thing tells the user what to do before it happens: the module's
+description, shown in the Install Modules dialog when the module is
+selected, states the prerequisite up front. Most users install without
+looking, but it is there, and it is the only channel that works — see
+below.
 
 That is not what we wanted, and it was tried: a guard in
 `InstallPixInsightModule` that asked the core whether `.tif` was already
@@ -467,9 +450,17 @@ reasons, each verified against a real core (1.9.3) or the pinned headers:
   `MppModule` holding a dangling pointer that its own destructor later
   deletes.
 
+- Writing to the Process Console from inside `InstallPixInsightModule` also
+  **segfaults** — tried against PixInsight 1.9.3 as a catch-log-rethrow
+  around the refused registration, so the fix would appear above the core's
+  error. `Console` is not usable there any more than the registry query is.
+  This closes the last in-module channel: nothing of ours runs between the
+  refusal and the uninstall except that one function.
+
 Registering later, from `OnLoad()`, is not an option either: the core reads
-the module tree when `InstallPixInsightModule` returns. Do not retry this
-without a PCL API that exposes format registration as a queryable step.
+the module tree when `InstallPixInsightModule` returns. Do not retry any of
+this without a PCL API that exposes format registration as a queryable step
+or a documented install-time logging hook.
 
 **What you give up while swapped.** Since phase 4 the honest list is short:
 
@@ -562,19 +553,14 @@ You will need `xxd` (or any hex dump), and `tiffinfo` (libtiff-tools) or
 prints the geometry and sample format of any file this module can read, and
 is the quickest independent second opinion.
 
-1. **[ASSUMPTION] The collision message appears, and does not crash.** With
-   the stock `TIFF-pxm.so` still installed, install this module. Expected:
-   the Process Console shows our red *"could not register its TIFF format"*
-   instructions immediately followed by the core's own *"Duplicate file
-   format identifier"* error, the install fails, and this module is
-   uninstalled — the same outcome as before, with the fix now stated. Also
-   select the module in the Install Modules dialog beforehand and confirm
-   its description states the prerequisite. Two outcomes to record: if
-   PixInsight segfaults instead, the `Console` call is not usable inside
-   `InstallPixInsightModule` and the catch block must be removed (the
-   crash is contained to an install that was failing anyway); if only the
-   core's error appears with no red text of ours above it, the exception
-   was not a `pcl::Exception` and the catch did not fire.
+1. **The prerequisite is stated where a careful user would see it.** In
+   Process > Modules > Install Modules, select this module before installing
+   and confirm its description says the stock TIFF module must be
+   uninstalled first, naming the *"Duplicate file format identifier"* error
+   that otherwise results. There is no in-module message at the moment of
+   collision and there cannot be one — both a registry query and a Console
+   write segfault inside `InstallPixInsightModule` (tested against 1.9.3;
+   see "Replacing the stock TIFF module").
 
 2. **The format is called TIFF, and PixInsight accepted the identifier.**
    Open **File > Save As** and confirm the format list offers **TIFF** —
