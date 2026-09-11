@@ -36,11 +36,11 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use mpp_core::formats::tiff_read::TiffReader;
 use mpp_core::formats::tiff_write::{
-    AlphaMode, BitDepth, Compression, Container, Layout, Resolution, ResolutionUnit, Sample,
-    TiffWriteOptions, write_tiff, write_tiff_native,
+    AlphaMode, BitDepth, Compression, Container, Layout, ProgressFn, Resolution, ResolutionUnit,
+    Sample, TiffWriteOptions, write_tiff_native_with_progress, write_tiff_with_progress,
 };
 use mpp_ipc::link::{HostEvent, HostLink};
-use mpp_ipc::protocol::{InitMessage, SessionMode};
+use mpp_ipc::protocol::{InitMessage, ProgressStage, SessionMode};
 use mpp_ipc::shm::ShmSegment;
 
 use staging::Staging;
@@ -154,11 +154,13 @@ struct WriteSetup {
 /// to match — [`validate_init`] rejects a mismatch up front rather than
 /// letting it surface after a multi-gigabyte staging run.
 trait BandSample: Sample {
-    /// Encode the (fully covered) `staging` image to `path` per `opts`.
+    /// Encode the (fully covered) `staging` image to `path` per `opts`,
+    /// reporting encode progress to `progress` after every block row.
     fn encode_staging(
         staging: &Staging<Self>,
         path: &Path,
         opts: &TiffWriteOptions,
+        progress: ProgressFn<'_>,
     ) -> mpp_core::Result<()>;
 }
 
@@ -167,9 +169,10 @@ impl BandSample for f32 {
         staging: &Staging<Self>,
         path: &Path,
         opts: &TiffWriteOptions,
+        progress: ProgressFn<'_>,
     ) -> mpp_core::Result<()> {
         // The converting path: unit-range f32 in, any `opts.bit_depth` out.
-        write_tiff(staging, path, opts)
+        write_tiff_with_progress(staging, path, opts, progress)
     }
 }
 
@@ -181,8 +184,9 @@ macro_rules! native_band_sample {
                 staging: &Staging<Self>,
                 path: &Path,
                 opts: &TiffWriteOptions,
+                progress: ProgressFn<'_>,
             ) -> mpp_core::Result<()> {
-                write_tiff_native(staging, path, opts)
+                write_tiff_native_with_progress(staging, path, opts, progress)
             }
         }
     };
@@ -344,7 +348,8 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
                 if rows_done.saturating_sub(last_progress) >= progress_every
                     || rows_done >= rows_total
                 {
-                    if let Err(e) = link.send_progress(rows_done, rows_total) {
+                    if let Err(e) = link.send_progress(ProgressStage::Bands, rows_done, rows_total)
+                    {
                         return Err(fail(link, &e.to_string()));
                     }
                     last_progress = rows_done;
@@ -394,7 +399,24 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
     // call the encoder makes below reads real data, never the zero-filled
     // uncovered case documented on `Staging`'s `PlanarRows` impl (see
     // `staging.rs`).
-    if let Err(e) = T::encode_staging(&staging, &output_path, &setup.options) {
+    //
+    // Encode-phase progress (docs/pi-protocol.md §7.3): every block row the
+    // encoder finishes becomes a `Progress` frame counting OUTPUT rows
+    // (`rows_total == height`), distinct from the band phase's
+    // `height * channels`. A block row is ~4 MiB of pixels, so no further
+    // throttling is needed. A link failure mid-encode is remembered rather
+    // than aborting the encode — the file is still worth finishing, and the
+    // host-gone/`Done` bookkeeping below reports it as usual.
+    let mut progress_err: Option<mpp_ipc::link::LinkError> = None;
+    let mut progress = |rows_done: u64, rows_total: u64| {
+        if progress_err.is_none()
+            && let Err(e) = link.send_progress(ProgressStage::Encode, rows_done, rows_total)
+        {
+            progress_err = Some(e);
+        }
+    };
+    let encoded = T::encode_staging(&staging, &output_path, &setup.options, &mut progress);
+    if let Err(e) = encoded {
         // The encoder may have left a partial file behind; best-effort
         // clean it up rather than leaving a corrupt-looking output file
         // for the host to trip over after we've already reported failure.
@@ -403,6 +425,9 @@ fn run_write_typed<T: BandSample, R: Read, W: Write>(
             link,
             &format!("encoding {}: {e}", output_path.display()),
         ));
+    }
+    if let Some(e) = progress_err {
+        return Err(fail(link, &e.to_string()));
     }
 
     if let Err(e) = staging.remove() {

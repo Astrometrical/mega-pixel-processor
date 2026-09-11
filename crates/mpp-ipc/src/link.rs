@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 
 use crate::protocol::{
     BandHeader, DoneMessage, ErrorMessage, IPC_PROTOCOL_VERSION, ImageMeta, InitMessage,
-    ProgressMessage, read_frame, tag, write_frame,
+    ProgressMessage, ProgressStage, read_frame, tag, write_frame,
 };
 
 /// Errors from the worker-side host link.
@@ -175,10 +175,16 @@ impl<R: Read, W: Write> HostLink<R, W> {
 
     /// Sends a `Progress` frame (tag [`tag::PROGRESS`]) reporting rows
     /// completed so far out of the total expected.
-    pub fn send_progress(&mut self, rows_done: u64, rows_total: u64) -> Result<(), LinkError> {
+    pub fn send_progress(
+        &mut self,
+        stage: ProgressStage,
+        rows_done: u64,
+        rows_total: u64,
+    ) -> Result<(), LinkError> {
         let payload = encode_json(&ProgressMessage {
             rows_done,
             rows_total,
+            stage,
         })?;
         self.send(tag::PROGRESS, &payload)
     }
@@ -426,7 +432,7 @@ mod tests {
     #[test]
     fn send_progress_writes_tagged_json_frame() {
         let mut link = HostLink::new(Cursor::new(Vec::new()), Vec::new());
-        link.send_progress(10, 100).unwrap();
+        link.send_progress(ProgressStage::Encode, 10, 100).unwrap();
         let mut out = Cursor::new(link.output.clone());
         let (t, payload) = read_frame(&mut out).unwrap();
         assert_eq!(t, tag::PROGRESS);
@@ -435,7 +441,8 @@ mod tests {
             msg,
             ProgressMessage {
                 rows_done: 10,
-                rows_total: 100
+                rows_total: 100,
+                stage: ProgressStage::Encode,
             }
         );
     }

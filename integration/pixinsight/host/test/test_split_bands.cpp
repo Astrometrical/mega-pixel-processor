@@ -110,9 +110,43 @@ int main() {
       session.PushBand(b.channel, b.start_row, kBandRows, buf.data());
     }
 
-    uint64_t bytes_written = session.Finish(nullptr);
+    // Finish pumps every Progress frame into the callback, each tagged with
+    // the phase it belongs to (docs/pi-protocol.md §7.3): the band phase's
+    // own final report may arrive after Finish is sent, and the encoder's
+    // reports follow it. The encode phase counts OUTPUT rows and must end
+    // complete -- that is what the module's "Encoding" bar is driven by.
+    std::vector<mpp::ProgressInfo> progress;
+    uint64_t bytes_written =
+        session.Finish([&](mpp::ProgressInfo p) { progress.push_back(p); });
     if (bytes_written == 0) {
       fail("Finish reported bytes_written == 0");
+    }
+    bool saw_encode = false;
+    uint64_t last_encode_done = 0;
+    for (const auto& p : progress) {
+      if (p.stage == mpp::ProgressStage::Bands) {
+        if (p.rows_total != kHeight * kChannels) {
+          fail("band-stage progress rows_total " + std::to_string(p.rows_total) +
+               " != height*channels " + std::to_string(kHeight * kChannels));
+        }
+      } else {
+        if (p.rows_total != kHeight) {
+          fail("encode-stage progress rows_total " + std::to_string(p.rows_total) +
+               " != height " + std::to_string(kHeight));
+        }
+        if (p.rows_done < last_encode_done) {
+          fail("encode-stage progress went backwards");
+        }
+        last_encode_done = p.rows_done;
+        saw_encode = true;
+      }
+    }
+    if (!saw_encode) {
+      fail("Finish delivered no encode-stage Progress");
+    }
+    if (last_encode_done != kHeight) {
+      fail("final encode-stage progress " + std::to_string(last_encode_done) +
+           " is not the full height " + std::to_string(kHeight));
     }
 
     // ---- verify the output file ----------------------------------------

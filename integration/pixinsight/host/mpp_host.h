@@ -101,10 +101,16 @@ struct WriteSessionConfig {
 };
 
 /// Progress snapshot pumped into `WriteSession::Finish`'s callback, mirroring
-/// the worker's `ProgressMessage` (docs/pi-protocol.md §4).
+/// the worker's `ProgressMessage` (docs/pi-protocol.md §4). `stage` says
+/// which phase -- and therefore which unit -- `rows_done`/`rows_total` are
+/// in: band streaming counts staged rows over every channel, encoding
+/// counts output rows written to the file. Both stages can be seen from
+/// `Finish`'s callback, since the band phase's final report may only reach
+/// the host after `Finish` has gone out.
 struct ProgressInfo {
   uint64_t rows_done = 0;
   uint64_t rows_total = 0;
+  ProgressStage stage = ProgressStage::Bands;
 };
 
 /// Thrown by `WriteSession` on any fault: a worker `Error` frame, an
@@ -190,6 +196,20 @@ class WriteSession {
   /// after `Cancel`.
   uint64_t Finish(const std::function<void(ProgressInfo)>& cb);
 
+  /// Registers `cb` to be invoked whenever this session has been waiting on
+  /// a worker frame for `kIdleWaitMs` with nothing arriving -- repeatedly,
+  /// about once per `kIdleWaitMs`, for as long as the silence lasts. The
+  /// PixInsight module uses it to pump the GUI event queue while the worker
+  /// is busy but quiet (staging the last bands, or the whole encode phase
+  /// between `Finish` and `Done`), so the Console keeps repainting and the
+  /// window is not flagged "not responding". Called on the thread that is
+  /// blocked in `PushBandBytes`/`Finish`/`Cancel`; an empty function clears
+  /// it. Ported from MergeMosaic's `ProgressCallback::on_idle` rhythm.
+  void SetIdleCallback(std::function<void()> cb) { idle_cb_ = std::move(cb); }
+
+  /// How long a frame read waits in silence before the idle callback fires.
+  static constexpr int kIdleWaitMs = 100;
+
   /// Sends `Cancel` -- only meaningful before `Finish` is sent, per
   /// docs/pi-protocol.md §7.4 -- and reads frames (tolerating `BandAck`/
   /// `Progress`) until the worker's terminal reply. Always throws
@@ -221,6 +241,8 @@ class WriteSession {
   // Reads one worker->host frame; throws HostError (reaping the worker) on
   // EOF or a malformed frame instead of returning a sentinel, since every
   // caller in this class would otherwise have to duplicate that check.
+  // While the pipe is silent, fires idle_cb_ every kIdleWaitMs (see
+  // SetIdleCallback) before blocking in the read proper.
   WorkerFrame ReadFrameOrThrow();
   void WriteFramed(const std::vector<uint8_t>& framed);
 
@@ -245,6 +267,8 @@ class WriteSession {
   bool spawned_ = false;  ///< True once os_spawn succeeded (dtor only acts then).
   bool reaped_ = false;
   bool finished_ = false;  ///< True once Finish/Cancel/a fault reached a terminal state.
+
+  std::function<void()> idle_cb_;  ///< See SetIdleCallback; empty = none.
 
   std::deque<uint32_t> free_slots_;
   // Busy-set: slot_busy_[i] is true iff slot i was handed out in a Band
@@ -335,6 +359,12 @@ class ReadSession {
   void ReadAll(const std::function<void(uint32_t channel, uint64_t start_row, uint32_t rows,
                                          const void* samples)>& sink);
 
+  /// As `WriteSession::SetIdleCallback`: `cb` fires about every
+  /// `WriteSession::kIdleWaitMs` while `ReadAll` is waiting on a worker frame
+  /// that has not arrived -- the read direction's silent stretches are the
+  /// worker decoding a large chunk before its first band of it can be sent.
+  void SetIdleCallback(std::function<void()> cb) { idle_cb_ = std::move(cb); }
+
   /// Standalone geometry probe: spawns `worker_exe --probe input_path`
   /// (no `Init` handshake -- the `--probe` CLI entry opens the file and
   /// prints its `ImageMeta` as JSON, then exits, per `mpp-ipc-worker`'s
@@ -362,6 +392,7 @@ class ReadSession {
   ReadSessionConfig cfg_;
   uint64_t slot_bytes_ = 0;
   ImageMeta meta_{};
+  std::function<void()> idle_cb_;  ///< See SetIdleCallback; empty = none.
 
   ShmSegment shm_;
   Pipe in_pipe_;   // host -> worker stdin

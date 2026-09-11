@@ -163,3 +163,20 @@ add_test(NAME test_sectionbar_order
          COMMAND test_sectionbar_order
                  ${CMAKE_CURRENT_SOURCE_DIR}/../module/TiffOptionsDialog.h
                  ${CMAKE_CURRENT_SOURCE_DIR}/../module/TiffOptionsDialog.cpp)
+
+# Idle callback (progress-bar work): WriteSession/ReadSession::SetIdleCallback
+# fires while the worker pipe is silent, so the module can pump the GUI.
+# fake_worker_slow_error is a test-only fixture that goes quiet for ~350 ms
+# after Finish before replying Error -- see its header comment.
+add_executable(fake_worker_slow_error test/fake_worker_slow_error.cpp)
+target_link_libraries(fake_worker_slow_error PRIVATE mpp_host)
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(fake_worker_slow_error PRIVATE Threads::Threads)
+endif()
+
+add_executable(test_idle_callback test/test_idle_callback.cpp)
+target_link_libraries(test_idle_callback PRIVATE mpp_host)
+target_compile_definitions(test_idle_callback PRIVATE
+  FAKE_WORKER_SLOW_ERROR_PATH="$<TARGET_FILE:fake_worker_slow_error>")
+add_test(NAME test_idle_callback COMMAND test_idle_callback)
