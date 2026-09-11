@@ -42,7 +42,18 @@ use tiff::decoder::ifd::Value;
 use tiff::decoder::{ChunkType, Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 
+use crate::pipeline::{self, Pipeline};
 use crate::{Error, Result};
+
+/// Most worker threads the decoder will use; see
+/// [`TiffReader::set_decode_threads`].
+const MAX_DECODE_THREADS: usize = 16;
+
+/// Decoded-but-not-yet-delivered chunk bytes the parallel decoder is
+/// allowed to hold. Files with huge chunks (a single-strip astro TIFF's
+/// chunk is the whole image) get a window of one; small chunks get up to
+/// two per worker.
+const DECODE_WINDOW_BYTES: usize = 256 << 20;
 
 /// TIFF `PhotometricInterpretation` = 1: BlackIsZero grayscale.
 const PHOTOMETRIC_BLACK_IS_ZERO: u16 = 1;
@@ -507,6 +518,12 @@ pub struct TiffReader {
     decoder: Decoder<PatchedReader<File>>,
     info: TiffInfo,
     path: PathBuf,
+    /// The header patch every decoder on this file needs (see
+    /// [`PatchedReader`]), kept so [`Self::read_bands`] can open one decoder
+    /// per worker thread.
+    patch: Option<(u64, Vec<u8>)>,
+    /// Worker threads for chunk decoding; see [`Self::set_decode_threads`].
+    decode_threads: usize,
     /// What each decoded chunk's samples must become.
     transform: Transform,
     /// True when the file stores each channel in its own chunks
@@ -540,9 +557,7 @@ impl TiffReader {
             .map(|p| p.patch_to(PHOTOMETRIC_BLACK_IS_ZERO));
         file.rewind().map_err(|e| Error::io(path, e))?;
 
-        let mut decoder = Decoder::new(PatchedReader::new(file, patch))
-            .map_err(|e| Error::format(path, format!("TIFF header: {e}")))?
-            .with_limits(tiff_limits());
+        let mut decoder = open_decoder(path, file, &patch)?;
 
         let (width, height) = decoder
             .dimensions()
@@ -766,8 +781,90 @@ impl TiffReader {
             decoder,
             info,
             path: path.to_path_buf(),
+            patch,
+            decode_threads: pipeline::worker_count(usize::MAX, MAX_DECODE_THREADS),
             transform,
             planar,
+        })
+    }
+
+    /// Use `threads` worker threads to decode chunks in
+    /// [`Self::read_bands`] (clamped to at least one, and never more than
+    /// the file has chunks). Defaults to every core up to 16. Each worker
+    /// opens its own handle on the file; the bands still come out in chunk
+    /// order whatever the count.
+    pub fn set_decode_threads(&mut self, threads: usize) {
+        self.decode_threads = threads.max(1);
+    }
+
+    /// Decode chunks `0..count` on worker threads and hand each one's
+    /// planes to `consume` in index order. `chunk_bytes` (one decoded
+    /// chunk's size) bounds how many decoded chunks may wait for `consume`
+    /// at once. A decode failure, or an error from `consume`, stops every
+    /// worker and is returned.
+    fn decode_chunks(
+        &self,
+        path: &Path,
+        count: u32,
+        chunk_channels: u32,
+        sample_format: SampleFormat,
+        chunk_bytes: usize,
+        mut consume: impl FnMut(u32, Vec<Vec<u8>>) -> Result<()>,
+    ) -> Result<()> {
+        let count = count as usize;
+        let threads = pipeline::worker_count(count, self.decode_threads);
+        let window = (DECODE_WINDOW_BYTES / chunk_bytes.max(1)).clamp(1, threads * 2);
+        let pipeline = Pipeline::<Vec<Vec<u8>>>::new(count, window);
+        let transform = &self.transform;
+        let patch = &self.patch;
+
+        std::thread::scope(|scope| -> Result<()> {
+            for _ in 0..threads {
+                let pipeline = &pipeline;
+                scope.spawn(move || {
+                    // One decoder per worker: the `tiff` crate's decoder is
+                    // `&mut self` per chunk, so parallel decoding means
+                    // parallel handles on the same file.
+                    let mut decoder = match File::open(path)
+                        .map_err(|e| Error::io(path, e))
+                        .and_then(|file| open_decoder(path, file, patch))
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            pipeline.fail(e.to_string());
+                            return;
+                        }
+                    };
+                    while let Some(idx) = pipeline.claim() {
+                        let idx32 = idx as u32;
+                        let planes = decoder
+                            .read_chunk(idx32)
+                            .map_err(|e| Error::format(path, format!("TIFF chunk {idx}: {e}")))
+                            .and_then(|result| {
+                                chunk_planes(path, result, chunk_channels, sample_format, transform)
+                            });
+                        match planes {
+                            Ok(planes) => pipeline.complete(idx, planes),
+                            Err(e) => {
+                                pipeline.fail(e.to_string());
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+
+            for idx in 0..count {
+                let planes = pipeline.take(idx).map_err(|msg| Error::format(path, msg))?;
+                if let Err(e) = consume(idx as u32, planes) {
+                    // Release any worker parked on the window so the scope
+                    // can join them, then hand the sink's own error back.
+                    pipeline.fail(e.to_string());
+                    return Err(e);
+                }
+                pipeline.taken(idx);
+            }
+            Ok(())
         })
     }
 
@@ -840,31 +937,37 @@ impl TiffReader {
         };
         // Chunky chunks carry every channel; planar chunks carry exactly one.
         let chunk_channels = if self.planar { 1 } else { total_channels };
+        let (strip_w, strip_h) = self.decoder.chunk_dimensions();
+        let chunk_bytes =
+            strip_w as usize * strip_h as usize * chunk_channels as usize * sample_format.bytes();
 
-        for i in 0..strip_count {
-            let (w_c, h_c) = self.decoder.chunk_data_dimensions(i);
-            if u64::from(w_c) != width {
-                return Err(Error::format(
-                    path,
-                    format!("strip {i} width {w_c} does not match image width {width}"),
-                ));
-            }
-            let start_row = u64::from(i % strips_per_plane) * u64::from(rows_per_strip);
-            let result = self
-                .decoder
-                .read_chunk(i)
-                .map_err(|e| Error::format(path, format!("TIFF strip {i}: {e}")))?;
-            let planes =
-                chunk_planes(path, result, chunk_channels, sample_format, &self.transform)?;
-            if self.planar {
-                sink(i / strips_per_plane, start_row, h_c, &planes[0])?;
-            } else {
-                for (ch, bytes) in planes.iter().enumerate() {
-                    sink(ch as u32, start_row, h_c, bytes)?;
+        let decoder = &self.decoder;
+        let planar = self.planar;
+        self.decode_chunks(
+            path,
+            strip_count,
+            chunk_channels,
+            sample_format,
+            chunk_bytes,
+            |i, planes| {
+                let (w_c, h_c) = decoder.chunk_data_dimensions(i);
+                if u64::from(w_c) != width {
+                    return Err(Error::format(
+                        path,
+                        format!("strip {i} width {w_c} does not match image width {width}"),
+                    ));
                 }
-            }
-        }
-        Ok(())
+                let start_row = u64::from(i % strips_per_plane) * u64::from(rows_per_strip);
+                if planar {
+                    sink(i / strips_per_plane, start_row, h_c, &planes[0])
+                } else {
+                    for (ch, bytes) in planes.iter().enumerate() {
+                        sink(ch as u32, start_row, h_c, bytes)?;
+                    }
+                    Ok(())
+                }
+            },
+        )
     }
 
     /// [`Self::read_bands`] for a tiled image: a tile only spans part of a
@@ -906,54 +1009,71 @@ impl TiffReader {
             tile_count
         };
         let tiles_across = (width as u32).div_ceil(tile_w);
-        let tiles_down = tiles_per_plane.div_ceil(tiles_across);
         // Chunky chunks carry every channel; planar chunks carry exactly one.
         let chunk_channels = if self.planar { 1 } else { total_channels };
-        let grids = if self.planar { total_channels } else { 1 };
+        let chunk_bytes =
+            tile_w as usize * tile_h as usize * chunk_channels as usize * sample_bytes;
 
-        for plane in 0..grids {
-            for tr in 0..tiles_down {
-                let mut row_bands: Vec<Vec<u8>> = Vec::new();
-                let mut band_rows: u32 = 0;
-                for tc in 0..tiles_across {
-                    let idx = plane * tiles_per_plane + tr * tiles_across + tc;
-                    let (w_c, h_c) = self.decoder.chunk_data_dimensions(idx);
+        // Tiles arrive in index order, so a tile row is assembled as its
+        // tiles come in and emitted when the last one lands.
+        let decoder = &self.decoder;
+        let planar = self.planar;
+        let mut row_bands: Vec<Vec<u8>> = Vec::new();
+        let mut band_rows: u32 = 0;
+        self.decode_chunks(
+            path,
+            tile_count,
+            chunk_channels,
+            sample_format,
+            chunk_bytes,
+            |idx, planes| {
+                let plane = idx / tiles_per_plane;
+                let within = idx % tiles_per_plane;
+                let tr = within / tiles_across;
+                let tc = within % tiles_across;
+                let (w_c, h_c) = decoder.chunk_data_dimensions(idx);
+                if tc == 0 {
                     band_rows = h_c;
-                    if row_bands.is_empty() {
-                        row_bands = (0..chunk_channels)
-                            .map(|_| vec![0u8; h_c as usize * width as usize * sample_bytes])
-                            .collect();
+                    row_bands = (0..chunk_channels)
+                        .map(|_| vec![0u8; h_c as usize * width as usize * sample_bytes])
+                        .collect();
+                }
+                let x_off = u64::from(tc) * u64::from(tile_w);
+                for (ch, src) in planes.iter().enumerate() {
+                    let dst = &mut row_bands[ch];
+                    for row in 0..h_c as usize {
+                        let src_off = row * w_c as usize * sample_bytes;
+                        let dst_off = (row * width as usize + x_off as usize) * sample_bytes;
+                        dst[dst_off..dst_off + w_c as usize * sample_bytes]
+                            .copy_from_slice(&src[src_off..src_off + w_c as usize * sample_bytes]);
                     }
-                    let result = self
-                        .decoder
-                        .read_chunk(idx)
-                        .map_err(|e| Error::format(path, format!("TIFF tile {idx}: {e}")))?;
-                    let planes =
-                        chunk_planes(path, result, chunk_channels, sample_format, &self.transform)?;
-                    let x_off = u64::from(tc) * u64::from(tile_w);
-                    for (ch, src) in planes.iter().enumerate() {
-                        let dst = &mut row_bands[ch];
-                        for row in 0..h_c as usize {
-                            let src_off = row * w_c as usize * sample_bytes;
-                            let dst_off = (row * width as usize + x_off as usize) * sample_bytes;
-                            dst[dst_off..dst_off + w_c as usize * sample_bytes].copy_from_slice(
-                                &src[src_off..src_off + w_c as usize * sample_bytes],
-                            );
+                }
+                if tc + 1 == tiles_across {
+                    let start_row = u64::from(tr) * u64::from(tile_h);
+                    if planar {
+                        sink(plane, start_row, band_rows, &row_bands[0])?;
+                    } else {
+                        for (ch, bytes) in row_bands.iter().enumerate() {
+                            sink(ch as u32, start_row, band_rows, bytes)?;
                         }
                     }
                 }
-                let start_row = u64::from(tr) * u64::from(tile_h);
-                if self.planar {
-                    sink(plane, start_row, band_rows, &row_bands[0])?;
-                } else {
-                    for (ch, bytes) in row_bands.iter().enumerate() {
-                        sink(ch as u32, start_row, band_rows, bytes)?;
-                    }
-                }
-            }
-        }
-        Ok(())
+                Ok(())
+            },
+        )
     }
+}
+
+/// A fresh `tiff` decoder on `file` with this crate's limits and the
+/// palette header patch (see [`PatchedReader`]) applied.
+fn open_decoder(
+    path: &Path,
+    file: File,
+    patch: &Option<(u64, Vec<u8>)>,
+) -> Result<Decoder<PatchedReader<File>>> {
+    Ok(Decoder::new(PatchedReader::new(file, patch.clone()))
+        .map_err(|e| Error::format(path, format!("TIFF header: {e}")))?
+        .with_limits(tiff_limits()))
 }
 
 /// Map the TIFF `SampleFormat` tag and a bit depth onto this reader's
@@ -1200,27 +1320,12 @@ fn deinterleave(
     sample_format: SampleFormat,
 ) -> Result<Vec<Vec<u8>>> {
     let channels = total_channels as usize;
-    let sample_bytes = sample_format.bytes();
-
-    macro_rules! planes_from {
-        ($data:expr) => {{
-            let data = $data;
-            let mut planes: Vec<Vec<u8>> = (0..channels)
-                .map(|_| Vec::with_capacity(data.len() / channels.max(1) * sample_bytes))
-                .collect();
-            for (i, v) in data.iter().enumerate() {
-                planes[i % channels].extend_from_slice(&v.to_ne_bytes());
-            }
-            planes
-        }};
-    }
-
     let planes = match (result, sample_format) {
-        (DecodingResult::U8(d), SampleFormat::U8) => planes_from!(d),
-        (DecodingResult::U16(d), SampleFormat::U16) => planes_from!(d),
-        (DecodingResult::U32(d), SampleFormat::U32) => planes_from!(d),
-        (DecodingResult::F32(d), SampleFormat::F32) => planes_from!(d),
-        (DecodingResult::F64(d), SampleFormat::F64) => planes_from!(d),
+        (DecodingResult::U8(d), SampleFormat::U8) => split_planes(&d, channels),
+        (DecodingResult::U16(d), SampleFormat::U16) => split_planes(&d, channels),
+        (DecodingResult::U32(d), SampleFormat::U32) => split_planes(&d, channels),
+        (DecodingResult::F32(d), SampleFormat::F32) => split_planes(&d, channels),
+        (DecodingResult::F64(d), SampleFormat::F64) => split_planes(&d, channels),
         (other, fmt) => {
             return Err(Error::format(
                 path,
@@ -1231,6 +1336,24 @@ fn deinterleave(
         }
     };
     Ok(planes)
+}
+
+/// Split pixel-interleaved `data` into one native-order byte plane per
+/// channel. A single channel is one copy; several are a typed strided
+/// gather per channel (no bounds checks, no per-sample byte pushes) and
+/// then one copy each to bytes.
+fn split_planes<T: bytemuck::Pod>(data: &[T], channels: usize) -> Vec<Vec<u8>> {
+    if channels <= 1 {
+        return vec![bytemuck::cast_slice(data).to_vec()];
+    }
+    let per_plane = data.len() / channels;
+    (0..channels)
+        .map(|ch| {
+            let mut typed: Vec<T> = Vec::with_capacity(per_plane);
+            typed.extend(data.chunks_exact(channels).map(|px| px[ch]));
+            bytemuck::cast_slice(&typed).to_vec()
+        })
+        .collect()
 }
 
 /// Expand a chunk of 8-bit `ColorMap` indices into three native-endian
@@ -2814,6 +2937,128 @@ mod tests {
             msg.to_lowercase().contains("iccprofile"),
             "expected error to name the IccProfile tag, got: {msg}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A distinct-valued RGB f32 image: sample `(c, y, x)` is unique, so a
+    /// band delivered out of place or from the wrong chunk cannot match.
+    struct Ramp {
+        w: u64,
+        h: u64,
+        c: u64,
+        planes: Vec<Vec<f32>>,
+    }
+
+    impl Ramp {
+        fn new(w: u64, h: u64, c: u64) -> Self {
+            let total = (w * h * c) as f32;
+            let planes = (0..c)
+                .map(|ch| {
+                    (0..w * h)
+                        .map(|i| (ch * w * h + i) as f32 / total)
+                        .collect()
+                })
+                .collect();
+            Self { w, h, c, planes }
+        }
+    }
+
+    impl crate::formats::PlanarRows<f32> for Ramp {
+        fn width(&self) -> u64 {
+            self.w
+        }
+        fn height(&self) -> u64 {
+            self.h
+        }
+        fn channels(&self) -> u64 {
+            self.c
+        }
+        fn row(&self, c: u64, y: u64) -> &[f32] {
+            let s = (y * self.w) as usize;
+            &self.planes[c as usize][s..s + self.w as usize]
+        }
+    }
+
+    /// Every band `read_bands` emits, in order, as `(channel, start_row,
+    /// rows, bytes)`.
+    #[allow(unused_imports)]
+    use crate::formats::PlanarRows as _;
+    fn collect_bands(reader: &mut TiffReader) -> Vec<(u32, u64, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        reader
+            .read_bands(&mut |ch, y, rows, bytes| {
+                out.push((ch, y, rows, bytes.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn parallel_strip_decode_delivers_the_same_bands_in_the_same_order() {
+        // 7x61 RGB f32 in 3-row strips (84-byte row, 256-byte target): 21
+        // strips, the last one a single row. Decoded on 1, 4 and 7 threads
+        // the band sequence must be identical, and equal to the pixels.
+        let dir = tmpdir("parallel-strips");
+        let path = dir.join("ramp.tif");
+        let img = Ramp::new(7, 61, 3);
+        crate::formats::tiff_write::encode::write_tiff_with_target(
+            &img,
+            &path,
+            &crate::formats::tiff_write::TiffWriteOptions::default(),
+            256,
+        )
+        .unwrap();
+
+        let mut reference = TiffReader::open(&path).unwrap();
+        reference.set_decode_threads(1);
+        let expected = collect_bands(&mut reference);
+        assert!(
+            expected.len() >= 21 * 3,
+            "expected many bands, got {}",
+            expected.len()
+        );
+        for (ch, y, rows, bytes) in &expected {
+            let want: Vec<u8> = (0..*rows as u64)
+                .flat_map(|r| {
+                    img.row(u64::from(*ch), y + r)
+                        .iter()
+                        .flat_map(|v| v.to_ne_bytes())
+                })
+                .collect();
+            assert_eq!(bytes, &want, "band ch {ch} row {y}");
+        }
+
+        for threads in [4usize, 7] {
+            let mut reader = TiffReader::open(&path).unwrap();
+            reader.set_decode_threads(threads);
+            assert_eq!(collect_bands(&mut reader), expected, "{threads} threads");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_tile_decode_matches_single_threaded() {
+        // 300x200 RGB u16 in 64-pixel tiles: 5x4 = 20 tiles, partial on the
+        // right and bottom edges, decoded on 1 and 6 threads.
+        use crate::formats::tiff_write::{BitDepth, Layout, TiffWriteOptions, write_tiff};
+        let dir = tmpdir("parallel-tiles");
+        let path = dir.join("ramp.tif");
+        let img = Ramp::new(300, 200, 3);
+        let opts = TiffWriteOptions {
+            bit_depth: BitDepth::U16,
+            layout: Layout::Tiles { size: 128 },
+            ..Default::default()
+        };
+        write_tiff(&img, &path, &opts).unwrap();
+
+        let mut reference = TiffReader::open(&path).unwrap();
+        reference.set_decode_threads(1);
+        let expected = collect_bands(&mut reference);
+        assert_eq!(expected.len(), 2 * 3, "two tile rows x three channels");
+
+        let mut reader = TiffReader::open(&path).unwrap();
+        reader.set_decode_threads(6);
+        assert_eq!(collect_bands(&mut reader), expected);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

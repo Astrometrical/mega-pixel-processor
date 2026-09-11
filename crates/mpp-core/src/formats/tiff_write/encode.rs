@@ -6,12 +6,9 @@
 //! encode loop through the crate-internal `RowSource` trait, which adapts a
 //! [`PlanarRows`] of one type to the writer's output type `O`.
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
 
 use tiff::encoder::compression::{
     CompressionAlgorithm, Compressor, Deflate, DeflateLevel, Lzw, Packbits, Uncompressed,
@@ -23,6 +20,7 @@ use super::options::{AlphaMode, Compression, Container, Layout, ResolutionUnit, 
 use super::sample::Sample;
 use crate::formats::PlanarRows;
 use crate::formats::tiff::BitDepth;
+use crate::pipeline::{self, Pipeline};
 use crate::{Error, Result};
 
 /// Target uncompressed bytes per strip; rows per strip derives from this.
@@ -48,10 +46,7 @@ impl Default for EncodeTuning {
     fn default() -> Self {
         Self {
             target_block_bytes: TARGET_BLOCK_BYTES,
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .clamp(1, MAX_ENCODE_THREADS),
+            threads: pipeline::worker_count(usize::MAX, MAX_ENCODE_THREADS),
         }
     }
 }
@@ -155,7 +150,7 @@ pub fn write_tiff_with_progress(
 /// [`write_tiff`], parameterized on the target block size — split out so
 /// tests can force multi-block output without a multi-gigabyte image.
 #[cfg(test)]
-fn write_tiff_with_target(
+pub(crate) fn write_tiff_with_target(
     img: &(impl PlanarRows<f32> + Sync),
     path: &Path,
     opts: &TiffWriteOptions,
@@ -527,106 +522,6 @@ impl<O: Sample> BlockEncoder<O> {
     }
 }
 
-/// Shared state of the encode pipeline: workers claim block indices from
-/// `next`, encode them, and park the bytes in `ready`; the writer drains
-/// `ready` in index order. `window` bounds how far ahead of the writer a
-/// worker may claim, so no more than that many encoded blocks are ever held
-/// in memory whatever the thread count.
-struct Pipeline {
-    next: AtomicUsize,
-    window: usize,
-    state: Mutex<PipelineState>,
-    changed: Condvar,
-}
-
-struct PipelineState {
-    /// Blocks the writer has written so far (`0..written` are on disk).
-    written: usize,
-    /// Encoded blocks awaiting the writer, by index.
-    ready: BTreeMap<usize, Vec<u8>>,
-    /// First failure from either side; stops everyone.
-    failed: Option<String>,
-}
-
-impl Pipeline {
-    fn new(window: usize) -> Self {
-        Self {
-            next: AtomicUsize::new(0),
-            window,
-            state: Mutex::new(PipelineState {
-                written: 0,
-                ready: BTreeMap::new(),
-                failed: None,
-            }),
-            changed: Condvar::new(),
-        }
-    }
-
-    fn fail(&self, message: String) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.failed.get_or_insert(message);
-        self.changed.notify_all();
-    }
-
-    /// Worker loop: encode blocks until none are left or someone failed.
-    fn run_worker<O, S>(&self, src: &S, blocks: &[BlockSpec], mut enc: BlockEncoder<O>)
-    where
-        O: Sample,
-        S: RowSource<O> + ?Sized,
-    {
-        loop {
-            let idx = self.next.fetch_add(1, Ordering::Relaxed);
-            if idx >= blocks.len() {
-                return;
-            }
-            // Stay within the window: block `idx` may only be encoded once
-            // the writer is within `window` blocks of it.
-            {
-                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                while st.failed.is_none() && idx >= st.written + self.window {
-                    st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
-                }
-                if st.failed.is_some() {
-                    return;
-                }
-            }
-            match enc.encode(src, &blocks[idx]) {
-                Ok(bytes) => {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.ready.insert(idx, bytes);
-                    self.changed.notify_all();
-                }
-                Err(e) => {
-                    self.fail(format!("TIFF encode: {e}"));
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Writer side: the bytes of block `idx`, once a worker has produced
-    /// them, or the pipeline's failure.
-    fn take(&self, idx: usize) -> std::result::Result<Vec<u8>, String> {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if let Some(failed) = &st.failed {
-                return Err(failed.clone());
-            }
-            if let Some(bytes) = st.ready.remove(&idx) {
-                return Ok(bytes);
-            }
-            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    /// Writer side: block `idx` is on disk; workers may advance the window.
-    fn written(&self, idx: usize) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.written = idx + 1;
-        self.changed.notify_all();
-    }
-}
-
 /// Where each block landed in the file: the `StripOffsets`/`StripByteCounts`
 /// (or tile) lists the IFD needs, in block order.
 struct BlockTables<K: TiffKind> {
@@ -662,15 +557,25 @@ where
 {
     let (w, h, c) = (src.width(), src.height(), src.channels());
     let threads = tuning.threads.clamp(1, blocks.len().max(1));
-    let pipeline = Pipeline::new(threads * 2);
+    let pipeline = Pipeline::<Vec<u8>>::new(blocks.len(), threads * 2);
     let mut offsets = Vec::with_capacity(blocks.len());
     let mut byte_counts = Vec::with_capacity(blocks.len());
 
     std::thread::scope(|scope| -> Result<()> {
         for _ in 0..threads {
             let pipeline = &pipeline;
-            let enc = BlockEncoder::<O>::new(opts, w, c, samples_per_row);
-            scope.spawn(move || pipeline.run_worker(src, blocks, enc));
+            let mut enc = BlockEncoder::<O>::new(opts, w, c, samples_per_row);
+            scope.spawn(move || {
+                while let Some(idx) = pipeline.claim() {
+                    match enc.encode(src, &blocks[idx]) {
+                        Ok(bytes) => pipeline.complete(idx, bytes),
+                        Err(e) => {
+                            pipeline.fail(format!("TIFF encode: {e}"));
+                            return;
+                        }
+                    }
+                }
+            });
         }
 
         for (idx, spec) in blocks.iter().enumerate() {
@@ -691,7 +596,7 @@ where
                 pipeline.fail(format!("TIFF encode: {e}"));
                 return Err(Error::format(path, format!("TIFF encode: {e}")));
             }
-            pipeline.written(idx);
+            pipeline.taken(idx);
             if let Some(rows) = spec.rows_done_after {
                 progress(rows, h);
             }
