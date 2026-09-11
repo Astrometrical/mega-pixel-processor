@@ -121,9 +121,11 @@ impl<O: Sample, I: PlanarRows<O> + ?Sized> RowSource<O> for NativeSource<'_, I> 
 }
 
 /// Write `img` to `path` as a TIFF or BigTIFF per `opts`, streaming block by
-/// block in constant memory. Samples arrive in the unit-range `f32` domain
-/// and are converted to the output sample format [`TiffWriteOptions::bit_depth`]
-/// selects.
+/// block in memory bounded by the thread count, not the image size: blocks
+/// are gathered and compressed on worker threads (every core up to 16) and
+/// written in file order, at most two per worker in flight. Samples arrive
+/// in the unit-range `f32` domain and are converted to the output sample
+/// format [`TiffWriteOptions::bit_depth`] selects.
 ///
 /// Options are validated first, so an impossible request fails before the
 /// output file is created. Grayscale, gray+alpha, RGB and RGBA are

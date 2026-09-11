@@ -510,9 +510,11 @@ enum Transform {
 /// Opens a file and validates its header up front (see [`TiffReader::open`]);
 /// [`TiffReader::read_bands`] then decodes the image chunk-by-chunk (strip or
 /// tile, whichever the file uses) and hands the caller de-interleaved,
-/// native-endian per-channel row bands in chunk order. Peak memory is one
-/// decoded chunk (plus, for tiled images, one row of tile bands) — never the
-/// whole image.
+/// native-endian per-channel row bands in chunk order. Chunks are decoded
+/// on worker threads (see [`TiffReader::set_decode_threads`]) and delivered
+/// in order; peak memory is a bounded window of decoded chunks (256 MiB, or
+/// one chunk if a single chunk is larger) plus, for tiled images, one row
+/// of tile bands — never the whole image.
 #[derive(Debug)]
 pub struct TiffReader {
     decoder: Decoder<PatchedReader<File>>,
@@ -879,9 +881,9 @@ impl TiffReader {
     /// rows as usize * width as usize * sample_format.bytes()`. Channels are
     /// `0..total_channels()`; bands cover every row of every channel exactly
     /// once. Order is chunk order (top-down for strips; for tiled images, a
-    /// full grid row of tiles is decoded and de-tiled into full-width bands
-    /// before any band of that tile-row is emitted, so at most one tile-row
-    /// of chunks is held at a time).
+    /// full grid row of tiles is de-tiled into full-width bands before any
+    /// band of that tile-row is emitted). Chunks are decoded in parallel and
+    /// delivered in order, so `sink` is always called from this thread.
     #[allow(clippy::type_complexity)]
     pub fn read_bands(
         &mut self,

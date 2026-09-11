@@ -68,7 +68,9 @@ being better, not on being the only place the files work.
   linked): demand-driven/streaming, constant memory on multi-GB images,
   `tiffsave` with `bigtiff` option, `dzsave` for DZI pyramids.
   **Decided (2026-08-20):** hybrid. The XISF→BigTIFF leg is pure Rust
-  (`tiff` crate, `TiffEncoder::new_big`, strip-streamed, constant memory);
+  (`tiff` crate, `TiffEncoder::new_big`, strip-streamed; since 2026-09-11
+  blocks are compressed on worker threads and written in order through a
+  bounded window, so memory is a few blocks per core, not the image);
   vips is used by *spawning the official `vips` binaries* for `dzsave` and
   mainstream-format conversion — no FFI bindings, no LGPL linking
   obligations. Revisit bindings only if process spawning proves limiting.
