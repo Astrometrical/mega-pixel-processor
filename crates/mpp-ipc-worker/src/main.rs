@@ -146,10 +146,10 @@ struct WriteSetup {
 ///
 /// Two shapes, and only two, because `mpp-core` offers exactly two entry
 /// points: `f32` bands are the unit-range domain
-/// [`write_tiff`] converts from,
+/// [`write_tiff_with_progress`] converts from,
 /// so an `f32` session can target any output `bit_depth` (this is the v1/v2
 /// behaviour, unchanged); every other band type is written verbatim by
-/// [`write_tiff_native`],
+/// [`write_tiff_native_with_progress`],
 /// which is the whole point of protocol v3 and requires the output format
 /// to match — [`validate_init`] rejects a mismatch up front rather than
 /// letting it surface after a multi-gigabyte staging run.

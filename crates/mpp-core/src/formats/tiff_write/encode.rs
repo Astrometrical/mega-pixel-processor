@@ -28,8 +28,8 @@ const TARGET_BLOCK_BYTES: u64 = 4 << 20;
 /// Encode-progress observer: called as `(rows_done, rows_total)` each time a
 /// whole block row (a strip, or a full row of tiles) has reached the file,
 /// where `rows_total` is the image height. The final call always reports
-/// `rows_done == rows_total`. Callers that want no reports pass
-/// [`no_progress`].
+/// `rows_done == rows_total`. The plain [`write_tiff`]/[`write_tiff_native`]
+/// entry points report nothing.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(u64, u64);
 
 /// A [`ProgressFn`] that ignores every report.
