@@ -69,10 +69,12 @@ public:
 
    // -- Read-path lifecycle (PCL_FILEFORMAT_API.md §R). The core drives an
    //    interactive open through whole-image ReadImage (never ReadSamples --
-   //    CanReadIncrementally() is false); the overload matching the geometry
-   //    declared by Open() fires, so only that one allocates + decodes, and
-   //    the others throw (defensive per the "Unknowns" discipline: the
-   //    headers do not promise which overload the core will call).
+   //    CanReadIncrementally() is false). Which overload fires is the
+   //    caller's choice of sample format, not the file's: File > Open asks
+   //    for the format Open() declared, but a process loading its own inputs
+   //    (SubframeSelector in f32, for one) asks for its working format
+   //    whatever the file stores. Every overload therefore decodes the
+   //    file's native samples and converts each band into its own type.
 
    void ReadImage( pcl::Image& image ) override;
    void ReadImage( pcl::DImage& image ) override;
@@ -150,14 +152,14 @@ private:
    template <class Img>
    void WriteWholeImage( const Img& image );
 
-   // Whole-image read for the overload whose sample type matches the file's
-   // declared bit_depth (\a wantDepth, e.g. "u16"): verifies the dispatch,
-   // allocates \a image, runs a mpp::ReadSession, and copies each native
-   // per-channel row band into the matching channel plane at its start row.
-   // A non-matching overload throws (only the matching one should ever fire).
+   // Whole-image read behind every ReadImage overload: allocates \a image in
+   // the geometry Open() declared, runs a mpp::ReadSession, and lands each
+   // per-channel row band in the matching channel plane at its start row.
+   // Bands arrive in the file's native sample type and are converted into
+   // the destination's (any overload may be called for any file; see above).
    // Any mpp::HostError becomes a pcl::Error carrying the worker's message.
    template <class Img>
-   void ReadInto( Img& image, const char* wantDepth );
+   void ReadInto( Img& image );
 
    String path_;                  // stored at Create()/Open(); may be relative (FileFormatImplementation.h:486-489)
    std::string worker_path_;      // resolved at Create()/Open() via dladdr (UTF-8)

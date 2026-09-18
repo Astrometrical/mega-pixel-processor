@@ -271,9 +271,19 @@ limited to files this module itself wrote:
   Deflate/PackBits).
 - **Colour/sample support**: grayscale or RGB, with or without an alpha
   channel (`ImageMeta.alpha`/`ImageMeta.channels`,
-  `docs/pi-protocol.md` §9.2); native `u8`/`u16`/`u32`/`f32`/`f64` samples,
-  decoded and handed to PixInsight at their **native** bit depth. Both
-  directions are native since phase 4.
+  `docs/pi-protocol.md` §9.2); native `u8`/`u16`/`u32`/`f32`/`f64` samples.
+  `Open()` declares the file's native format, so File > Open lands the
+  image at its native bit depth -- but the `ReadImage` overload the core
+  calls is the **caller's** choice of sample format, not the file's
+  (`FileFormatInstance.h` documents each as "reads the current image in
+  <format>"): a process loading its own inputs (SubframeSelector measures in
+  32-bit float, whatever the file) calls the overload for its working
+  format. Every overload therefore decodes the native samples and converts
+  each band into the requested type with PCL's own `pixel_traits::Copy`
+  rescaling (integers onto their full range, floats onto [0,1]) -- the
+  read-side mirror of the `WriteSamples` rule under "Write: sample-format
+  mapping". An earlier version threw on a mismatch; SubframeSelector on a
+  u16 file proved that wrong.
 - **Palette (`ColorMap`) images**: expanded to RGB by looking the indices up
   in the file's own `ColorMap`. The result reports a `u16` sample format,
   because `ColorMap` entries are 16-bit — a palette file therefore opens as
@@ -531,7 +541,12 @@ is the human's manual check:
    4, or an independently-produced TIFF/BigTIFF in the supported subset
    (see "Read support"). Confirm it opens with the correct geometry and
    colour space, and visually verify pixel content against a known-good
-   render of the same file (e.g. `mpp convert <file> check.png`).
+   render of the same file (e.g. `mpp convert <file> check.png`). Then load
+   the same file through a process that reads its own inputs in a format
+   other than the file's -- SubframeSelector on a `u16` file is the
+   reference case (it measures in f32) -- and confirm it measures rather
+   than erroring, with the same star statistics as the natively-opened
+   window: that exercises the read-side sample conversion.
 8. Type an output path with no TIFF-family extension and confirm
    PixInsight's Console shows the rename warning and the file lands at
    `<name>.tiff` — then confirm that renamed file re-opens via step 7's

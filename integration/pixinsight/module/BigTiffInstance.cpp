@@ -557,23 +557,72 @@ void BigTiffInstance::Close()
 
 // ----------------------------------------------------------------------------
 
+/*
+ * Native sample width of a read-mode `ImageMeta.bit_depth` value, in bytes:
+ * the width of the samples the worker places in shm, which is always the
+ * file's own (docs/pi-protocol.md §9.2: the worker never converts on read).
+ */
+static uint64_t NativeSampleBytes( const std::string& bitDepth )
+{
+   if ( bitDepth == "u8" )
+      return 1;
+   if ( bitDepth == "u16" )
+      return 2;
+   if ( bitDepth == "u32" || bitDepth == "f32" )
+      return 4;
+   if ( bitDepth == "f64" )
+      return 8;
+   // Open() already refused anything else; a value reaching here means the
+   // file changed between the probe and the read, which the geometry
+   // cross-check below reports by name.
+   return 0;
+}
+
+/*
+ * Convert one band of `n` native `bitDepth` samples at `src` into `dst`,
+ * rescaling between sample types the way PixInsight itself does
+ * (pcl::GenericPixelTraits::ToSample: integer samples map onto their full
+ * range, floats onto [0,1]). A band whose native type is already the
+ * destination's is a straight copy.
+ */
 template <class Img>
-void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
+static void ConvertBand( typename Img::sample* dst, const void* src, size_t n,
+                         const std::string& bitDepth )
+{
+   using traits = typename Img::pixel_traits;
+   if ( bitDepth == "u8" )
+      traits::Copy( dst, static_cast<const uint8*>( src ), n );
+   else if ( bitDepth == "u16" )
+      traits::Copy( dst, static_cast<const uint16*>( src ), n );
+   else if ( bitDepth == "u32" )
+      traits::Copy( dst, static_cast<const uint32*>( src ), n );
+   else if ( bitDepth == "f32" )
+      traits::Copy( dst, static_cast<const float*>( src ), n );
+   else if ( bitDepth == "f64" )
+      traits::Copy( dst, static_cast<const double*>( src ), n );
+   else
+      throw mpp::HostError( "worker sent a band in an unsupported sample format" );
+}
+
+template <class Img>
+void BigTiffInstance::ReadInto( Img& image )
 {
    using sample = typename Img::sample;
 
    if ( !open_ || !read_mode_ )
       throw Error( "BigTIFF: internal error: ReadImage() called before a successful Open()." );
 
-   // The core dispatches to the overload whose sample type matches the format
-   // declared by Open() (native fidelity); a mismatched overload should never
-   // fire. Fail loudly rather than silently reinterpret samples of the wrong
-   // width (Unknowns: the headers do not promise which overload is called).
-   if ( read_bit_depth_ != wantDepth )
-      throw Error( String().Format(
-         "BigTIFF: internal error: ReadImage() dispatched to the \"%s\" overload but the "
-         "file declares \"%s\" samples (only the matching overload should be called).",
-         wantDepth, read_bit_depth_.c_str() ) );
+   // The overload the core calls names the sample format the CALLER wants,
+   // not the file's: File > Open asks for the native format Open() declared,
+   // but a process loading its own inputs (SubframeSelector measuring in
+   // f32, ImageIntegration, a script's ReadImage(ImageVariant&)) asks for its
+   // working format whatever the file stores -- FileFormatInstance.h
+   // documents each overload as "reads the current image in <format>". So
+   // the worker streams the file's native samples and each band is converted
+   // into the destination's sample type here (ConvertBand), the read-side
+   // mirror of the write path's WriteSamples rule (README, "Write:
+   // sample-format mapping"). An earlier version threw on a mismatch; the
+   // first process to load a u16 file in f32 proved that wrong.
 
    const int width = int( read_width_ );
    const int height = int( read_height_ );
@@ -584,10 +633,13 @@ void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
    // flip.
    image.AllocateData( width, height, channels, read_color_space_ );
 
-   // Size the shm slots the host provisions: ~4 MiB of native samples per
-   // band, at least one row, at most the whole image (mirrors the write path's
-   // band sizing, inverted).
-   const uint64_t sampleBytes = uint64_t( sizeof( sample ) );
+   // Size the shm slots the host provisions: ~4 MiB of NATIVE samples per
+   // band (the width the worker actually writes, not the destination's), at
+   // least one row, at most the whole image (mirrors the write path's band
+   // sizing, inverted).
+   const uint64_t sampleBytes = NativeSampleBytes( read_bit_depth_ );
+   if ( sampleBytes == 0 )
+      throw Error( "BigTIFF: the file's geometry changed between opening and reading it." );
    const uint64_t kTargetBandBytes = uint64_t( 4 )*1024*1024;
    uint64_t bandRows = kTargetBandBytes/( read_width_*sampleBytes );
    bandRows = std::max<uint64_t>( 1, std::min<uint64_t>( bandRows, read_height_ ) );
@@ -637,12 +689,12 @@ void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
             if ( startRow + rows > read_height_ )
                throw mpp::HostError( "worker sent a band exceeding the image height" );
 
-            // Native copy: the incoming samples are already `sample`-typed,
-            // row-major, native-endian -- exactly the destination plane's
-            // layout. PixelData(ch) is the channel's first sample; offset by
-            // startRow full rows.
+            // The incoming samples are the file's native type, row-major,
+            // native-endian -- the destination plane's layout, modulo sample
+            // type. PixelData(ch) is the channel's first sample; offset by
+            // startRow full rows and convert (or plainly copy) the band in.
             sample* dst = image.PixelData( int( ch ) ) + size_t( startRow )*size_t( width );
-            std::memcpy( dst, samples, size_t( rows )*size_t( width )*sizeof( sample ) );
+            ConvertBand<Img>( dst, samples, size_t( rows )*size_t( width ), read_bit_depth_ );
 
             rowsRead += rows;
             progress.Update( kStageReading, rowsRead, rowsTotal );
@@ -656,27 +708,27 @@ void BigTiffInstance::ReadInto( Img& image, const char* wantDepth )
 
 void BigTiffInstance::ReadImage( pcl::Image& image )
 {
-   ReadInto( image, "f32" );
+   ReadInto( image );
 }
 
 void BigTiffInstance::ReadImage( pcl::DImage& image )
 {
-   ReadInto( image, "f64" );
+   ReadInto( image );
 }
 
 void BigTiffInstance::ReadImage( UInt8Image& image )
 {
-   ReadInto( image, "u8" );
+   ReadInto( image );
 }
 
 void BigTiffInstance::ReadImage( UInt16Image& image )
 {
-   ReadInto( image, "u16" );
+   ReadInto( image );
 }
 
 void BigTiffInstance::ReadImage( UInt32Image& image )
 {
-   ReadInto( image, "u32" );
+   ReadInto( image );
 }
 
 // ----------------------------------------------------------------------------
