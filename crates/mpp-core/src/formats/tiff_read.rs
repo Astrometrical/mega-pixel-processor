@@ -82,26 +82,72 @@ const TAG_REFERENCE_BLACK_WHITE: u16 = 532;
 /// the boundary from the read side.
 const ICC_PROFILE_MAX_BYTES: usize = 16 << 20;
 
-/// `tiff` 0.11.3's `Limits` (the decoder's default is 256 MiB) exists to
-/// bound how much a hostile header can make the decoder allocate before
-/// any of it is validated — but its `decoding_buffer_size` field also
-/// gates a BYTE/UNDEFINED-typed tag's byte count, divided by
-/// `size_of::<Value>()` (an implementation detail of the crate's own
-/// `Entry::vec_with_capacity`, not part of its public contract, hence
-/// computed here rather than hardcoded). At the crate's default that
-/// ceiling is exactly half of [`ICC_PROFILE_MAX_BYTES`] — comfortably
-/// under our own writer's sanctioned cap, so a legitimately-written large
-/// profile would silently fail to resolve. Scale `decoding_buffer_size` up
-/// (never down, so the unrelated per-chunk pixel-decode headroom this same
-/// field governs is only ever widened, never narrowed) just enough to
-/// cover [`ICC_PROFILE_MAX_BYTES`].
-fn tiff_limits() -> Limits {
+/// The decoder limits to open a file of `file_len` bytes with, before its
+/// header has been read; [`widen_for_image`] finishes them once it has.
+///
+/// `tiff` 0.11.3's `Limits` (the decoder's defaults are 256 MiB decoded,
+/// 128 MiB on disk per chunk) exists to bound how much a hostile header can
+/// make the decoder allocate before any of it is validated. Two of its
+/// fields matter here:
+///
+/// - `intermediate_buffer_size` caps a single chunk's on-disk byte count
+///   (`StripByteCounts`/`TileByteCounts`), whatever the compression. The
+///   crate's 128 MiB default refuses the whole-image single strip that many
+///   exporters write (a 4854x4812 RGB 16-bit Vaonis Vespera export is 133.7
+///   MiB in one strip). No chunk can legitimately be longer than the file
+///   it lives in, so the ceiling is exactly `file_len`: every well-formed
+///   file passes, and a byte count past the end of the file is still
+///   refused as a limit violation rather than read to a short-read error —
+///   or, under an unlimited decoder, allocated at the size of the lie.
+/// - `decoding_buffer_size` caps a decoded chunk (see [`widen_for_image`])
+///   but also gates a BYTE/UNDEFINED-typed tag's byte count, divided by
+///   `size_of::<Value>()` (an implementation detail of the crate's own
+///   `Entry::vec_with_capacity`, not part of its public contract, hence
+///   computed here rather than hardcoded). At the crate's default that
+///   ceiling is exactly half of [`ICC_PROFILE_MAX_BYTES`] — comfortably
+///   under our own writer's sanctioned cap, so a legitimately-written large
+///   profile would silently fail to resolve. Scale it up (never down) just
+///   enough to cover [`ICC_PROFILE_MAX_BYTES`].
+fn tiff_limits(file_len: u64) -> Limits {
     let mut limits = Limits::default();
     let needed = ICC_PROFILE_MAX_BYTES.saturating_mul(std::mem::size_of::<Value>());
     if needed > limits.decoding_buffer_size {
         limits.decoding_buffer_size = needed;
     }
+    limits.intermediate_buffer_size = usize::try_from(file_len).unwrap_or(usize::MAX);
     limits
+}
+
+/// Widen `limits.decoding_buffer_size` so the decoder can hold any one
+/// chunk of a `width` x `height` image with `samples` samples per pixel of
+/// `bit_depth` bits, laid out in `chunk_dims` (width, height) chunks.
+///
+/// A decoded chunk is never larger than the whole image — a single-strip
+/// file's one chunk *is* the image, and a reader that handles multi-GB
+/// images has committed to that buffer already — nor than its own padded
+/// grid cell (a tile grid overhangs an image smaller than one tile; the
+/// crate allocates the full cell). The ceiling becomes the largest of
+/// those and whatever it already was, so it is only ever widened: the
+/// ICC-driven baseline from [`tiff_limits`] survives, and the crate's
+/// protection against a header that lies about its geometry is reduced to
+/// exactly what this reader would have to allocate to read the image
+/// anyway.
+fn widen_for_image(
+    limits: &mut Limits,
+    width: u32,
+    height: u32,
+    chunk_dims: (u32, u32),
+    samples: u16,
+    bit_depth: u8,
+) {
+    let sample_bytes = usize::from(bit_depth.div_ceil(8)).saturating_mul(usize::from(samples));
+    let area = |w: u32, h: u32| (w as usize).saturating_mul(h as usize);
+    let image_bytes = area(width, height).saturating_mul(sample_bytes);
+    let chunk_bytes = area(chunk_dims.0, chunk_dims.1).saturating_mul(sample_bytes);
+    limits.decoding_buffer_size = limits
+        .decoding_buffer_size
+        .max(image_bytes)
+        .max(chunk_bytes);
 }
 
 /// Native sample format of a decoded TIFF.
@@ -524,6 +570,10 @@ pub struct TiffReader {
     /// [`PatchedReader`]), kept so [`Self::read_bands`] can open one decoder
     /// per worker thread.
     patch: Option<(u64, Vec<u8>)>,
+    /// The decoder limits sized to this file and image (see
+    /// [`tiff_limits`] and [`widen_for_image`]), kept for the same reason
+    /// as `patch`: every per-worker decoder must read under the same ones.
+    limits: Limits,
     /// Worker threads for chunk decoding; see [`Self::set_decode_threads`].
     decode_threads: usize,
     /// What each decoded chunk's samples must become.
@@ -559,7 +609,9 @@ impl TiffReader {
             .map(|p| p.patch_to(PHOTOMETRIC_BLACK_IS_ZERO));
         file.rewind().map_err(|e| Error::io(path, e))?;
 
-        let mut decoder = open_decoder(path, file, &patch)?;
+        let file_len = file.metadata().map_err(|e| Error::io(path, e))?.len();
+        let mut limits = tiff_limits(file_len);
+        let mut decoder = open_decoder(path, file, &patch, &limits)?;
 
         let (width, height) = decoder
             .dimensions()
@@ -769,6 +821,23 @@ impl TiffReader {
         let planar =
             planar_config != 1 && total_channels > 1 && matches!(transform, Transform::Direct);
 
+        // Only now — after every header tag, the ICC profile included, has
+        // been read under the finite ICC-driven baseline — size the
+        // decoded-chunk ceiling to the image (see `widen_for_image`). The
+        // order matters: `icc_profile_tag` relies on that baseline to refuse
+        // a profile past `ICC_PROFILE_MAX_BYTES`, and a big enough image
+        // would widen it out of reach. Pixel decoding is the only thing that
+        // needs the wider ceiling, and none of it has happened yet.
+        widen_for_image(
+            &mut limits,
+            width,
+            height,
+            decoder.chunk_dimensions(),
+            color_type.num_samples(),
+            color_type.bit_depth(),
+        );
+        let decoder = decoder.with_limits(limits.clone());
+
         let info = TiffInfo {
             width: u64::from(width),
             height: u64::from(height),
@@ -784,6 +853,7 @@ impl TiffReader {
             info,
             path: path.to_path_buf(),
             patch,
+            limits,
             decode_threads: pipeline::worker_count(usize::MAX, MAX_DECODE_THREADS),
             transform,
             planar,
@@ -819,6 +889,7 @@ impl TiffReader {
         let pipeline = Pipeline::<Vec<Vec<u8>>>::new(count, window);
         let transform = &self.transform;
         let patch = &self.patch;
+        let limits = &self.limits;
 
         std::thread::scope(|scope| -> Result<()> {
             for _ in 0..threads {
@@ -829,7 +900,7 @@ impl TiffReader {
                     // parallel handles on the same file.
                     let mut decoder = match File::open(path)
                         .map_err(|e| Error::io(path, e))
-                        .and_then(|file| open_decoder(path, file, patch))
+                        .and_then(|file| open_decoder(path, file, patch, limits))
                     {
                         Ok(d) => d,
                         Err(e) => {
@@ -1066,16 +1137,17 @@ impl TiffReader {
     }
 }
 
-/// A fresh `tiff` decoder on `file` with this crate's limits and the
-/// palette header patch (see [`PatchedReader`]) applied.
+/// A fresh `tiff` decoder on `file` with `limits` (see [`tiff_limits`])
+/// and the palette header patch (see [`PatchedReader`]) applied.
 fn open_decoder(
     path: &Path,
     file: File,
     patch: &Option<(u64, Vec<u8>)>,
+    limits: &Limits,
 ) -> Result<Decoder<PatchedReader<File>>> {
     Ok(Decoder::new(PatchedReader::new(file, patch.clone()))
         .map_err(|e| Error::format(path, format!("TIFF header: {e}")))?
-        .with_limits(tiff_limits()))
+        .with_limits(limits.clone()))
 }
 
 /// Map the TIFF `SampleFormat` tag and a bit depth onto this reader's
@@ -3061,6 +3133,142 @@ mod tests {
         let mut reader = TiffReader::open(&path).unwrap();
         reader.set_decode_threads(6);
         assert_eq!(collect_bands(&mut reader), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_single_strip_past_the_crates_intermediate_limit_is_read() {
+        // 11600x11600 Gray8 written as ONE uncompressed strip: 134,560,000
+        // bytes, just past the `tiff` crate's default 128 MiB
+        // `Limits::intermediate_buffer_size`, which caps a single chunk's
+        // on-disk byte count. Whole-image single-strip files are what many
+        // camera/app exporters write (a Vaonis Vespera export is the
+        // reference case), so the reader must accept any chunk the file
+        // itself can hold. Gray8 keeps the fixture as small as it can be
+        // while still crossing the default ceiling.
+        use crate::formats::tiff::BitDepth;
+        use crate::formats::tiff_write::TiffWriteOptions;
+        use crate::formats::tiff_write::encode::write_tiff_with_target;
+        const SIDE: u64 = 11600;
+        const _: () = assert!(
+            SIDE * SIDE > 128 << 20,
+            "fixture must exceed the 128 MiB default"
+        );
+        let dir = tmpdir("single-strip-huge");
+        let path = dir.join("one-strip.tif");
+        write_tiff_with_target(
+            &synth_planar(SIDE, SIDE, 1),
+            &path,
+            &TiffWriteOptions {
+                bit_depth: BitDepth::U8,
+                ..Default::default()
+            },
+            u64::MAX, // every row into one strip
+        )
+        .unwrap();
+
+        let mut reader = TiffReader::open(&path).unwrap();
+        assert_eq!(
+            reader.decoder.strip_count().unwrap(),
+            1,
+            "fixture must be a single strip"
+        );
+        let mut rows_seen = 0u64;
+        let mut bytes_seen = 0u64;
+        reader
+            .read_bands(&mut |_, _, rows, bytes| {
+                rows_seen += u64::from(rows);
+                bytes_seen += bytes.len() as u64;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows_seen, SIDE);
+        assert_eq!(bytes_seen, SIDE * SIDE);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn limits_are_bounded_by_the_file_and_widened_to_the_image() {
+        // A chunk's on-disk byte count can never legitimately exceed the
+        // file it lives in: `intermediate_buffer_size` is exactly the file
+        // length. Its decoded size can never exceed the whole image (a
+        // single-strip file's one chunk *is* the image) or its own padded
+        // grid cell (a tile grid overhangs a small image): decoding
+        // headroom is the largest of those and the ICC-driven baseline.
+        let baseline = tiff_limits(0).decoding_buffer_size;
+
+        let small = tiff_limits(4096);
+        assert_eq!(small.intermediate_buffer_size, 4096);
+        assert_eq!(small.decoding_buffer_size, baseline);
+
+        // 20000 x 20000 RGB 16-bit = 2.4e9 bytes: past the baseline, so the
+        // image itself sets the decoded ceiling.
+        let mut big = tiff_limits(1 << 30);
+        widen_for_image(&mut big, 20000, 20000, (20000, 20000), 3, 16);
+        assert_eq!(big.intermediate_buffer_size, 1 << 30);
+        assert_eq!(big.decoding_buffer_size, 20000 * 20000 * 3 * 2);
+
+        // A 4x4 image in a 256x256 tile grid: one padded tile out-sizes the
+        // image, but neither reaches the baseline.
+        let mut tiny = tiff_limits(4096);
+        widen_for_image(&mut tiny, 4, 4, (256, 256), 1, 8);
+        assert_eq!(tiny.decoding_buffer_size, baseline);
+
+        // The padded chunk can be the largest term: a 4-row image whose
+        // tiles are 8192 x 8192 x RGBA f32 = 1 GiB per tile.
+        let mut padded = tiff_limits(4096);
+        widen_for_image(&mut padded, 4, 4, (8192, 8192), 4, 32);
+        assert_eq!(padded.decoding_buffer_size, 8192 * 8192 * 4 * 4);
+
+        // Never narrowed by a later, smaller image.
+        widen_for_image(&mut padded, 4, 4, (4, 4), 1, 8);
+        assert_eq!(padded.decoding_buffer_size, 8192 * 8192 * 4 * 4);
+    }
+
+    #[test]
+    fn a_strip_byte_count_past_the_end_of_the_file_is_refused_by_the_limit() {
+        // A header claiming more chunk bytes than the file holds is corrupt
+        // or hostile, never a big image. With the intermediate ceiling
+        // pinned to the file length the decoder refuses it as a limit
+        // violation before reading anything, rather than with a short read
+        // or, under an unlimited decoder, an allocation the size of the lie.
+        let dir = tmpdir("strip-bytes-past-eof");
+        let path = dir.join("in.tif");
+        {
+            let mut enc = TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+            let image = enc.new_image::<colortype::Gray8>(4, 4).unwrap();
+            image.write_data(&[7u8; 16]).unwrap();
+        }
+        // Classic little-endian TIFF from the crate's encoder: walk IFD0
+        // for StripByteCounts (279) and overwrite its inline LONG value.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], b"II\x2a\x00");
+        let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+        let entry = (0..count)
+            .map(|i| ifd + 2 + i * 12)
+            .find(|&e| u16::from_le_bytes(bytes[e..e + 2].try_into().unwrap()) == 279)
+            .expect("StripByteCounts entry");
+        assert_eq!(
+            u16::from_le_bytes(bytes[entry + 2..entry + 4].try_into().unwrap()),
+            4,
+            "LONG"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[entry + 4..entry + 8].try_into().unwrap()),
+            1,
+            "one strip"
+        );
+        bytes[entry + 8..entry + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = TiffReader::open(&path).unwrap();
+        let err = reader.read_bands(&mut |_, _, _, _| Ok(())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("limits exceeded"),
+            "expected the decoder's limit to refuse the byte count, got: {msg}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
