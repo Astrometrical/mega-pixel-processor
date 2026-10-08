@@ -143,7 +143,10 @@ through `mpp-core`:
   one; a linear-only solution needs none.
   Persist the `Header`, not an encoded solution: both models derive serde,
   but postcard is positional, so a stored solution breaks when the model
-  gains a field, while re-decoding a stored `Header` does not.
+  gains a field, while re-decoding a stored `Header` does not. That holds
+  only when the `Header` is stored in a self-describing encoding such as
+  JSON. A postcard-encoded `Header` is positional too: adding a field to
+  `Header` or `FitsKeyword` breaks `Header` values already stored that way.
   Only the Gnomonic projection and the standard native frame are decoded;
   anything else is an `Error::Astrometry`, never a wrong mapping. The
   linear-only `wcs` module and the sidecar are unchanged.
