@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::FitsKeyword;
+use super::{FitsKeyword, KeywordValue};
 use crate::header::Header;
 use crate::{Error, Result};
 
@@ -26,7 +26,8 @@ const MAX_HEADER_BLOCKS: usize = 1000;
 /// Every card up to `END` is kept in order, structural ones (`SIMPLE`,
 /// `BITPIX`, `NAXISn`, …) and commentary ones (`COMMENT`, `HISTORY`)
 /// included; blank cards are dropped. FITS has no XISF properties, so the
-/// header's property list is empty.
+/// header's property list is empty. The image size is `NAXIS1` × `NAXIS2`
+/// when both are positive integers.
 pub fn read_header(path: &Path) -> Result<Header> {
     let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
     let mut keywords = Vec::new();
@@ -49,9 +50,19 @@ pub fn read_header(path: &Path) -> Result<Header> {
         for card in block.as_chunks::<CARD>().0 {
             let kw = parse_card(card);
             if kw.name == "END" {
+                let dim = |name: &str| match keywords
+                    .iter()
+                    .find(|k: &&FitsKeyword| k.name == name)?
+                    .typed_value()
+                {
+                    KeywordValue::Int(n) if n > 0 => u32::try_from(n).ok(),
+                    _ => None,
+                };
+                let image_size = dim("NAXIS1").zip(dim("NAXIS2"));
                 return Ok(Header {
                     keywords,
                     properties: Vec::new(),
+                    image_size,
                 });
             }
             if !(kw.name.is_empty() && kw.value.is_empty() && kw.comment.is_empty()) {
@@ -109,7 +120,6 @@ fn parse_card(card: &[u8]) -> FitsKeyword {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::KeywordValue;
 
     fn card(s: &str) -> Vec<u8> {
         assert!(s.len() <= CARD);
@@ -151,6 +161,7 @@ mod tests {
         synth_fits(&path);
         let h = read_header(&path).unwrap();
         assert!(h.properties.is_empty());
+        assert_eq!(h.image_size, Some((2, 1)), "from NAXIS1/NAXIS2");
         assert_eq!(h.keywords.len(), 39, "blank card dropped, END excluded");
         assert_eq!(h.keywords[0].name, "SIMPLE");
         assert_eq!(h.keywords[0].typed_value(), KeywordValue::Bool(true));

@@ -13,9 +13,7 @@ memmap2.workspace = true
 bytemuck.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# float_roundtrip: f64 values (solutions, headers) survive JSON exactly.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 tiff.workspace = true
 
-[dev-dependencies]
-# Exact f64 round trips in the serde tests.
-serde_json = { workspace = true, features = ["float_roundtrip"] }

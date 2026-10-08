@@ -105,7 +105,7 @@ pub fn from_xisf_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
     let refimg = find("PCL:AstrometricSolution:ReferenceImageCoordinates")?.as_f64_vec()?;
     let (rows, cols, m) =
         find("PCL:AstrometricSolution:LinearTransformationMatrix")?.as_f64_mat()?;
-    if crval.len() != 2 || refimg.len() != 2 || (rows, cols) != (2, 2) {
+    if crval.len() != 2 || refimg.len() != 2 || (rows, cols) != (2, 2) || m.len() != 4 {
         return None;
     }
 

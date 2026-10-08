@@ -22,7 +22,8 @@ fn header() -> Header {
 fn pi(h: &Header) -> mpp_core::astrometry::PiSolution {
     match AstrometricSolution::from_header(h).unwrap().unwrap() {
         AstrometricSolution::PixInsight(s) => s,
-        AstrometricSolution::Wcs(w) => match w {},
+        // `non_exhaustive`: downstream keeps a fallback arm.
+        _ => panic!("expected a PixInsight solution"),
     }
 }
 
@@ -36,6 +37,7 @@ fn arcsec_apart(a: (f64, f64), b: (f64, f64)) -> f64 {
 fn header_lookups() {
     let h = header();
     assert_eq!(h.keywords.len(), 59);
+    assert_eq!(h.image_size, Some((4944, 3284)));
     assert_eq!(h.keyword("FOCALLEN").unwrap().value, "1678.9564");
     assert_eq!(
         h.keyword("FOCALLEN").unwrap().typed_value().as_f64(),
@@ -147,8 +149,27 @@ fn pixel_to_sky_reproduces_the_control_points() {
     let median = seps[seps.len() / 2];
     let worst = seps[seps.len() - 1];
     eprintln!("control-point residuals: median {median:.3}″, worst {worst:.3}″");
-    assert!(median < 0.25, "median control-point residual {median}″");
-    assert!(worst < 2.0, "worst control-point residual {worst}″");
+    // Measured: 0.095″ / 0.90″.
+    assert!(median < 0.15, "median control-point residual {median}″");
+    assert!(worst < 1.2, "worst control-point residual {worst}″");
+
+    // The distortion model earns its keep: without layer 3 (projective
+    // only) the median is 0.25″ on this frame.
+    let mut projective_only = pi(&h);
+    projective_only.distortion = None;
+    let mut seps2: Vec<f64> = cp
+        .image
+        .iter()
+        .zip(&cp.celestial)
+        .map(|(p, c)| arcsec_apart(projective_only.pixel_to_sky(p[0], p[1]), (c[0], c[1])))
+        .collect();
+    seps2.sort_by(f64::total_cmp);
+    let median2 = seps2[seps2.len() / 2];
+    eprintln!("projective-only median {median2:.3}″");
+    assert!(
+        median < 0.6 * median2,
+        "full model median {median}″ vs projective-only {median2}″"
+    );
 }
 
 #[test]

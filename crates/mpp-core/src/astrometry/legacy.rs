@@ -27,6 +27,11 @@ const REQUIRED: [&str; 3] = [
 
 /// True when any required legacy property or any legacy spline property is
 /// present: the header claims a legacy solution.
+///
+/// Deliberately strict: one stray legacy id without the rest makes
+/// [`AstrometricSolution::from_header`](super::AstrometricSolution::from_header)
+/// an error (an incomplete solution), where mmm's `WcsModel::from_properties`
+/// returned `None` (no solution).
 pub(crate) fn has_legacy_block(props: &[XisfProperty]) -> bool {
     props
         .iter()
@@ -255,6 +260,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_short_linear_matrix_is_an_error_not_a_panic() {
+        // A deserialized Header can claim 2×2 and carry one element.
+        let mut p = orion_props();
+        p.iter_mut()
+            .find(|p| p.id.ends_with("LinearTransformationMatrix"))
+            .unwrap()
+            .value = PropertyValue::F64Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1e-3],
+        };
+        assert!(crate::wcs::from_xisf_properties(&p).is_none());
+        let h: crate::header::Header =
+            serde_json::from_str(&serde_json::to_string(&header(p, None)).unwrap()).unwrap();
+        assert!(AstrometricSolution::from_header(&h).is_err());
+    }
+
+    #[test]
     fn center_pixel_maps_to_reference_coordinates() {
         let sol = AstrometricSolution::from_header(&header(orion_props(), None))
             .unwrap()
@@ -446,9 +469,30 @@ pub(crate) mod tests {
                 "({x},{y}): grid ({ra_g},{dec_g}) vs linear ({ra_l},{dec_l})"
             );
         }
-        // The grids decode without the image size too (corner checks then
-        // use the grid's own domain).
-        assert!(solve(spline_props(w as f64, h as f64), None).is_ok());
+        // A distortion cannot be checked without the image size: refused.
+        let e = solve(spline_props(w as f64, h as f64), None).unwrap_err();
+        assert!(e.to_string().contains("image size"), "{e}");
+    }
+
+    #[test]
+    fn the_image_size_field_wins_over_stale_naxis_keywords() {
+        let (w, h) = (1000u64, 700u64);
+        // NAXIS keywords from an older, larger frame; geometry is current.
+        let mut hd = header(spline_props(w as f64, h as f64), Some((2 * w, h)));
+        assert!(
+            AstrometricSolution::from_header(&hd).is_err(),
+            "NAXIS alone"
+        );
+        hd.image_size = Some((w as u32, h as u32));
+        assert!(
+            AstrometricSolution::from_header(&hd).is_ok(),
+            "image_size first"
+        );
+        hd.image_size = Some((2 * w as u32, h as u32));
+        assert!(
+            AstrometricSolution::from_header(&hd).is_err(),
+            "and it is checked"
+        );
     }
 
     #[test]

@@ -29,6 +29,11 @@ pub struct Header {
     pub keywords: Vec<FitsKeyword>,
     /// XISF properties, in header order. Empty for FITS files.
     pub properties: Vec<Property>,
+    /// Image `(width, height)` in pixels, when the reader knows it: the
+    /// `<Image geometry>` of an XISF file (authoritative, whatever its
+    /// `NAXIS` keywords say), or `NAXIS1`/`NAXIS2` of a FITS file.
+    #[serde(default)]
+    pub image_size: Option<(u32, u32)>,
 }
 
 impl Header {
@@ -48,6 +53,9 @@ impl From<&XisfHeader> for Header {
         Header {
             keywords: h.fits_keywords.clone(),
             properties: h.properties.clone(),
+            image_size: u32::try_from(h.width)
+                .ok()
+                .zip(u32::try_from(h.height).ok()),
         }
     }
 }
@@ -87,6 +95,7 @@ mod tests {
                     location: Some((4096, 16)),
                 },
             ],
+            image_size: Some((4944, 3284)),
         }
     }
 
@@ -98,6 +107,12 @@ mod tests {
         assert!(h.keyword("NOPE").is_none());
         assert_eq!(h.property("M").unwrap().type_, "F64Matrix");
         assert!(h.property("nope").is_none());
+    }
+
+    #[test]
+    fn image_size_defaults_to_none_when_absent_from_the_encoding() {
+        let h: Header = serde_json::from_str(r#"{"keywords":[],"properties":[]}"#).unwrap();
+        assert_eq!(h.image_size, None);
     }
 
     #[test]

@@ -19,6 +19,8 @@ use crate::header::Header;
 use crate::{Error, Result};
 
 const SIGNATURE: &[u8; 8] = b"XISF0100";
+/// Prefix of PixInsight's private solution lookup-table cache.
+const GRID_CACHE_PREFIX: &str = "PCL:AstrometricSolution:Grid:";
 
 /// Parsed metadata for the image block of an XISF file.
 #[derive(Debug, Clone)]
@@ -66,8 +68,9 @@ impl XisfImage {
         // e.g. astrometric solution data) so downstream code sees decoded values.
         for prop in &mut header.properties {
             if prop.location.is_some() && prop.value.needs_attachment_data() {
-                let bytes = attachment_slice(&mmap, path, prop)?;
-                prop.value = decode_attached_numbers(bytes, path, prop)?;
+                let value = attachment_slice(&mmap, path, prop)
+                    .and_then(|bytes| decode_attached_numbers(bytes, path, prop));
+                lenient(prop, value)?;
             }
         }
 
@@ -187,6 +190,12 @@ impl super::PlanarRows<f32> for XisfImage {
 /// format (unlike [`XisfImage::open`], which reads Float32 only). The other
 /// limits of the module docs still apply: compressed or non-planar images
 /// are refused.
+///
+/// PixInsight's private `PCL:AstrometricSolution:Grid:*` properties, a
+/// lookup-table cache of the astrometric solution (about 20 MB on a 16 MP
+/// frame), are dropped without reading their attachments: no decoder uses
+/// them, and a [`Header`] is meant to travel. [`XisfImage::open`] keeps them.
+/// The header's image size is the `<Image geometry>`.
 pub fn read_header(path: &Path) -> Result<Header> {
     let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
     let io = |e| Error::io(path, e);
@@ -206,21 +215,28 @@ pub fn read_header(path: &Path) -> Result<Header> {
     bytes.resize(16 + header_len, 0);
     file.read_exact(&mut bytes[16..]).map_err(io)?;
     let mut header = parse_header(path, &bytes)?;
+    // PixInsight's private lookup-table cache of the solution: tens of MB that
+    // no decoder reads, and a Header travels between nodes.
+    header
+        .properties
+        .retain(|p| !p.id.starts_with(GRID_CACHE_PREFIX));
 
     for prop in &mut header.properties {
         if let Some((off, size)) = prop.location
             && prop.value.needs_attachment_data()
         {
-            if off.checked_add(size).is_none_or(|end| end > file_len) {
-                return Err(Error::format(
+            let value = if off.checked_add(size).is_none_or(|end| end > file_len) {
+                Err(Error::format(
                     path,
                     format!("property {}: attachment out of bounds", prop.id),
-                ));
-            }
-            let mut data = vec![0u8; size as usize];
-            file.seek(SeekFrom::Start(off)).map_err(io)?;
-            file.read_exact(&mut data).map_err(io)?;
-            prop.value = decode_attached_numbers(&data, path, prop)?;
+                ))
+            } else {
+                let mut data = vec![0u8; size as usize];
+                file.seek(SeekFrom::Start(off)).map_err(io)?;
+                file.read_exact(&mut data).map_err(io)?;
+                decode_attached_numbers(&data, path, prop)
+            };
+            lenient(prop, value)?;
         }
     }
     Ok(Header::from(&header))
@@ -427,6 +443,42 @@ fn decode_numbers(kind: NumKind, bytes: &[u8]) -> Vec<f64> {
 /// Types we do not decode become [`PropertyValue::Unread`] (or `Str` when a
 /// plain `value` attribute is present).
 fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfProperty> {
+    let id = p.id.clone();
+    let type_ = p.type_.clone();
+    match finish_property_strict(path, p, text) {
+        Err(_) if is_lenient_array(&type_) => Ok(XisfProperty {
+            id,
+            type_,
+            value: PropertyValue::Unread,
+            location: None,
+        }),
+        r => r,
+    }
+}
+
+/// True for numeric vector/matrix types other than f64. Before they were
+/// decoded these read as [`PropertyValue::Unread`]; a malformed one still
+/// does, rather than failing the whole file. F64 arrays stay strict.
+fn is_lenient_array(type_: &str) -> bool {
+    matches!(numeric_array_type(type_), Some((kind, _, _)) if !matches!(kind, NumKind::F64))
+}
+
+/// Store a resolved attachment value; a failure fails the read for f64
+/// arrays and leaves the others `Unread` (see [`is_lenient_array`]).
+fn lenient(prop: &mut XisfProperty, value: Result<PropertyValue>) -> Result<()> {
+    match value {
+        Ok(v) => prop.value = v,
+        Err(_) if is_lenient_array(&prop.type_) => {
+            prop.value = PropertyValue::Unread;
+            prop.location = None;
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// [`finish_property`] without the leniency for non-f64 arrays.
+fn finish_property_strict(path: &Path, p: PendingProperty, text: &str) -> Result<XisfProperty> {
     let err = |msg: String| Error::format(path, msg);
     let scalar = |p: &PendingProperty| -> String {
         p.value_attr
@@ -1139,21 +1191,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.location, Some((4096, 16)));
-        assert!(
-            finish_property(
-                Path::new("x"),
-                pending(
-                    "v",
-                    "I32Vector",
-                    Some("attachment:4096:32"),
-                    Some(4),
-                    None,
-                    None
-                ),
-                "",
+        let wrong = || {
+            pending(
+                "v",
+                "I32Vector",
+                Some("attachment:4096:32"),
+                Some(4),
+                None,
+                None,
             )
-            .is_err()
-        );
+        };
+        assert!(finish_property_strict(Path::new("x"), wrong(), "").is_err());
+        // A malformed non-f64 array reads as Unread rather than failing.
+        let p = finish_property(Path::new("x"), wrong(), "").unwrap();
+        assert_eq!((p.value, p.location), (PropertyValue::Unread, None));
     }
 
     #[test]
@@ -1172,5 +1223,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.value, PropertyValue::Str("Local\nFallback".into()));
+    }
+
+    /// A 2×2 Float32 XISF whose header holds `props_xml` (attachments, if
+    /// any, at byte 1024; pixels at 2048).
+    fn synth_with(dir: &Path, name: &str, props_xml: &str, att: &[u8]) -> PathBuf {
+        let xml = format!(
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">"#,
+                r#"<Image geometry="2:2:1" sampleFormat="Float32" colorSpace="Gray" location="attachment:2048:16">"#,
+                r#"<FITSKeyword name="NAXIS1" value="4944" comment="stale"/>"#,
+                "{}",
+                r#"</Image></xisf>"#,
+            ),
+            props_xml
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SIGNATURE);
+        bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(xml.as_bytes());
+        assert!(bytes.len() <= 1024);
+        bytes.resize(1024, 0);
+        bytes.extend_from_slice(att);
+        bytes.resize(2048 + 16, 0);
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_header_drops_the_pixinsight_grid_cache_and_records_the_geometry() {
+        let dir = std::env::temp_dir().join(format!("mpp-xisf-grid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = synth_with(
+            &dir,
+            "grid.xisf",
+            concat!(
+                r#"<Property id="PCL:AstrometricSolution:Grid:ImageToProjection:GridX" type="F64Matrix" rows="1" columns="2" location="attachment:1024:16"/>"#,
+                r#"<Property id="PCL:AstrometricSolution:Grid:ImageToProjection:Delta" type="Float64" value="8"/>"#,
+                r#"<Property id="PCL:AstrometricSolution:Generation:Engine" type="String" value="DDM"/>"#,
+            ),
+            &[0u8; 16],
+        );
+        let h = read_header(&path).unwrap();
+        assert!(
+            !h.properties
+                .iter()
+                .any(|p| p.id.starts_with("PCL:AstrometricSolution:Grid:")),
+            "{:?}",
+            h.properties
+        );
+        assert!(
+            h.property("PCL:AstrometricSolution:Generation:Engine")
+                .is_some()
+        );
+        assert_eq!(h.image_size, Some((2, 2)), "geometry, not the stale NAXIS1");
+        // XisfImage keeps every property.
+        let img = XisfImage::open(&path).unwrap();
+        assert_eq!(img.header().properties.len(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_non_f64_arrays_degrade_to_unread_but_f64_still_fails() {
+        let dir = std::env::temp_dir().join(format!("mpp-xisf-lenient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = synth_with(
+            &dir,
+            "lenient.xisf",
+            concat!(
+                // 3 elements claimed, 2 encoded.
+                r#"<Property id="P:Short" type="I32Vector" length="3" location="inline:base64">AAAAAAEAAAA=</Property>"#,
+                r#"<Property id="P:Where" type="UI16Matrix" rows="1" columns="2" location="embedded"/>"#,
+                r#"<Property id="P:NoLen" type="F32Vector" location="inline:base64">AAAAAA==</Property>"#,
+                r#"<Property id="P:Far" type="I32Vector" length="2" location="attachment:999999:8"/>"#,
+            ),
+            &[],
+        );
+        let img = XisfImage::open(&path).unwrap();
+        for id in ["P:Short", "P:Where", "P:NoLen", "P:Far"] {
+            let p = img.header().properties.iter().find(|p| p.id == id).unwrap();
+            assert_eq!(p.value, PropertyValue::Unread, "{id}");
+        }
+        assert!(read_header(&path).is_ok());
+        let bad = synth_with(
+            &dir,
+            "bad-f64.xisf",
+            r#"<Property id="P:Short" type="F64Vector" length="3" location="inline:base64">AAAAAAAAAAA=</Property>"#,
+            &[],
+        );
+        assert!(XisfImage::open(&bad).is_err(), "F64 behaviour unchanged");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -48,8 +48,12 @@ mod pixinsight;
 pub use distortion::{DistortionModel, Kernel, LocalTerm, ScalarSpline, VectorSpline};
 
 /// A plate solution in one of the forms mpp understands.
+///
+/// `non_exhaustive`: when [`WcsSolution`] gains values, code outside this
+/// crate already has a fallback arm for it.
 // The size gap is to an uninhabited variant: there is nothing to box.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AstrometricSolution {
     /// PixInsight's solution: the 1.9.5 standard block, or a legacy (≤ 1.9.4)
@@ -82,12 +86,16 @@ impl AstrometricSolution {
     /// with its own linear solution. A solution is never silently
     /// approximated by its linear part.
     ///
-    /// The image size, used for the corner consistency checks, comes from
-    /// the `NAXIS1`/`NAXIS2` keywords; without them those checks are
-    /// skipped.
+    /// The image size, needed for the consistency checks of a solution with
+    /// a distortion or projective layer, is [`Header::image_size`], else the
+    /// `NAXIS1`/`NAXIS2` keywords. Such a solution with neither is an error;
+    /// a linear-only solution needs no size.
     pub fn from_header(header: &Header) -> Result<Option<Self>> {
         let props = &header.properties;
-        let dims = image_dims(header);
+        let dims = header
+            .image_size
+            .map(|(w, h)| (u64::from(w), u64::from(h)))
+            .or_else(|| image_dims(header));
         let sol = if pixinsight::has_standard_block(props) {
             pixinsight::decode(props, dims)
         } else if legacy::has_legacy_block(props) {
@@ -458,8 +466,9 @@ pub(crate) fn require_gnomonic(proj: &str) -> std::result::Result<(), String> {
 /// reference pixel must map to ≈ (0, 0) on the projection plane (36″
 /// allowance) and back (5 px), and the image corners must agree with the
 /// linear solution within the 180″ distortion allowance (a wrong layout or
-/// orientation is off by about a degree). The corners are the image bounds
-/// when `dims` are known, else the legacy grid's own domain, else skipped.
+/// orientation is off by about a degree). Checking needs the image size
+/// (`dims`): a solution with anything beyond the linear layer and no size is
+/// refused.
 pub(crate) fn validate(
     sol: &PiSolution,
     dims: Option<(u64, u64)>,
@@ -518,16 +527,14 @@ pub(crate) fn validate(
             "the inverse model maps the reference point to ({ix}, {iy}), not the reference pixel"
         ));
     }
-    let rect = match (dims, &sol.distortion) {
-        (Some((w, h)), _) => [0.0, 0.0, w as f64, h as f64],
-        (
-            None,
-            Some(Distortion::Grids {
-                image_to_native, ..
-            }),
-        ) => image_to_native.rect,
-        (None, _) => return Ok(()),
+    let Some((w, h)) = dims else {
+        return Err(
+            "the image size is unknown (no image geometry or NAXIS1/NAXIS2), so the \
+                    distortion cannot be checked against the linear solution"
+                .into(),
+        );
     };
+    let rect = [0.0, 0.0, w as f64, h as f64];
     let m = sol.linear;
     for (cx, cy) in [
         (rect[0], rect[1]),
@@ -584,6 +591,7 @@ pub(crate) mod testprops {
                 .map(|(w, h)| vec![kw("NAXIS1", w), kw("NAXIS2", h)])
                 .unwrap_or_default(),
             properties: props,
+            image_size: None,
         }
     }
 }
