@@ -115,6 +115,13 @@ through `mpp-core`:
   `formats::fits::read_header` (primary-HDU cards; mpp still has no FITS
   pixel reader). An open `XisfImage` converts with `Header::from`.
   Existing reader signatures are unchanged.
+- **`Header::image_size`**: `Option<(u32, u32)>`, the XISF `<Image geometry>`
+  (authoritative, whatever the `NAXIS` keywords say) or FITS
+  `NAXIS1`/`NAXIS2`. It decodes as `None` when absent from an older encoding.
+- **Grid caches dropped**: `xisf::read_header` skips PixInsight's private
+  `PCL:AstrometricSolution:Grid:*` properties (about 20 MB). No decoder uses
+  them, and a `Header` is meant to travel between nodes. `XisfImage::open`
+  keeps them.
 - **XISF properties**: every numeric vector/matrix type (`I32Vector`,
   `F32Matrix`, …) now decodes to f64, as in mmm; only complex and other
   non-numeric types stay `Unread`.
@@ -123,8 +130,20 @@ through `mpp-core`:
   `Wcs(WcsSolution)` for FITS WCS with SIP. The PixInsight decoders (1.9.5
   standard block with its RBF distortion model; legacy ≤ 1.9.4 block with
   its interpolation grids) are copied from `mmm-core` and evaluated
-  directly rather than sampled onto grids. mmm and mii keep their own
-  copies for now; consolidation comes with their in-process integration.
+  directly rather than sampled onto grids. This code is duplicated from mmm
+  for now: mmm and mii keep their own copies, and consolidation comes with
+  their in-process integration.
+  `AstrometricSolution` is `#[non_exhaustive]`, so code outside the crate
+  keeps a fallback arm for the `Wcs` form when it gains values.
+  `AstrometricSolution::from_header(&Header) -> Result<Option<Self>>`
+  decodes the standard block, falling back to the legacy one, and gives
+  `Ok(None)` when the header holds no solution. A solution with a distortion
+  or projective layer needs the image size (`Header::image_size`, else
+  `NAXIS1`/`NAXIS2`) for its consistency checks and is an error without
+  one; a linear-only solution needs none.
+  Persist the `Header`, not an encoded solution: both models derive serde,
+  but postcard is positional, so a stored solution breaks when the model
+  gains a field, while re-decoding a stored `Header` does not.
   Only the Gnomonic projection and the standard native frame are decoded;
   anything else is an `Error::Astrometry`, never a wrong mapping. The
   linear-only `wcs` module and the sidecar are unchanged.
