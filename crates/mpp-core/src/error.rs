@@ -34,6 +34,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// Metadata that claims to hold an astrometric solution but cannot be
+    /// decoded into a usable one (missing or malformed required properties,
+    /// an unsupported revision or projection, or a model inconsistent with
+    /// itself); `reason` says which.
+    #[error("unusable astrometric solution: {reason}")]
+    Astrometry {
+        /// Human-readable explanation of what is wrong.
+        reason: String,
+    },
+
     /// An option or argument combination that cannot produce a valid file.
     ///
     /// Unlike [`Error::Io`] and [`Error::Format`] this carries no path: it
@@ -58,6 +68,13 @@ impl Error {
     pub fn format(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
         Error::Format {
             path: path.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Build an [`Error::Astrometry`] from a reason.
+    pub fn astrometry(reason: impl Into<String>) -> Self {
+        Error::Astrometry {
             reason: reason.into(),
         }
     }

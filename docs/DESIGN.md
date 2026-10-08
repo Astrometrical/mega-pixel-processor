@@ -103,6 +103,32 @@ being better, not on being the only place the files work.
   display formats, so the DZI path operates on stretched, display-ready
   input by design.
 
+## Headers and full astrometric solutions (2026-10-08)
+
+Added for Photometrical, which reads image metadata and plate solutions
+through `mpp-core`:
+
+- **`header::Header`**: the ordered FITS keywords and XISF properties of a
+  file, reusing `FitsKeyword` and `XisfProperty`. Readers:
+  `formats::read_header` (by extension), `formats::xisf::read_header`
+  (header and property attachments only, any sample format) and
+  `formats::fits::read_header` (primary-HDU cards; mpp still has no FITS
+  pixel reader). An open `XisfImage` converts with `Header::from`.
+  Existing reader signatures are unchanged.
+- **XISF properties**: every numeric vector/matrix type (`I32Vector`,
+  `F32Matrix`, …) now decodes to f64, as in mmm; only complex and other
+  non-numeric types stay `Unread`.
+- **`astrometry::AstrometricSolution`**: the full solution, a union of
+  `PixInsight(PiSolution)` and a reserved, still-uninhabited
+  `Wcs(WcsSolution)` for FITS WCS with SIP. The PixInsight decoders (1.9.5
+  standard block with its RBF distortion model; legacy ≤ 1.9.4 block with
+  its interpolation grids) are copied from `mmm-core` and evaluated
+  directly rather than sampled onto grids. mmm and mii keep their own
+  copies for now; consolidation comes with their in-process integration.
+  Only the Gnomonic projection and the standard native frame are decoded;
+  anything else is an `Error::Astrometry`, never a wrong mapping. The
+  linear-only `wcs` module and the sidecar are unchanged.
+
 ## WCS sidecar schema (v1, decided 2026-08-20)
 
 Canonical JSON, written as `<output-stem>.wcs.json` beside any container

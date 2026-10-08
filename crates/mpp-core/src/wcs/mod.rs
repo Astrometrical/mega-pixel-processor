@@ -71,7 +71,7 @@ impl LinearWcs {
 /// everything in degrees. ξ grows toward east, η toward north — the standard
 /// zenithal native frame with `ReferenceNativeCoordinates` (0, 90) and
 /// `CelestialPoleNativeCoordinates` (180, 90).
-fn tan_deproject(crval: [f64; 2], xi_deg: f64, eta_deg: f64) -> (f64, f64) {
+pub(crate) fn tan_deproject(crval: [f64; 2], xi_deg: f64, eta_deg: f64) -> (f64, f64) {
     let (xi, eta) = (xi_deg.to_radians(), eta_deg.to_radians());
     let (a0, d0) = (crval[0].to_radians(), crval[1].to_radians());
     let den = d0.cos() - eta * d0.sin();
@@ -136,7 +136,7 @@ pub fn from_xisf_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
 }
 
 /// PixInsight projection-system name → 3-letter FITS projection code.
-fn projection_code(name: &str) -> Option<&'static str> {
+pub(crate) fn projection_code(name: &str) -> Option<&'static str> {
     Some(match name {
         "Gnomonic" => "TAN",
         "Stereographic" => "STG",

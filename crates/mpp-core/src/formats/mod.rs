@@ -4,6 +4,12 @@
 //! plus passthrough metadata (FITS keywords, XISF properties). Writers
 //! stream pixel data out in constant memory.
 
+use std::path::Path;
+
+use crate::header::Header;
+use crate::{Error, Result};
+
+pub mod fits;
 pub mod tiff;
 pub mod tiff_read;
 pub mod tiff_write;
@@ -27,8 +33,36 @@ pub trait PlanarRows<T> {
     fn row(&self, c: u64, y: u64) -> &[T];
 }
 
+/// The header of the image file at `path`, without reading its pixels.
+///
+/// Dispatches on the extension: XISF (`.xisf`) and FITS (`.fits`, `.fit`,
+/// `.fts`) headers are read by [`xisf::read_header`] and
+/// [`fits::read_header`]. TIFF files (`.tif`, `.tiff`, `.btf`, `.tf8`) carry
+/// neither FITS keywords nor XISF properties that mpp reads, so they yield an
+/// empty [`Header`]. Any other extension is an [`Error::Format`].
+pub fn read_header(path: &Path) -> Result<Header> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "xisf" => xisf::read_header(path),
+        "fits" | "fit" | "fts" => fits::read_header(path),
+        "tif" | "tiff" | "btf" | "tf8" => {
+            // Fail on a missing file as the other formats do.
+            std::fs::metadata(path).map_err(|e| Error::io(path, e))?;
+            Ok(Header::default())
+        }
+        _ => Err(Error::format(
+            path,
+            format!("no header reader for extension '{ext}' (XISF, FITS or TIFF expected)"),
+        )),
+    }
+}
+
 /// A FITS header keyword carried through from input to output.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FitsKeyword {
     /// Keyword name (e.g. `OBJECT`, `CRVAL1`), as written in the header.
     pub name: String,
@@ -36,6 +70,70 @@ pub struct FitsKeyword {
     pub value: String,
     /// Free-text comment, empty when the card has none.
     pub comment: String,
+}
+
+impl FitsKeyword {
+    /// The value parsed by FITS rules: a quoted string (with `''` unescaped
+    /// and trailing blanks dropped), `T`/`F`, an integer, a real (a `D`
+    /// exponent is accepted), or none for an empty value (commentary cards).
+    /// Text that fits none of these, such as a complex value, is returned as
+    /// a string, unchanged.
+    pub fn typed_value(&self) -> KeywordValue {
+        let v = self.value.trim();
+        if v.is_empty() {
+            return KeywordValue::None;
+        }
+        if let Some(inner) = v.strip_prefix('\'') {
+            let inner = inner.strip_suffix('\'').unwrap_or(inner);
+            return KeywordValue::Str(inner.replace("''", "'").trim_end().to_string());
+        }
+        match v {
+            "T" => return KeywordValue::Bool(true),
+            "F" => return KeywordValue::Bool(false),
+            _ => {}
+        }
+        if let Ok(i) = v.parse::<i64>() {
+            return KeywordValue::Int(i);
+        }
+        match v.replace(['D', 'd'], "E").parse::<f64>() {
+            Ok(r) => KeywordValue::Real(r),
+            Err(_) => KeywordValue::Str(v.to_string()),
+        }
+    }
+}
+
+/// A FITS keyword value parsed by [`FitsKeyword::typed_value`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum KeywordValue {
+    /// A string (quotes removed), or unparseable value text.
+    Str(String),
+    /// An integer.
+    Int(i64),
+    /// A real number.
+    Real(f64),
+    /// A logical value (`T` or `F`).
+    Bool(bool),
+    /// No value (commentary cards such as `COMMENT` and `HISTORY`).
+    None,
+}
+
+impl KeywordValue {
+    /// The value as a float: reals directly, integers converted; else `None`.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Real(v) => Some(*v),
+            Self::Int(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    /// The value as a string slice, for strings only.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 /// One XISF `<Property>` element carried through from the input header.
@@ -62,9 +160,10 @@ pub struct XisfProperty {
 
 /// Decoded value of an XISF property.
 ///
-/// Attachment-located `F64Vector`/`F64Matrix` properties parse with empty
-/// `data` (dimensions from the header attributes); `XisfPanel::open` resolves
-/// them from the file. `Unread` marks types we do not decode.
+/// Attachment-located vector/matrix properties parse with empty `data`
+/// (dimensions from the header attributes); [`xisf::XisfImage::open`] and
+/// [`xisf::read_header`] resolve them from the file. `Unread` marks types we
+/// do not decode.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PropertyValue {
     /// String-like value (`String`, `TimePoint`, or any `value` attribute of
@@ -74,9 +173,12 @@ pub enum PropertyValue {
     F64(f64),
     /// Integer scalar (all `Int*`/`UInt*` widths, and `Boolean` as 0/1).
     I64(i64),
-    /// `F64Vector` data, in header order.
+    /// Vector data of any XISF numeric vector type (`F64Vector`, `I32Vector`,
+    /// `F32Vector`, …), converted to f64 in header order; the property's
+    /// `type_` records the original type. Integers are exact up to 2^53.
     F64Vec(Vec<f64>),
-    /// `F64Matrix` data, row-major.
+    /// Matrix data of any XISF numeric matrix type, converted to f64,
+    /// row-major; `type_` records the original type.
     F64Mat {
         /// Number of matrix rows.
         rows: u32,
@@ -192,6 +294,49 @@ mod tests {
         assert_eq!(m.as_f64_mat(), Some((2, 2, &[1.0, 0.0, 0.0, 1.0][..])));
         assert!(PropertyValue::F64Vec(Vec::new()).needs_attachment_data());
         assert!(!PropertyValue::F64(0.0).needs_attachment_data());
+    }
+
+    fn kw(value: &str) -> FitsKeyword {
+        FitsKeyword {
+            name: "K".into(),
+            value: value.into(),
+            comment: String::new(),
+        }
+    }
+
+    #[test]
+    fn keyword_values_parse_by_fits_rules() {
+        assert_eq!(kw("'M42 '").typed_value(), KeywordValue::Str("M42".into()));
+        assert_eq!(
+            kw("'O''Neil'").typed_value(),
+            KeywordValue::Str("O'Neil".into())
+        );
+        assert_eq!(kw("T").typed_value(), KeywordValue::Bool(true));
+        assert_eq!(kw("F").typed_value(), KeywordValue::Bool(false));
+        assert_eq!(kw("-32").typed_value(), KeywordValue::Int(-32));
+        assert_eq!(kw("1645.0").typed_value(), KeywordValue::Real(1645.0));
+        assert_eq!(kw("1.5D3").typed_value(), KeywordValue::Real(1500.0));
+        assert_eq!(kw("").typed_value(), KeywordValue::None);
+        assert_eq!(
+            kw("(1, 2)").typed_value(),
+            KeywordValue::Str("(1, 2)".into())
+        );
+        assert_eq!(kw("90").typed_value().as_f64(), Some(90.0));
+        assert_eq!(kw("'x'").typed_value().as_str(), Some("x"));
+    }
+
+    #[test]
+    fn read_header_dispatches_on_extension() {
+        let dir = std::env::temp_dir().join(format!("mpp-read-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tif = dir.join("a.TIF");
+        std::fs::write(&tif, b"II*\0").unwrap();
+        assert_eq!(read_header(&tif).unwrap(), Header::default());
+        assert!(read_header(&dir.join("missing.tif")).is_err());
+        let png = dir.join("a.png");
+        std::fs::write(&png, b"x").unwrap();
+        assert!(read_header(&png).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

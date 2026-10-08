@@ -10,6 +10,11 @@
 //!   strip-streaming TIFF/BigTIFF writing; vips-backed mainstream-format export
 //!   (PNG/JPEG/WebP/AVIF/JXL, via [`vips`]) and DZI tile-pyramid export are
 //!   both implemented today.
+//! - [`header`] — the format-neutral [`header::Header`] (ordered FITS
+//!   keywords plus XISF properties) that the readers return.
+//! - [`astrometry`] — [`astrometry::AstrometricSolution`], the full
+//!   astrometric solution model (PixInsight's standard and legacy blocks,
+//!   distortion included) decoded from a [`header::Header`].
 //! - [`wcs`] — astrometric solutions: the linear WCS model, extraction
 //!   from PixInsight XISF properties, and the canonical JSON sidecar.
 //! - [`convert`] — one-call conversion orchestration used by the CLI.
@@ -27,6 +32,10 @@ pub mod error;
 pub use error::{Error, Result};
 
 pub mod formats;
+
+pub mod header;
+
+pub mod astrometry;
 
 pub(crate) mod pipeline;
 

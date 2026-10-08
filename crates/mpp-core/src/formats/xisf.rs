@@ -8,12 +8,14 @@
 //! Spec: <https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html>
 
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use quick_xml::events::Event;
 
 use super::{FitsKeyword, PropertyValue, SampleFormat, XisfProperty};
+use crate::header::Header;
 use crate::{Error, Result};
 
 const SIGNATURE: &[u8; 8] = b"XISF0100";
@@ -60,11 +62,12 @@ impl XisfImage {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::io(path, e))?;
         let mut header = parse_header(path, &mmap)?;
 
-        // Resolve attachment-located f64 vectors/matrices (tiny blocks — e.g.
-        // astrometric solution data) so downstream code sees decoded values.
+        // Resolve attachment-located numeric vectors/matrices (small blocks —
+        // e.g. astrometric solution data) so downstream code sees decoded values.
         for prop in &mut header.properties {
             if prop.location.is_some() && prop.value.needs_attachment_data() {
-                prop.value = read_attached_f64s(&mmap, path, prop)?;
+                let bytes = attachment_slice(&mmap, path, prop)?;
+                prop.value = decode_attached_numbers(bytes, path, prop)?;
             }
         }
 
@@ -176,7 +179,54 @@ impl super::PlanarRows<f32> for XisfImage {
     }
 }
 
-fn parse_header(path: &Path, mmap: &Mmap) -> Result<XisfHeader> {
+/// The FITS keywords and properties of the XISF file at `path`, without its
+/// pixels.
+///
+/// Reads only the XML header and the attachment blocks of vector/matrix
+/// properties, so it is cheap on multi-GB files and accepts every sample
+/// format (unlike [`XisfImage::open`], which reads Float32 only). The other
+/// limits of the module docs still apply: compressed or non-planar images
+/// are refused.
+pub fn read_header(path: &Path) -> Result<Header> {
+    let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
+    let io = |e| Error::io(path, e);
+    let mut lead = [0u8; 16];
+    if file.read_exact(&mut lead).is_err() || &lead[0..8] != SIGNATURE {
+        return Err(Error::format(
+            path,
+            "not a monolithic XISF file (bad signature)",
+        ));
+    }
+    let header_len = u32::from_le_bytes(lead[8..12].try_into().unwrap()) as usize;
+    let file_len = file.metadata().map_err(io)?.len();
+    if file_len < 16 + header_len as u64 {
+        return Err(Error::format(path, "truncated XISF header"));
+    }
+    let mut bytes = lead.to_vec();
+    bytes.resize(16 + header_len, 0);
+    file.read_exact(&mut bytes[16..]).map_err(io)?;
+    let mut header = parse_header(path, &bytes)?;
+
+    for prop in &mut header.properties {
+        if let Some((off, size)) = prop.location
+            && prop.value.needs_attachment_data()
+        {
+            if off.checked_add(size).is_none_or(|end| end > file_len) {
+                return Err(Error::format(
+                    path,
+                    format!("property {}: attachment out of bounds", prop.id),
+                ));
+            }
+            let mut data = vec![0u8; size as usize];
+            file.seek(SeekFrom::Start(off)).map_err(io)?;
+            file.read_exact(&mut data).map_err(io)?;
+            prop.value = decode_attached_numbers(&data, path, prop)?;
+        }
+    }
+    Ok(Header::from(&header))
+}
+
+fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
     if mmap.len() < 16 || &mmap[0..8] != SIGNATURE {
         return Err(Error::format(
             path,
@@ -300,14 +350,79 @@ fn parse_property_start(path: &Path, e: &quick_xml::events::BytesStart) -> Resul
     })
 }
 
+/// Element type of an XISF numeric vector/matrix.
+#[derive(Clone, Copy)]
+enum NumKind {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+/// `(element kind, element byte width, is_matrix)` for an XISF numeric
+/// vector/matrix type name (`I32Vector`, `F64Matrix`, …); `None` otherwise.
+fn numeric_array_type(type_: &str) -> Option<(NumKind, usize, bool)> {
+    let (base, is_matrix) = match (type_.strip_suffix("Vector"), type_.strip_suffix("Matrix")) {
+        (Some(b), _) => (b, false),
+        (None, Some(b)) => (b, true),
+        (None, None) => return None,
+    };
+    let (kind, width) = match base {
+        "I8" => (NumKind::I8, 1),
+        "UI8" => (NumKind::U8, 1),
+        "I16" => (NumKind::I16, 2),
+        "UI16" => (NumKind::U16, 2),
+        "I32" => (NumKind::I32, 4),
+        "UI32" => (NumKind::U32, 4),
+        "I64" => (NumKind::I64, 8),
+        "UI64" => (NumKind::U64, 8),
+        "F32" => (NumKind::F32, 4),
+        "F64" => (NumKind::F64, 8),
+        _ => return None,
+    };
+    Some((kind, width, is_matrix))
+}
+
+/// Decode little-endian elements of `kind` into f64s (integers convert
+/// exactly up to 2^53; `bytes.len()` must be a multiple of the width).
+fn decode_numbers(kind: NumKind, bytes: &[u8]) -> Vec<f64> {
+    macro_rules! conv {
+        ($t:ty) => {
+            bytes
+                .chunks_exact(std::mem::size_of::<$t>())
+                .map(|c| <$t>::from_le_bytes(c.try_into().unwrap()) as f64)
+                .collect()
+        };
+    }
+    match kind {
+        NumKind::I8 => conv!(i8),
+        NumKind::U8 => conv!(u8),
+        NumKind::I16 => conv!(i16),
+        NumKind::U16 => conv!(u16),
+        NumKind::I32 => conv!(i32),
+        NumKind::U32 => conv!(u32),
+        NumKind::I64 => conv!(i64),
+        NumKind::U64 => conv!(u64),
+        NumKind::F32 => conv!(f32),
+        NumKind::F64 => conv!(f64),
+    }
+}
+
 /// Decode a completed `<Property>` from its attributes and element text.
 ///
 /// Shapes handled (all three occur in PixInsight files):
 /// - scalars via the `value` attribute (or element text as fallback),
 /// - String/TimePoint via element text or `value`,
-/// - `F64Vector`/`F64Matrix` via `location="inline:base64|inline:hex"`
-///   (payload is the element text) or `location="attachment:offset:size"`
-///   (value left with empty data; resolved from the file by the caller).
+/// - every numeric vector/matrix type (`F64Vector`, `I32Vector`, `F32Matrix`,
+///   …, decoded to f64) via `location="inline:base64|inline:hex"` (payload is
+///   the element text) or `location="attachment:offset:size"` (value left
+///   with empty data; resolved from the file by the caller).
 ///
 /// Types we do not decode become [`PropertyValue::Unread`] (or `Str` when a
 /// plain `value` attribute is present).
@@ -343,8 +458,9 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
                 .clone()
                 .unwrap_or_else(|| text.trim().to_string()),
         ),
-        "F64Vector" | "F64Matrix" => {
-            let n = if p.type_ == "F64Vector" {
+        t if numeric_array_type(t).is_some() => {
+            let (kind, width, is_matrix) = numeric_array_type(t).unwrap();
+            let n = if !is_matrix {
                 p.length
                     .ok_or_else(|| err(format!("property {}: missing length", p.id)))?
                     as usize
@@ -360,20 +476,15 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
                     let bytes = decode_inline(loc, text).ok_or_else(|| {
                         err(format!("property {}: bad inline data ({loc})", p.id))
                     })?;
-                    if bytes.len() != n * 8 {
+                    if bytes.len() != n * width {
                         return Err(err(format!(
                             "property {}: inline data is {} bytes, expected {}",
                             p.id,
                             bytes.len(),
-                            n * 8
+                            n * width
                         )));
                     }
-                    bytes
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .map(|c| f64::from_le_bytes(*c))
-                        .collect()
+                    decode_numbers(kind, &bytes)
                 }
                 Some(loc) if loc.starts_with("attachment:") => {
                     let mut it = loc.splitn(3, ':').skip(1);
@@ -389,11 +500,11 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
                             p.id
                         ))
                     })?;
-                    if size != (n * 8) as u64 {
+                    if size != (n * width) as u64 {
                         return Err(err(format!(
                             "property {}: attachment is {size} bytes, expected {}",
                             p.id,
-                            n * 8
+                            n * width
                         )));
                     }
                     location = Some((off, size));
@@ -406,7 +517,7 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
                     )));
                 }
             };
-            if p.type_ == "F64Vector" {
+            if !is_matrix {
                 PropertyValue::F64Vec(data)
             } else {
                 PropertyValue::F64Mat {
@@ -489,9 +600,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     )
 }
 
-/// Typed reader for an attachment-located f64 vector/matrix property: reads
-/// `location` bytes from the mapped file and returns the filled-in value.
-fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<PropertyValue> {
+/// The bytes of an attachment-located property within the mapped file.
+fn attachment_slice<'a>(file: &'a [u8], path: &Path, prop: &XisfProperty) -> Result<&'a [u8]> {
     let (off, size) = prop
         .location
         .ok_or_else(|| Error::format(path, format!("property {} has no attachment", prop.id)))?;
@@ -504,22 +614,34 @@ fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<P
                 format!("property {}: attachment out of bounds", prop.id),
             )
         })?;
-    let bytes = &file[off as usize..end as usize];
-    if !bytes.len().is_multiple_of(8) {
+    Ok(&file[off as usize..end as usize])
+}
+
+/// Typed decoder for an attachment-located numeric vector/matrix property:
+/// decodes its attachment `bytes` per the property's XISF type and returns
+/// the filled-in value.
+fn decode_attached_numbers(
+    bytes: &[u8],
+    path: &Path,
+    prop: &XisfProperty,
+) -> Result<PropertyValue> {
+    let (kind, width, _) = numeric_array_type(&prop.type_).ok_or_else(|| {
+        Error::format(
+            path,
+            format!("property {}: not a numeric vector/matrix", prop.id),
+        )
+    })?;
+    if !bytes.len().is_multiple_of(width) {
         return Err(Error::format(
             path,
             format!(
-                "property {}: attachment size {} not a multiple of 8",
-                prop.id, size
+                "property {}: attachment size {} not a multiple of {width}",
+                prop.id,
+                bytes.len()
             ),
         ));
     }
-    let data: Vec<f64> = bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| f64::from_le_bytes(*c))
-        .collect();
+    let data = decode_numbers(kind, bytes);
     match &prop.value {
         PropertyValue::F64Vec(_) => Ok(PropertyValue::F64Vec(data)),
         PropertyValue::F64Mat { rows, cols, .. } => Ok(PropertyValue::F64Mat {
@@ -529,7 +651,7 @@ fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<P
         }),
         _ => Err(Error::format(
             path,
-            format!("property {}: not an f64 vector/matrix", prop.id),
+            format!("property {}: not a vector/matrix", prop.id),
         )),
     }
 }
@@ -684,8 +806,13 @@ mod tests {
     /// Base64-encode f64s little-endian (test helper mirroring what PixInsight
     /// writes for `location="inline:base64"` properties).
     fn b64_f64s(data: &[f64]) -> String {
-        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        b64(&bytes)
+    }
+
+    /// Standard-alphabet base64 with padding.
+    fn b64(bytes: &[u8]) -> String {
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut s = String::new();
         for chunk in bytes.chunks(3) {
             let b = [
@@ -728,6 +855,7 @@ mod tests {
                 r#"<Property id="P:Mat" type="F64Matrix" rows="2" columns="2" location="inline:base64">{mat_b64}</Property>"#,
                 r#"<Property id="P:Att" type="F64Vector" length="3" location="attachment:1536:24"/>"#,
                 r#"<Property id="P:Odd" type="I32Vector" length="2" location="inline:base64">AAAAAAEAAAA=</Property>"#,
+                r#"<Property id="P:Cplx" type="C64Vector" length="1" location="inline:base64">AAAAAAAAAAAAAAAAAAAAAA==</Property>"#,
                 r#"</Image></xisf>"#,
             ),
             w = w,
@@ -802,6 +930,12 @@ mod tests {
 
         assert_eq!(
             get("P:Odd").value,
+            PropertyValue::F64Vec(vec![0.0, 1.0]),
+            "integer vectors decode to f64"
+        );
+        assert_eq!(get("P:Odd").type_, "I32Vector");
+        assert_eq!(
+            get("P:Cplx").value,
             PropertyValue::Unread,
             "undecoded types stay Unread"
         );
@@ -837,5 +971,206 @@ mod tests {
         std::fs::write(&path, b"NOTXISF0 garbage").unwrap();
         assert!(XisfImage::open(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_header_resolves_attachments_without_reading_pixels() {
+        let dir = std::env::temp_dir().join(format!("mpp-xisf-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = synth_xisf_with_properties(&dir);
+        let full = XisfImage::open(&path).unwrap();
+        let h = read_header(&path).unwrap();
+        assert_eq!(h, Header::from(full.header()));
+        assert_eq!(
+            h.property("P:Att").unwrap().value.as_f64_vec(),
+            Some(&[10.5, -20.25, 30.0][..])
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_header_accepts_any_sample_format() {
+        // A UInt16 image that `XisfImage::open` refuses: the header still reads.
+        let dir = std::env::temp_dir().join(format!("mpp-xisf-u16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            r#"<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">"#,
+            r#"<Image geometry="2:2:1" sampleFormat="UInt16" colorSpace="Gray" location="attachment:1024:8">"#,
+            r#"<FITSKeyword name="FOCALLEN" value="1645.0" comment="[mm] Focal length"/>"#,
+            r#"<Property id="Observation:Object:Name" type="String">NGC 3199</Property>"#,
+            r#"</Image></xisf>"#,
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SIGNATURE);
+        bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(xml.as_bytes());
+        bytes.resize(1032, 0);
+        let path = dir.join("u16.xisf");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(XisfImage::open(&path).is_err());
+        let h = read_header(&path).unwrap();
+        assert_eq!(h.keywords.len(), 1);
+        assert_eq!(
+            h.keyword("FOCALLEN").unwrap().typed_value().as_f64(),
+            Some(1645.0)
+        );
+        assert_eq!(
+            h.property("Observation:Object:Name")
+                .unwrap()
+                .value
+                .as_str(),
+            Some("NGC 3199")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_header_rejects_bad_signature_and_out_of_bounds_attachments() {
+        let dir = std::env::temp_dir().join(format!("mpp-xisf-hdrbad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.xisf");
+        std::fs::write(&path, b"NOTXISF0 garbage").unwrap();
+        assert!(read_header(&path).is_err());
+        let xml = concat!(
+            r#"<xisf version="1.0"><Image geometry="1:1:1" sampleFormat="Float32" location="attachment:512:4">"#,
+            r#"<Property id="P:Far" type="F64Vector" length="2" location="attachment:9999:16"/>"#,
+            r#"</Image></xisf>"#,
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SIGNATURE);
+        bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(xml.as_bytes());
+        bytes.resize(516, 0);
+        std::fs::write(&path, bytes).unwrap();
+        let e = read_header(&path).unwrap_err().to_string();
+        assert!(e.contains("out of bounds"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn pending(
+        id: &str,
+        type_: &str,
+        location: Option<&str>,
+        length: Option<u64>,
+        rows: Option<u32>,
+        cols: Option<u32>,
+    ) -> PendingProperty {
+        PendingProperty {
+            id: id.into(),
+            type_: type_.into(),
+            value_attr: None,
+            location: location.map(str::to_string),
+            length,
+            rows,
+            cols,
+        }
+    }
+
+    #[test]
+    fn i32vector_inline_decodes_to_f64vec_keeping_type() {
+        let bytes: Vec<u8> = [0i32, 5, 12, -3]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let p = finish_property(
+            Path::new("x"),
+            pending(
+                "AstrometricSolution:DistortionModel:ImageToProjection:Local:X:NodeOffsets",
+                "I32Vector",
+                Some("inline:base64"),
+                Some(4),
+                None,
+                None,
+            ),
+            &b64(&bytes),
+        )
+        .unwrap();
+        assert_eq!(p.type_, "I32Vector");
+        assert_eq!(p.value, PropertyValue::F64Vec(vec![0.0, 5.0, 12.0, -3.0]));
+    }
+
+    #[test]
+    fn f32matrix_inline_decodes_row_major() {
+        let bytes: Vec<u8> = [1.5f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let p = finish_property(
+            Path::new("x"),
+            pending(
+                "m",
+                "F32Matrix",
+                Some("inline:base64"),
+                None,
+                Some(2),
+                Some(3),
+            ),
+            &b64(&bytes),
+        )
+        .unwrap();
+        assert_eq!(
+            p.value,
+            PropertyValue::F64Mat {
+                rows: 2,
+                cols: 3,
+                data: vec![1.5, 2.0, 3.0, 4.0, 5.0, 6.0]
+            }
+        );
+    }
+
+    #[test]
+    fn i32vector_attachment_size_uses_element_width() {
+        // 4 elements × 4 bytes = 16 bytes; an 8-byte-per-element assumption
+        // would reject it.
+        let p = finish_property(
+            Path::new("x"),
+            pending(
+                "v",
+                "I32Vector",
+                Some("attachment:4096:16"),
+                Some(4),
+                None,
+                None,
+            ),
+            "",
+        )
+        .unwrap();
+        assert_eq!(p.location, Some((4096, 16)));
+        assert!(
+            finish_property(
+                Path::new("x"),
+                pending(
+                    "v",
+                    "I32Vector",
+                    Some("attachment:4096:32"),
+                    Some(4),
+                    None,
+                    None
+                ),
+                "",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn multiline_string_property_keeps_newline() {
+        let p = finish_property(
+            Path::new("x"),
+            pending(
+                "AstrometricSolution:DistortionModel:ImageToProjection:Terms",
+                "String",
+                None,
+                None,
+                None,
+                None,
+            ),
+            "Local\nFallback",
+        )
+        .unwrap();
+        assert_eq!(p.value, PropertyValue::Str("Local\nFallback".into()));
     }
 }
