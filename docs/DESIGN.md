@@ -245,6 +245,23 @@ multi-subblock images and a re-saved solved WBPP master.
 - Decoded throughput is 160–400 MB/s. Unshuffle and sample conversion are
   single-threaded; parallelize them if decode time matters.
 
+## FITS WCS solutions (2026-10-29)
+
+`AstrometricSolution::Wcs` is no longer a reserved slot: `WcsSolution` holds
+a FITS TAN solution with optional SIP distortion (`astrometry::fits`,
+`astrometry::sip`, ported verbatim from Mega Merge Mosaic and checked
+against an astropy oracle).
+- **Accepted:** `CD`, `PC × CDELT`, or `CDELT` + `CROTA2`.
+- **Refused by name:** TPV, PV terms, FK4, a non-2000 `EQUINOX`, a non-180
+  `LONPOLE`, and non-degree units.
+- **Fallback:** `from_header` reads it when the header carries no
+  PixInsight block (`CTYPE` cards; row order from `ROWORDER`).
+- **Inverse direction:** `PiSolution::projection_to_image` gives the
+  inverse of `image_to_projection`.
+- **Linear layer alone:** `astrometry::linear_layer` reads layer 1 leniently,
+  for consumers that need the linear WCS even when a higher layer is
+  unusable.
+
 ## WCS sidecar schema (v1, decided 2026-08-20)
 
 Canonical JSON, written as `<output-stem>.wcs.json` beside any container
