@@ -227,6 +227,39 @@ impl PiSolution {
         }
     }
 
+    /// Map a projection-plane point (ξ, η), degrees, back to an image
+    /// coordinate: the inverse of [`Self::image_to_projection`], through the
+    /// legacy `NativeToImage` grid, or layer 2's projection→image matrix plus
+    /// the layer 3 projection→image residual, or the inverted linear
+    /// solution — the same layer choice as the forward direction.
+    pub fn projection_to_image(&self, xi: f64, eta: f64) -> (f64, f64) {
+        let linear = || {
+            let m = self.linear;
+            let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+            let dx = (m[1][1] * xi - m[0][1] * eta) / det;
+            let dy = (-m[1][0] * xi + m[0][0] * eta) / det;
+            (self.reference_image[0] + dx, self.reference_image[1] + dy)
+        };
+        let base = || match &self.projective {
+            Some(p) => p.projection_to_image.apply(xi, eta),
+            None => linear(),
+        };
+        match &self.distortion {
+            Some(Distortion::Grids {
+                native_to_image, ..
+            }) => native_to_image.eval(xi, eta),
+            Some(Distortion::Rbf {
+                projection_to_image,
+                ..
+            }) => {
+                let (px, py) = base();
+                let (rx, ry) = projection_to_image.residual(xi, eta);
+                (px + rx, py + ry)
+            }
+            None => base(),
+        }
+    }
+
     /// Map an image coordinate to (RA, Dec) in degrees: the projection-plane
     /// point from [`Self::image_to_projection`], deprojected (gnomonic) about
     /// the reference point.

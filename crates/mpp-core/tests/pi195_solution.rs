@@ -182,3 +182,30 @@ fn solution_round_trips_through_serde() {
     assert_eq!(back, sol);
     assert_eq!(back.pixel_to_sky(10.0, 20.0), sol.pixel_to_sky(10.0, 20.0));
 }
+
+#[test]
+fn projection_to_image_inverts_image_to_projection() {
+    let mut s = pi(&header());
+    let (w, h) = (4944.0, 3284.0);
+    // PixInsight fits the two directions' splines independently, so with
+    // layer 3 the round trip is only as good as that fit (≈ 0.1–0.4 px at
+    // worst on this solve); layers 1–2 invert exactly.
+    let check = |s: &mpp_core::astrometry::PiSolution, what: &str, tol: f64| {
+        let mut worst = 0f64;
+        for j in 0..9 {
+            for i in 0..9 {
+                let (x, y) = (w * i as f64 / 8.0, h * j as f64 / 8.0);
+                let (xi, eta) = s.image_to_projection(x, y);
+                let (bx, by) = s.projection_to_image(xi, eta);
+                worst = worst.max((bx - x).hypot(by - y));
+            }
+        }
+        assert!(worst < tol, "{what}: round trip off by {worst} px");
+    };
+    assert!(matches!(s.distortion, Some(Distortion::Rbf { .. })));
+    check(&s, "layers 1-3", 0.5);
+    s.distortion = None;
+    check(&s, "layers 1-2", 1e-3);
+    s.projective = None;
+    check(&s, "layer 1", 1e-9);
+}
