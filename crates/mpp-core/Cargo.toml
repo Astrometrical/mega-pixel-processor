@@ -37,6 +37,9 @@ tiff = ["dep:tiff"]
 convert = ["tiff"]
 # DZI / single-image publishing (`publish`) and the viewer page.
 publish = ["convert"]
+# Test encoders (`testkit`: synthetic XISF/FITS writers, including every
+# XISF codec) for other crates' tests; never enable in production builds.
+testkit = []
 
 [[example]]
 name = "tiff_bench"

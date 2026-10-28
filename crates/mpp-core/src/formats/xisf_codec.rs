@@ -363,8 +363,8 @@ impl Decoder {
 /// `shuffle_item` when given) in subblocks of `subblock_size` uncompressed
 /// bytes, storing raw any subblock that does not shrink (the Revision 2
 /// encoder rule). Returns the stored bytes and the matching [`Compression`].
-#[cfg(test)]
-pub(crate) fn compress(
+#[cfg(any(test, feature = "testkit"))]
+pub fn compress(
     codec: Codec,
     shuffle_item: Option<usize>,
     data: &[u8],

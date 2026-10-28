@@ -308,7 +308,7 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testsupport::synth_xisf;
+    use crate::testkit::synth_xisf;
     use crate::wcs::sidecar::WcsSidecar;
     use std::path::PathBuf;
 

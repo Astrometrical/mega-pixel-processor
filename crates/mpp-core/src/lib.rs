@@ -59,5 +59,5 @@ pub mod viewer;
 #[cfg(feature = "publish")]
 pub mod publish;
 
-#[cfg(test)]
-mod testsupport;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;

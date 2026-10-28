@@ -409,7 +409,7 @@ mod tests {
     fn signature_beats_extension() {
         let dir = tmpdir("sig-ext");
         let p = dir.join("really-xisf.fits");
-        crate::testsupport::synth_xisf(&p, 4, 3, 1, true);
+        crate::testkit::synth_xisf(&p, 4, 3, 1, true);
         let h = read_header(&p).unwrap();
         assert!(
             h.property("PCL:AstrometricSolution:ReferenceCelestialCoordinates")

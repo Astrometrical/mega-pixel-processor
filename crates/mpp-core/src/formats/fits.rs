@@ -403,7 +403,7 @@ impl FitsImage {
 mod tests {
     use super::*;
     use crate::formats::{card_number, card_string};
-    use crate::testsupport::synth_fits;
+    use crate::testkit::synth_fits;
     use std::path::PathBuf;
 
     fn card(s: &str) -> Vec<u8> {

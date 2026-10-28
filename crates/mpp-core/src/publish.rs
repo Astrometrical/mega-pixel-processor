@@ -373,7 +373,7 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testsupport::synth_xisf;
+    use crate::testkit::synth_xisf;
     use std::path::PathBuf;
 
     fn tmpdir(tag: &str) -> PathBuf {

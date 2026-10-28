@@ -1807,7 +1807,7 @@ mod tests {
         //! Property data blocks: compression, checksums, embedded, byte order.
         use super::super::*;
         use crate::formats::xisf_codec::Codec;
-        use crate::testsupport::{BlockSpec, Placement, PropSpec, XisfBuilder, tiny_image};
+        use crate::testkit::{BlockSpec, Placement, PropSpec, XisfBuilder, tiny_image};
 
         fn tmp(tag: &str) -> PathBuf {
             let d =
@@ -2124,7 +2124,7 @@ mod tests {
     mod images {
         //! `<Image>` attributes and multi-image units.
         use super::super::*;
-        use crate::testsupport::{ImageSpec, XisfBuilder, tiny_image};
+        use crate::testkit::{ImageSpec, XisfBuilder, tiny_image};
 
         fn tmp(tag: &str) -> PathBuf {
             let d =
@@ -2340,7 +2340,7 @@ mod tests {
         //! storage model, against the zero-copy reference.
         use super::super::*;
         use crate::formats::xisf_codec::Codec;
-        use crate::testsupport::{BlockSpec, ImageSpec, Placement, XisfBuilder, tiny_image};
+        use crate::testkit::{BlockSpec, ImageSpec, Placement, XisfBuilder, tiny_image};
 
         const W: u64 = 33;
         const H: u64 = 17;

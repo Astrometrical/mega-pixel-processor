@@ -1,5 +1,6 @@
-//! Test-only builders for synthetic input files (tests never depend on
-//! real image data — see CLAUDE.md).
+//! Builders for synthetic input files: mpp-core's own unit tests, and
+//! (behind the `testkit` feature) other crates' tests, use them instead of
+//! real image data — see CLAUDE.md.
 
 // Some builders serve only the feature-gated convert/publish tests.
 #![cfg_attr(not(feature = "convert"), allow(dead_code))]
@@ -38,7 +39,7 @@ fn b64_f64s(data: &[f64]) -> String {
 /// With `with_wcs`, a full PixInsight astrometric-solution property set is
 /// embedded (Gnomonic, ICRS, crval [84.199, -3.240], refimg [w/2, h/2],
 /// diagonal matrix ±4.4368e-4 deg/px).
-pub(crate) fn synth_xisf(path: &Path, w: u64, h: u64, c: u64, with_wcs: bool) {
+pub fn synth_xisf(path: &Path, w: u64, h: u64, c: u64, with_wcs: bool) {
     let data_offset = 4096u64;
     let data_size = w * h * c * 4;
     let props = if with_wcs {
@@ -96,7 +97,7 @@ pub(crate) fn synth_xisf(path: &Path, w: u64, h: u64, c: u64, with_wcs: bool) {
 /// in `[0, 1]`; integer `bitpix` (8/16/32) quantizes to the full unsigned
 /// range with the conventional `BZERO` (0 / 32768 / 2147483648); −32/−64
 /// store the floats. Round-trips through [`crate::formats::fits::FitsImage`].
-pub(crate) fn synth_fits(
+pub fn synth_fits(
     path: &Path,
     w: u64,
     h: u64,
@@ -198,7 +199,7 @@ pub(crate) fn synth_fits(
 
 /// How a synthesized XISF block is serialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Placement {
+pub enum Placement {
     /// `location="attachment:…"` after the header.
     Attached,
     /// `location="inline:base64"`.
@@ -209,7 +210,7 @@ pub(crate) enum Placement {
 
 /// Encoding options for one synthesized block.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockSpec {
+pub struct BlockSpec {
     /// Where the block goes.
     pub placement: Placement,
     /// `(codec, shuffle item size, subblock size)` to compress with.
@@ -232,7 +233,7 @@ impl Default for BlockSpec {
 }
 
 /// Hex digest of `data` under the XISF checksum algorithm `alg`.
-pub(crate) fn digest_hex(alg: &str, data: &[u8]) -> String {
+pub fn digest_hex(alg: &str, data: &[u8]) -> String {
     use sha2::Digest;
     let d: Vec<u8> = match alg {
         "sha-1" | "sha1" => sha1::Sha1::digest(data).to_vec(),
@@ -314,7 +315,7 @@ fn encode_block(data: &[u8], spec: &BlockSpec) -> EncodedBlock {
 
 /// One `<Image>` of a synthesized unit.
 #[derive(Debug, Clone)]
-pub(crate) struct ImageSpec {
+pub struct ImageSpec {
     /// `geometry` (width, height, channels).
     pub geometry: (u64, u64, u64),
     /// `sampleFormat` attribute value.
@@ -333,7 +334,7 @@ pub(crate) struct ImageSpec {
 
 /// A `<Property>` whose value is a data block (vector/matrix).
 #[derive(Debug, Clone)]
-pub(crate) struct PropSpec {
+pub struct PropSpec {
     /// `id`.
     pub id: &'static str,
     /// `type`, e.g. `F64Matrix`.
@@ -352,7 +353,7 @@ pub(crate) struct PropSpec {
 /// uncompressed attached image blocks 4096-aligned, compressed blocks and
 /// property attachments packed after them unaligned.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct XisfBuilder {
+pub struct XisfBuilder {
     /// Images, in order.
     pub images: Vec<ImageSpec>,
     /// File-level block properties.
@@ -472,7 +473,7 @@ impl XisfBuilder {
 }
 
 /// A minimal one-image unit: `w`×`h`×1 Float32 zeros, uncompressed.
-pub(crate) fn tiny_image() -> ImageSpec {
+pub fn tiny_image() -> ImageSpec {
     ImageSpec {
         geometry: (2, 2, 1),
         sample_format: "Float32",
