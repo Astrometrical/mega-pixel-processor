@@ -8,7 +8,8 @@
 //! such as Mega Merge Mosaic build with `default-features = false`):
 //!
 //! - [`formats`] — image readers/writers: native XISF reading, FITS
-//!   reading (header and pixels), and signature-based format detection.
+//!   reading (header and pixels) and streaming writing, and signature-based
+//!   format detection.
 //! - [`header`] — the format-neutral [`header::Header`] (ordered FITS
 //!   keywords plus XISF properties) that the readers return.
 //! - [`astrometry`] — [`astrometry::AstrometricSolution`], the full

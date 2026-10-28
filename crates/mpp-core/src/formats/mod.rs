@@ -10,6 +10,7 @@ use crate::header::Header;
 use crate::{Error, Result};
 
 pub mod fits;
+pub mod fits_write;
 #[cfg(feature = "tiff")]
 pub mod tiff;
 #[cfg(feature = "tiff")]
