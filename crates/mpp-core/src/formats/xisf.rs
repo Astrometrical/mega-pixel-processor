@@ -1,9 +1,14 @@
-//! Minimal XISF reader (PixInsight's native format).
+//! XISF reader (PixInsight's native format): baseline-decoder conformance
+//! with XISF 1.0 at document revision 1.02.
 //!
-//! Supports the monolithic XISF subset PixInsight emits for processed
-//! images: one `<Image>` element, planar pixel storage, little-endian
-//! Float32 samples, uncompressed attachment data block. Anything else
-//! errors clearly; compression and other sample formats come later.
+//! Monolithic units with any number of `<Image>`s; data blocks attached,
+//! inline or embedded, compressed with any standard codec (see
+//! [`super::xisf_codec`]) and checksummed (see [`super::xisf_block`]);
+//! planar or normal storage, either byte order, UInt8/16/32 and Float32/64
+//! samples. [`XisfImage`] serves the uncompressed planar little-endian
+//! Float32 layout zero-copy and decodes everything else on request.
+//! Distributed units, UInt64/complex samples and CIE L*a*b* are refused by
+//! name. `docs/DESIGN.md` ("XISF conformance") has the details.
 //!
 //! Spec: <https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html>
 
@@ -580,11 +585,9 @@ impl super::PlanarRows<f32> for XisfImage {
 /// The FITS keywords and properties of the XISF file at `path`, without its
 /// pixels.
 ///
-/// Reads only the XML header and the attachment blocks of vector/matrix
-/// properties, so it is cheap on multi-GB files and accepts every sample
-/// format (unlike [`XisfImage::open`], which reads Float32 only). The other
-/// limits of the module docs still apply: compressed or non-planar images
-/// are refused.
+/// Reads only the XML header and the attachment blocks of properties
+/// (decompressed and checksum-verified as needed), never the pixels, so it
+/// is cheap on multi-GB files whatever their encoding.
 ///
 /// PixInsight's private `PCL:AstrometricSolution:Grid:*` properties, a
 /// lookup-table cache of the astrometric solution (about 20 MB on a 16 MP
