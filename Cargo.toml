@@ -29,6 +29,10 @@ tiff = "0.11"
 flate2 = "1.1"
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
 zstd = "0.14"
+# XISF block checksums.
+sha1 = "0.11"
+sha2 = "0.11"
+sha3 = "0.12"
 nix = { version = "0.29", features = ["mman", "fs"] }
 libc = "0.2"
 windows-sys = { version = "0.59", features = [

@@ -21,6 +21,10 @@ tiff = { workspace = true, optional = true }
 flate2.workspace = true
 lz4_flex.workspace = true
 zstd.workspace = true
+# XISF block checksums (SHA-1/SHA-2 required by the spec, SHA-3 optional).
+sha1.workspace = true
+sha2.workspace = true
+sha3.workspace = true
 
 [features]
 # Everything on by default for the mpp CLI and PixInsight worker. Format

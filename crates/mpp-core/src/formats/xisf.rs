@@ -628,7 +628,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let digits: Vec<u8> = s
         .bytes()
         .filter(|b| !b.is_ascii_whitespace())
