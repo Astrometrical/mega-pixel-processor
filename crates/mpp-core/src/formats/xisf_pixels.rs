@@ -29,12 +29,22 @@ pub(crate) fn unsupported(h: &XisfHeader) -> Option<String> {
     }
 }
 
-/// Convert `raw` (the uncompressed block, `w·h·c` samples) into `out`
-/// (`w·h·c` planar normalized f32). `raw` is byte-swapped in place for a
-/// big-endian block.
+/// Whether the block's uncompressed bytes are already the planar
+/// normalized f32 output (Float32, planar, little-endian, default `0:1`
+/// range, no offset), so it can be decompressed straight into the output.
+pub(crate) fn is_identity_layout(h: &XisfHeader) -> bool {
+    h.sample_format == SampleFormat::Float32
+        && h.pixel_storage == PixelStorage::Planar
+        && h.block.byte_order == ByteOrder::Little
+        && h.effective_bounds() == (0.0, 1.0)
+        && h.offset == 0.0
+}
+
+/// Convert `raw` (the uncompressed block, `w·h·c` samples in the block's
+/// byte order) into `out` (`w·h·c` planar normalized f32).
 pub(crate) fn to_planar_f32(
     h: &XisfHeader,
-    raw: &mut [u8],
+    raw: &[u8],
     out: &mut [f32],
 ) -> std::result::Result<(), String> {
     if let Some(why) = unsupported(h) {
@@ -55,11 +65,7 @@ pub(crate) fn to_planar_f32(
             h.sample_format
         ));
     }
-    if h.block.byte_order == ByteOrder::Big && bps > 1 {
-        for s in raw.chunks_exact_mut(bps) {
-            s.reverse();
-        }
-    }
+    let big = h.block.byte_order == ByteOrder::Big;
     let (lo, hi) = h.effective_bounds();
     let float = matches!(
         h.sample_format,
@@ -71,17 +77,41 @@ pub(crate) fn to_planar_f32(
         let b = &raw[k * bps..(k + 1) * bps];
         let v = match h.sample_format {
             SampleFormat::UInt8 => b[0] as f64,
-            SampleFormat::UInt16 => u16::from_le_bytes([b[0], b[1]]) as f64,
-            SampleFormat::UInt32 => u32::from_le_bytes(b.try_into().unwrap()) as f64,
+            SampleFormat::UInt16 => {
+                let b = [b[0], b[1]];
+                (if big {
+                    u16::from_be_bytes(b)
+                } else {
+                    u16::from_le_bytes(b)
+                }) as f64
+            }
+            SampleFormat::UInt32 => {
+                let b = b.try_into().unwrap();
+                (if big {
+                    u32::from_be_bytes(b)
+                } else {
+                    u32::from_le_bytes(b)
+                }) as f64
+            }
             SampleFormat::Float32 => {
-                let f = f32::from_le_bytes(b.try_into().unwrap());
+                let b = b.try_into().unwrap();
+                let f = if big {
+                    f32::from_be_bytes(b)
+                } else {
+                    f32::from_le_bytes(b)
+                };
                 if identity {
                     return f;
                 }
                 f as f64
             }
             SampleFormat::Float64 => {
-                let f = f64::from_le_bytes(b.try_into().unwrap());
+                let b = b.try_into().unwrap();
+                let f = if big {
+                    f64::from_be_bytes(b)
+                } else {
+                    f64::from_le_bytes(b)
+                };
                 if identity {
                     return f as f32;
                 }

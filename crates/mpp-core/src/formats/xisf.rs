@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use quick_xml::events::Event;
 
-use super::xisf_block::{BlockAttrs, BlockLocation, ByteOrder, DataBlock};
+use super::xisf_block::{BlockAttrs, BlockLocation, ByteOrder, DataBlock, try_zeroed};
 use super::{FitsKeyword, PropertyValue, SampleFormat, XisfProperty};
 use crate::header::Header;
 use crate::{Error, Result};
@@ -459,26 +459,37 @@ impl XisfImage {
             }
             Pixels::Pending => {}
         }
+        let err = |e: String| Error::format(&self.path, format!("image block: {e}"));
+        let verify = self.verify_checksums;
+        let Some(c) = &h.block.compression else {
+            // Uncompressed but not mappable: convert straight from the file.
+            let stored = h.block.stored(&self.mmap).map_err(err)?;
+            if verify && let Some(sum) = &h.block.checksum {
+                sum.verify(stored).map_err(err)?;
+            }
+            return super::xisf_pixels::to_planar_f32(h, stored, out).map_err(err);
+        };
         let len = usize::try_from(h.block.uncompressed_len())
-            .map_err(|_| Error::format(&self.path, "image block too large for this platform"))?;
-        let mut raw = vec![0u8; len];
-        let shuffled = h
-            .block
-            .compression
-            .as_ref()
-            .is_some_and(|c| c.item_size.is_some());
-        let mut scratch = shuffled.then(|| vec![0u8; len]);
+            .map_err(|_| err("too large for this platform".into()))?;
+        let mut scratch = match c.item_size {
+            Some(_) => Some(try_zeroed::<u8>(len).map_err(err)?),
+            None => None,
+        };
+        if super::xisf_pixels::is_identity_layout(h) {
+            // The decompressed bytes *are* the planar f32 output: decode in
+            // place, holding at most one scratch buffer besides `out`.
+            let bytes: &mut [u8] = bytemuck::cast_slice_mut(out);
+            return h
+                .block
+                .decode_into(&self.mmap, verify, bytes, scratch.as_deref_mut())
+                .map_err(err);
+        }
+        let mut raw = try_zeroed::<u8>(len).map_err(err)?;
         h.block
-            .decode_into(
-                &self.mmap,
-                self.verify_checksums,
-                &mut raw,
-                scratch.as_deref_mut(),
-            )
-            .map_err(|e| Error::format(&self.path, format!("image block: {e}")))?;
+            .decode_into(&self.mmap, verify, &mut raw, scratch.as_deref_mut())
+            .map_err(err)?;
         drop(scratch);
-        super::xisf_pixels::to_planar_f32(h, &mut raw, out)
-            .map_err(|e| Error::format(&self.path, e))
+        super::xisf_pixels::to_planar_f32(h, &raw, out).map_err(err)
     }
 
     /// Decode the pixels into memory if they are not mapped (a no-op when
@@ -487,7 +498,8 @@ impl XisfImage {
     pub fn load(&mut self) -> Result<()> {
         if matches!(self.pixels, Pixels::Pending) {
             let h = &self.header;
-            let mut v = vec![0f32; (h.width * h.height * h.channels) as usize];
+            let mut v = try_zeroed::<f32>((h.width * h.height * h.channels) as usize)
+                .map_err(|e| Error::format(&self.path, e))?;
             self.decode_into(&mut v)?;
             self.pixels = Pixels::Decoded(v);
         }
@@ -1048,7 +1060,10 @@ fn finish_property_strict(
                     "property {}: data block is {} bytes, expected {}",
                     p.id,
                     block.uncompressed_len(),
-                    n * width
+                    expected.map_or_else(
+                        || "more than 2^64 (length overflow)".to_string(),
+                        |e| e.to_string()
+                    )
                 )));
             }
             let data: Vec<f64> = match &block.location {
@@ -2722,7 +2737,10 @@ mod tests {
             bytes[16..16 + xml.len()].copy_from_slice(xml.as_bytes());
             std::fs::write(&p, &bytes).unwrap();
             let e = XisfImage::open(&p).err().expect("oversized").to_string();
-            assert!(e.contains("does not match geometry"), "{e}");
+            assert!(
+                e.contains("does not match geometry") || e.contains("expand"),
+                "{e}"
+            );
             std::fs::remove_dir_all(&d).unwrap();
         }
 
@@ -2769,6 +2787,133 @@ mod tests {
             .write(&p);
             let img = XisfImage::open(&p).unwrap();
             let _ = img.channel(0);
+        }
+    }
+
+    mod hostile {
+        //! Headers that declare sizes far beyond what the stored bytes can
+        //! decompress to must be refused, never allocated (review C1).
+        use super::super::*;
+        use crate::testkit::tiny_image;
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d =
+                std::env::temp_dir().join(format!("mpp-xisf-hostile-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        /// A unit whose root holds `xml` (after one tiny image), with 64
+        /// junk bytes at offset 8192 for attachments to point at.
+        fn unit(d: &Path, image_xml: Option<&str>, root_xml: &str) -> PathBuf {
+            let image = image_xml.map(str::to_string).unwrap_or_else(|| {
+                let t = tiny_image();
+                format!(
+                    r#"<Image geometry="2:2:1" sampleFormat="Float32"{} location="attachment:4096:16"/>"#,
+                    t.attrs
+                )
+            });
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">{image}{root_xml}</xisf>"#
+            );
+            let mut bytes = b"XISF0100".to_vec();
+            bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&[0u8; 4]);
+            bytes.extend_from_slice(xml.as_bytes());
+            bytes.resize(8192 + 64, 0x5A);
+            let p = d.join("h.xisf");
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+
+        fn refused(p: &Path) {
+            let e = read_header(p).unwrap_err().to_string();
+            assert!(
+                e.contains("expand") || e.contains("overflow"),
+                "read_header: {e}"
+            );
+            let e = XisfImage::open(p)
+                .err()
+                .expect("open must refuse")
+                .to_string();
+            assert!(e.contains("expand") || e.contains("overflow"), "open: {e}");
+        }
+
+        #[test]
+        fn huge_compressed_image_is_refused() {
+            let d = tmp("image");
+            let p = unit(
+                &d,
+                Some(
+                    r#"<Image geometry="1073741824:1073741824:1" sampleFormat="Float32" bounds="0:1" compression="zlib:4611686018427387904" location="attachment:8192:12"/>"#,
+                ),
+                "",
+            );
+            let e = XisfImage::open(&p)
+                .err()
+                .expect("open must refuse")
+                .to_string();
+            assert!(e.contains("expand"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn huge_numeric_property_is_refused() {
+            let d = tmp("vec");
+            let p = unit(
+                &d,
+                None,
+                r#"<Property id="V" type="F64Vector" length="576460752303423488" compression="zlib:4611686018427387904" location="attachment:8192:12"/>"#,
+            );
+            refused(&p);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn huge_attached_string_property_is_refused() {
+            let d = tmp("str-att");
+            let p = unit(
+                &d,
+                None,
+                r#"<Property id="S" type="String" compression="zstd:4611686018427387904" location="attachment:8192:12"/>"#,
+            );
+            refused(&p);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn huge_inline_string_property_is_refused() {
+            let d = tmp("str-inl");
+            let p = unit(
+                &d,
+                None,
+                r#"<Property id="S" type="String" compression="lz4:4611686018427387904" location="inline:base64">AAAAAAAAAAAAAAAA</Property>"#,
+            );
+            refused(&p);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn overflowing_vector_length_is_an_error_not_a_panic() {
+            let d = tmp("ovf");
+            // Non-f64 arrays are lenient: the malformed one reads as Unread.
+            let p = unit(
+                &d,
+                None,
+                r#"<Property id="V" type="I32Vector" length="4611686018427387904" location="inline:base64">AAAA</Property>"#,
+            );
+            let h = read_header(&p).unwrap();
+            assert_eq!(h.property("V").unwrap().value, PropertyValue::Unread);
+            // F64 arrays are strict: an error, with no overflow panic.
+            let p = unit(
+                &d,
+                None,
+                r#"<Property id="V" type="F64Vector" length="4611686018427387904" location="inline:base64">AAAA</Property>"#,
+            );
+            let e = read_header(&p).unwrap_err().to_string();
+            assert!(e.contains("overflow"), "{e}");
+            assert!(XisfImage::open(&p).is_err());
+            std::fs::remove_dir_all(&d).unwrap();
         }
     }
 }

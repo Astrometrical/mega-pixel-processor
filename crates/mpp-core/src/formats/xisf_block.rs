@@ -212,12 +212,16 @@ impl DataBlock {
     ) -> std::result::Result<Vec<u8>, String> {
         let n = usize::try_from(self.uncompressed_len())
             .map_err(|_| "block too large for this platform".to_string())?;
-        let mut out = vec![0u8; n];
+        let mut out = try_zeroed::<u8>(n)?;
         let shuffled = self
             .compression
             .as_ref()
             .is_some_and(|c| c.item_size.is_some());
-        let mut scratch = shuffled.then(|| vec![0u8; n]);
+        let mut scratch = if shuffled {
+            Some(try_zeroed::<u8>(n)?)
+        } else {
+            None
+        };
         self.decode_stored_into(stored, verify, &mut out, scratch.as_deref_mut())?;
         Ok(out)
     }
@@ -312,6 +316,21 @@ impl Checksum {
             ))
         }
     }
+}
+
+/// A zero-filled buffer of `n` elements whose size came from a file
+/// header, allocated fallibly: an absurd size becomes an error, not a
+/// process abort.
+pub(crate) fn try_zeroed<T: Clone + Default>(n: usize) -> std::result::Result<Vec<T>, String> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| {
+        format!(
+            "cannot allocate {} bytes for an XISF data block",
+            n.saturating_mul(std::mem::size_of::<T>())
+        )
+    })?;
+    v.resize(n, T::default());
+    Ok(v)
 }
 
 #[cfg(test)]

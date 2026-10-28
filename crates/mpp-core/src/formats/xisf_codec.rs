@@ -29,6 +29,19 @@ pub enum Codec {
 }
 
 impl Codec {
+    /// Upper bound on how many bytes one stored byte of this codec's stream
+    /// can decompress to (zlib/deflate tops out near 1032:1, LZ4 near 255:1,
+    /// zstd RLE blocks at 32768:1), with a margin. A header claiming more is
+    /// lying about the data, and must be refused before anything is
+    /// allocated from it.
+    fn max_expansion(self) -> u64 {
+        match self {
+            Codec::Zlib => 1100,
+            Codec::Lz4 | Codec::Lz4Hc => 260,
+            Codec::Zstd => 33_000,
+        }
+    }
+
     fn id(self) -> &'static str {
         match self {
             Codec::Zlib => "zlib",
@@ -124,6 +137,15 @@ impl Compression {
                 "subblock uncompressed lengths sum to {u_sum}, but compression declares {uncompressed_size}"
             ));
         }
+        for (i, &(c, u)) in subblocks.iter().enumerate() {
+            let limit = c.saturating_mul(codec.max_expansion()).saturating_add(1024);
+            if c != u && u > limit {
+                return Err(format!(
+                    "subblock {i} declares {u} bytes from {c} stored: more than {} can expand to",
+                    codec.id()
+                ));
+            }
+        }
         Ok(Compression {
             codec,
             item_size,
@@ -198,7 +220,22 @@ pub fn decompress_into(
             c.uncompressed_size
         ));
     }
-    let stored_total: u64 = c.subblocks.iter().map(|s| s.0).sum();
+    let stored_total = c
+        .subblocks
+        .iter()
+        .try_fold(0u64, |a, s| a.checked_add(s.0))
+        .ok_or("subblock compressed lengths overflow")?;
+    let u_total = c
+        .subblocks
+        .iter()
+        .try_fold(0u64, |a, s| a.checked_add(s.1))
+        .ok_or("subblock uncompressed lengths overflow")?;
+    if u_total != c.uncompressed_size {
+        return Err(format!(
+            "subblocks decompress to {u_total} bytes, the block declares {}",
+            c.uncompressed_size
+        ));
+    }
     if stored.len() as u64 != stored_total {
         return Err(format!(
             "{} block stores {} bytes, its subblocks declare {stored_total}",
@@ -574,6 +611,25 @@ mod tests {
             let e = decode(&c, &stored).map(|_| ()).unwrap_err();
             assert!(e.contains("subblock 0"), "{codec:?}: {e}");
         }
+    }
+
+    #[test]
+    fn maximally_compressible_blocks_pass_the_expansion_bound() {
+        // All-zero data is the best case for every codec; real encoders
+        // must stay within the bound `parse` enforces.
+        let data = vec![0u8; 4 << 20];
+        for (codec, sh) in ALL {
+            let (stored, c) = compress(codec, sh, &data, data.len());
+            let attr = match sh {
+                Some(i) => format!("{}:{}:{i}", c.codec_id(), data.len()),
+                None => format!("{}:{}", c.codec_id(), data.len()),
+            };
+            let parsed = Compression::parse(&attr, None, stored.len() as u64)
+                .unwrap_or_else(|e| panic!("{codec:?} {sh:?}: {e}"));
+            assert_eq!(decode(&parsed, &stored).unwrap(), data);
+        }
+        let e = Compression::parse("zstd:400000000", None, 10).unwrap_err();
+        assert!(e.contains("expand"), "{e}");
     }
 
     #[test]
