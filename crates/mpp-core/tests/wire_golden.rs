@@ -1,0 +1,84 @@
+//! Golden serde form of the value types that cross the PixInsight host ↔
+//! worker IPC in Mega Merge Mosaic (`FitsKeyword`, `XisfProperty`,
+//! `PropertyValue`).
+//!
+//! The fixture is a byte-for-byte copy of mmm's
+//! `crates/mmm-core/tests/fixtures/wire_golden.json`. mmm re-exports these
+//! types from mpp-core, so mpp may only *match* that form: there is no bless
+//! mode here. A failure means a serde change that would break the mmm wire.
+
+use std::path::PathBuf;
+
+use mpp_core::formats::{FitsKeyword, PropertyValue, XisfProperty};
+
+#[derive(serde::Serialize)]
+struct WireSample {
+    keywords: Vec<FitsKeyword>,
+    properties: Vec<XisfProperty>,
+}
+
+fn kw(name: &str, value: &str, comment: &str) -> FitsKeyword {
+    FitsKeyword {
+        name: name.into(),
+        value: value.into(),
+        comment: comment.into(),
+    }
+}
+
+fn prop(id: &str, type_: &str, value: PropertyValue, location: Option<(u64, u64)>) -> XisfProperty {
+    XisfProperty {
+        id: id.into(),
+        type_: type_.into(),
+        value,
+        location,
+    }
+}
+
+fn sample() -> WireSample {
+    WireSample {
+        keywords: vec![
+            kw("OBJECT", "'M42'", "target"),
+            kw("CRVAL1", "84.199", ""),
+            kw("COMMENT", "", "free text"),
+        ],
+        properties: vec![
+            prop(
+                "Instrument:Filter:Name",
+                "String",
+                PropertyValue::Str("Ha".into()),
+                None,
+            ),
+            prop("Test:F64", "Float64", PropertyValue::F64(-0.5), None),
+            prop("Test:I64", "Int32", PropertyValue::I64(-7), None),
+            prop(
+                "Test:Vector",
+                "F64Vector",
+                PropertyValue::F64Vec(vec![1.0, 2.5e-7, -3.0]),
+                Some((4096, 24)),
+            ),
+            prop(
+                "Test:Matrix",
+                "F64Matrix",
+                PropertyValue::F64Mat {
+                    rows: 2,
+                    cols: 2,
+                    data: vec![1.0, 0.0, 0.0, -1.0],
+                },
+                None,
+            ),
+            prop("Test:Complex", "C64Vector", PropertyValue::Unread, None),
+        ],
+    }
+}
+
+#[test]
+fn wire_golden_matches_fixture() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wire_golden.json");
+    let json = serde_json::to_string_pretty(&sample()).unwrap();
+    let golden = std::fs::read_to_string(&path).expect("fixture missing: copy it from mmm");
+    assert_eq!(
+        json,
+        golden.trim_end(),
+        "wire serde form diverged from mmm's golden"
+    );
+}
