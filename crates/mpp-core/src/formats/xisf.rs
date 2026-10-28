@@ -32,12 +32,30 @@ pub struct XisfHeader {
     pub height: u64,
     /// Number of channels (planar planes).
     pub channels: u64,
-    /// Per-sample data type; only [`SampleFormat::Float32`] is readable.
+    /// Per-sample data type.
     pub sample_format: SampleFormat,
-    /// Byte offset of the attached data block within the file.
+    /// Byte offset of the image's data block within the file (0 for an
+    /// embedded block).
     pub data_offset: u64,
-    /// Byte size of the attached data block.
+    /// Stored (possibly compressed) byte size of the image's data block.
     pub data_size: u64,
+    /// The image's data block: location, byte order, compression, checksum.
+    pub block: DataBlock,
+    /// Pixel storage model (`pixelStorage`, default planar).
+    pub pixel_storage: PixelStorage,
+    /// Color space (`colorSpace`, default gray).
+    pub color_space: ColorSpace,
+    /// Declared representable range (`bounds`), if any; see
+    /// [`XisfHeader::effective_bounds`].
+    pub bounds: Option<(f64, f64)>,
+    /// `offset` attribute: subtracted from every sample (default 0).
+    pub offset: f64,
+    /// The image's `id` attribute, if any.
+    pub image_id: Option<String>,
+    /// Number of `<Image>` elements in the unit.
+    pub image_count: usize,
+    /// The `id` of every `<Image>` in the unit, in order.
+    pub image_ids: Vec<Option<String>>,
     /// All `<FITSKeyword>` cards of the image element, in header order.
     pub fits_keywords: Vec<FitsKeyword>,
     /// All `<Property>` elements in the header (image-level and file-level).
@@ -48,9 +66,203 @@ pub struct XisfHeader {
     pub(crate) property_blocks: Vec<(usize, DataBlock)>,
 }
 
+impl XisfHeader {
+    /// The representable sample range: `bounds` when declared, else the
+    /// format's default — `[0, 1]` for floating point (the spec requires
+    /// `bounds` there; PixInsight writes `0:1`), `[0, 2^k − 1]` for k-bit
+    /// unsigned integers.
+    pub fn effective_bounds(&self) -> (f64, f64) {
+        self.bounds.unwrap_or(match self.sample_format {
+            SampleFormat::UInt8 => (0.0, 255.0),
+            SampleFormat::UInt16 => (0.0, 65535.0),
+            SampleFormat::UInt32 => (0.0, 4294967295.0),
+            SampleFormat::UInt64 => (0.0, 18446744073709551615.0),
+            _ => (0.0, 1.0),
+        })
+    }
+}
+
+/// XISF pixel storage model (`pixelStorage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelStorage {
+    /// Each channel stored as a contiguous plane (the default).
+    Planar,
+    /// Channels interleaved pixel by pixel.
+    Normal,
+}
+
+/// XISF color space (`colorSpace`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorSpace {
+    /// Grayscale (the default).
+    Gray,
+    /// RGB.
+    Rgb,
+    /// CIE L*a*b*.
+    CieLab,
+}
+
+/// A parsed `<Image>` element, before the selected one becomes the header.
+struct ImageElement {
+    width: u64,
+    height: u64,
+    channels: u64,
+    sample_format: SampleFormat,
+    pixel_storage: PixelStorage,
+    color_space: ColorSpace,
+    bounds: Option<(f64, f64)>,
+    offset: f64,
+    id: Option<String>,
+    location: String,
+    byte_order: Option<String>,
+    compression: Option<String>,
+    subblocks: Option<String>,
+    checksum: Option<String>,
+    /// The `<Data>` child of an embedded image block.
+    data: Option<EmbeddedData>,
+    fits_keywords: Vec<FitsKeyword>,
+}
+
+impl ImageElement {
+    fn parse(path: &Path, e: &quick_xml::events::BytesStart) -> Result<ImageElement> {
+        let err = |m: String| Error::format(path, m);
+        let geometry = attr_string(path, e, b"geometry")?
+            .ok_or_else(|| err("<Image> missing geometry".into()))?;
+        let dims: Vec<u64> = geometry
+            .split(':')
+            .map(|p| p.trim().parse().unwrap_or(0))
+            .collect();
+        let (width, height, channels) = match dims.as_slice() {
+            [w, h, c] if *w > 0 && *h > 0 && *c > 0 => (*w, *h, *c),
+            _ => {
+                return Err(err(format!(
+                    "unsupported geometry '{geometry}' (need W:H:C)"
+                )));
+            }
+        };
+        let sample_format_s = attr_string(path, e, b"sampleFormat")?
+            .ok_or_else(|| err("<Image> missing sampleFormat".into()))?;
+        let sample_format = SampleFormat::parse(sample_format_s.trim())
+            .ok_or_else(|| err(format!("unknown sampleFormat '{sample_format_s}'")))?;
+        let pixel_storage = match attr_string(path, e, b"pixelStorage")?
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("Planar") => PixelStorage::Planar,
+            Some("Normal") => PixelStorage::Normal,
+            Some(other) => return Err(err(format!("unsupported pixelStorage '{other}'"))),
+        };
+        let color_space = match attr_string(path, e, b"colorSpace")?
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("Gray") => ColorSpace::Gray,
+            Some("RGB") => ColorSpace::Rgb,
+            Some("CIELab") => ColorSpace::CieLab,
+            Some(other) => return Err(err(format!("unsupported colorSpace '{other}'"))),
+        };
+        let bounds = match attr_string(path, e, b"bounds")? {
+            None => None,
+            Some(b) => Some(
+                b.split_once(':')
+                    .and_then(|(lo, hi)| Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?)))
+                    .filter(|(lo, hi): &(f64, f64)| lo.is_finite() && hi.is_finite() && hi > lo)
+                    .ok_or_else(|| err(format!("bad bounds '{b}' (need lower:upper)")))?,
+            ),
+        };
+        let offset = match attr_string(path, e, b"offset")? {
+            None => 0.0,
+            Some(o) => o
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| err(format!("bad offset '{o}'")))?,
+        };
+        Ok(ImageElement {
+            width,
+            height,
+            channels,
+            sample_format,
+            pixel_storage,
+            color_space,
+            bounds,
+            offset,
+            id: attr_string(path, e, b"id")?,
+            location: attr_string(path, e, b"location")?
+                .ok_or_else(|| err("<Image> missing location".into()))?,
+            byte_order: attr_string(path, e, b"byteOrder")?,
+            compression: attr_string(path, e, b"compression")?,
+            subblocks: attr_string(path, e, b"subblocks")?,
+            checksum: attr_string(path, e, b"checksum")?,
+            data: None,
+            fits_keywords: Vec::new(),
+        })
+    }
+
+    /// The header for this (selected) image of a unit of `image_count`.
+    fn into_header(
+        self,
+        path: &Path,
+        image_count: usize,
+        image_ids: Vec<Option<String>>,
+    ) -> Result<XisfHeader> {
+        let embedded = self.location.trim() == "embedded";
+        let (compression, subblocks, text, text_encoding) = match (&self.data, embedded) {
+            (Some(d), true) => (
+                d.compression.as_deref(),
+                d.subblocks.as_deref(),
+                Some(d.text.as_str()),
+                d.encoding.as_deref(),
+            ),
+            _ => (
+                self.compression.as_deref(),
+                self.subblocks.as_deref(),
+                None,
+                None,
+            ),
+        };
+        let block = DataBlock::parse(&BlockAttrs {
+            location: &self.location,
+            byte_order: self.byte_order.as_deref(),
+            compression,
+            subblocks,
+            checksum: self.checksum.as_deref(),
+            text,
+            text_encoding,
+        })
+        .map_err(|e| Error::format(path, format!("image block: {e}")))?;
+        let (data_offset, data_size) = match &block.location {
+            BlockLocation::Attachment { offset, size } => (*offset, *size),
+            BlockLocation::Inline(b) => (0, b.len() as u64),
+        };
+        Ok(XisfHeader {
+            width: self.width,
+            height: self.height,
+            channels: self.channels,
+            sample_format: self.sample_format,
+            data_offset,
+            data_size,
+            block,
+            pixel_storage: self.pixel_storage,
+            color_space: self.color_space,
+            bounds: self.bounds,
+            offset: self.offset,
+            image_id: self.id,
+            image_count,
+            image_ids,
+            fits_keywords: self.fits_keywords,
+            properties: Vec::new(),
+            property_blocks: Vec::new(),
+        })
+    }
+}
+
 /// Options for opening an XISF unit.
 #[derive(Debug, Clone)]
 pub struct XisfOpenOptions {
+    /// Which `<Image>` of the unit to read (0-based; default the first).
+    pub image_index: usize,
     /// Verify declared data-block checksums before using a block (default
     /// `true`). A mismatch is an error; turn this off only to salvage data.
     pub verify_checksums: bool,
@@ -59,6 +271,7 @@ pub struct XisfOpenOptions {
 impl Default for XisfOpenOptions {
     fn default() -> Self {
         XisfOpenOptions {
+            image_index: 0,
             verify_checksums: true,
         }
     }
@@ -87,7 +300,7 @@ impl XisfImage {
         // SAFETY: read-only map; we accept that truncation by another process
         // during a run is undefined, as is conventional for mmap-based readers.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::io(path, e))?;
-        let mut header = parse_header(path, &mmap, opts.verify_checksums)?;
+        let mut header = parse_header(path, &mmap, opts.verify_checksums, opts.image_index)?;
 
         // Resolve attachment-located numeric vectors/matrices (small blocks —
         // e.g. astrometric solution data) so downstream code sees decoded values.
@@ -121,6 +334,27 @@ impl XisfImage {
             ));
         }
 
+        // Decoding of compressed, embedded, interleaved and big-endian
+        // pixel blocks lands with the pixel decoder; until then only the
+        // zero-copy layout opens.
+        if let Some(c) = &header.block.compression {
+            return Err(Error::format(
+                path,
+                format!(
+                    "compressed image blocks ({}) are not readable yet",
+                    c.codec_id()
+                ),
+            ));
+        }
+        if !matches!(header.block.location, BlockLocation::Attachment { .. })
+            || header.pixel_storage != PixelStorage::Planar
+            || header.block.byte_order != ByteOrder::Little
+        {
+            return Err(Error::format(
+                path,
+                "only attached, planar, little-endian image blocks are readable yet",
+            ));
+        }
         if header.sample_format != SampleFormat::Float32 {
             return Err(Error::format(
                 path,
@@ -247,7 +481,7 @@ pub fn read_header_with(path: &Path, opts: &XisfOpenOptions) -> Result<Header> {
     let mut bytes = lead.to_vec();
     bytes.resize(16 + header_len, 0);
     file.read_exact(&mut bytes[16..]).map_err(io)?;
-    let mut header = parse_header(path, &bytes, opts.verify_checksums)?;
+    let mut header = parse_header(path, &bytes, opts.verify_checksums, opts.image_index)?;
 
     for (i, block) in std::mem::take(&mut header.property_blocks) {
         let prop = &mut header.properties[i];
@@ -279,7 +513,7 @@ pub fn read_header_with(path: &Path, opts: &XisfOpenOptions) -> Result<Header> {
     Ok(Header::from(&header))
 }
 
-fn parse_header(path: &Path, mmap: &[u8], verify: bool) -> Result<XisfHeader> {
+fn parse_header(path: &Path, mmap: &[u8], verify: bool, image_index: usize) -> Result<XisfHeader> {
     if mmap.len() < 16 || &mmap[0..8] != SIGNATURE {
         return Err(Error::format(
             path,
@@ -295,10 +529,16 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool) -> Result<XisfHeader> {
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
 
-    let mut header: Option<XisfHeader> = None;
-    let mut in_image = false;
-    let mut properties: Vec<XisfProperty> = Vec::new();
-    let mut property_blocks: Vec<(usize, DataBlock)> = Vec::new();
+    let mut images: Vec<ImageElement> = Vec::new();
+    // Index into `images` of the <Image> being read.
+    let mut current: Option<usize> = None;
+    // Whether the current image's <Data> (embedded pixel block) is open.
+    let mut image_data_open = false;
+    // Depth inside a <Thumbnail> subtree, all of which is skipped.
+    let mut skip = 0u32;
+    // Every property with its owning image (None: file level) and attached
+    // block, in document order.
+    let mut properties: Vec<(Option<usize>, XisfProperty, Option<DataBlock>)> = Vec::new();
     // <Property> currently being read: (partial parse, accumulated text,
     // nesting depth of unrelated child elements to skip).
     let mut pending: Option<(PendingProperty, String, u32)> = None;
@@ -309,52 +549,69 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool) -> Result<XisfHeader> {
             Ok(Event::Start(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
-                if let Some((partial, _, depth)) = pending.as_mut() {
+                if skip > 0 {
+                    skip += 1;
+                } else if let Some((partial, _, depth)) = pending.as_mut() {
                     if *depth == 0 && name == b"Data" {
                         partial.data = Some(EmbeddedData::parse(path, &e)?);
                     }
                     *depth += 1; // nested element inside <Property> (e.g. <Data>)
-                } else if name == b"Property" {
-                    pending = Some((parse_property_start(path, &e)?, String::new(), 0));
-                } else if name == b"Image" && header.is_none() {
-                    header = Some(parse_image_element(path, &e)?);
-                    in_image = true;
-                } else if name == b"FITSKeyword"
-                    && in_image
-                    && let Some(h) = header.as_mut()
-                {
-                    h.fits_keywords.push(parse_fits_keyword(path, &e)?);
+                } else {
+                    match name {
+                        b"Property" => {
+                            pending = Some((parse_property_start(path, &e)?, String::new(), 0));
+                        }
+                        b"Image" => {
+                            images.push(ImageElement::parse(path, &e)?);
+                            current = Some(images.len() - 1);
+                        }
+                        b"Thumbnail" => skip = 1,
+                        b"Data" if current.is_some() => {
+                            images[current.unwrap()].data = Some(EmbeddedData::parse(path, &e)?);
+                            image_data_open = true;
+                        }
+                        b"FITSKeyword" if current.is_some() => {
+                            images[current.unwrap()]
+                                .fits_keywords
+                                .push(parse_fits_keyword(path, &e)?);
+                        }
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::Empty(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
-                if let Some((partial, _, depth)) = pending.as_mut() {
+                if skip > 0 {
+                } else if let Some((partial, _, depth)) = pending.as_mut() {
                     // A self-closing <Data/> is an empty embedded block.
                     if *depth == 0 && name == b"Data" {
                         partial.data = Some(EmbeddedData::parse(path, &e)?);
                     }
-                } else if name == b"Property" {
-                    let partial = parse_property_start(path, &e)?;
-                    push_property(
-                        &mut properties,
-                        &mut property_blocks,
-                        path,
-                        partial,
-                        "",
-                        verify,
-                    )?;
-                } else if name == b"Image" && header.is_none() {
-                    header = Some(parse_image_element(path, &e)?);
-                } else if name == b"FITSKeyword"
-                    && in_image
-                    && let Some(h) = header.as_mut()
-                {
-                    h.fits_keywords.push(parse_fits_keyword(path, &e)?);
+                } else {
+                    match name {
+                        b"Property" => {
+                            let partial = parse_property_start(path, &e)?;
+                            let (prop, block) = finish_property(path, partial, "", verify)?;
+                            properties.push((current, prop, block));
+                        }
+                        b"Image" => images.push(ImageElement::parse(path, &e)?),
+                        b"Data" if current.is_some() => {
+                            images[current.unwrap()].data = Some(EmbeddedData::parse(path, &e)?);
+                        }
+                        b"FITSKeyword" if current.is_some() => {
+                            images[current.unwrap()]
+                                .fits_keywords
+                                .push(parse_fits_keyword(path, &e)?);
+                        }
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::Text(t)) => {
-                if let Some((partial, text, depth)) = pending.as_mut() {
+                if skip > 0 {
+                    // inside a <Thumbnail>
+                } else if let Some((partial, text, depth)) = pending.as_mut() {
                     let s = t
                         .unescape()
                         .map_err(|e| Error::format(path, format!("bad XML text: {e}")))?;
@@ -363,35 +620,45 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool) -> Result<XisfHeader> {
                         (1, Some(data)) => data.text.push_str(&s),
                         _ => {}
                     }
+                } else if image_data_open && let Some(data) = images[current.unwrap()].data.as_mut()
+                {
+                    let s = t
+                        .unescape()
+                        .map_err(|e| Error::format(path, format!("bad XML text: {e}")))?;
+                    data.text.push_str(&s);
                 }
             }
             Ok(Event::CData(t)) => {
-                if let Some((partial, text, depth)) = pending.as_mut() {
+                if skip > 0 {
+                } else if let Some((partial, text, depth)) = pending.as_mut() {
                     let s = String::from_utf8_lossy(&t);
                     match (*depth, partial.data.as_mut()) {
                         (0, _) => text.push_str(&s),
                         (1, Some(data)) => data.text.push_str(&s),
                         _ => {}
                     }
+                } else if image_data_open && let Some(data) = images[current.unwrap()].data.as_mut()
+                {
+                    data.text.push_str(&String::from_utf8_lossy(&t));
                 }
             }
             Ok(Event::End(e)) => {
-                if let Some((_, _, depth)) = pending.as_mut() {
+                if skip > 0 {
+                    skip -= 1;
+                } else if let Some((_, _, depth)) = pending.as_mut() {
                     if *depth > 0 {
                         *depth -= 1;
                     } else {
                         let (partial, text, _) = pending.take().unwrap();
-                        push_property(
-                            &mut properties,
-                            &mut property_blocks,
-                            path,
-                            partial,
-                            &text,
-                            verify,
-                        )?;
+                        let (prop, block) = finish_property(path, partial, &text, verify)?;
+                        properties.push((current, prop, block));
                     }
-                } else if e.local_name().as_ref() == b"Image" {
-                    in_image = false;
+                } else {
+                    match e.local_name().as_ref() {
+                        b"Data" => image_data_open = false,
+                        b"Image" => current = None,
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -401,29 +668,30 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool) -> Result<XisfHeader> {
         buf.clear();
     }
 
-    let mut header =
-        header.ok_or_else(|| Error::format(path, "no <Image> element in XISF header"))?;
-    header.properties = properties;
-    header.property_blocks = property_blocks;
-    Ok(header)
-}
-
-/// Finish a `<Property>` and append it, remembering its data block when the
-/// data is attached (resolved later from the file).
-fn push_property(
-    properties: &mut Vec<XisfProperty>,
-    blocks: &mut Vec<(usize, DataBlock)>,
-    path: &Path,
-    partial: PendingProperty,
-    text: &str,
-    verify: bool,
-) -> Result<()> {
-    let (prop, block) = finish_property(path, partial, text, verify)?;
-    if let Some(block) = block {
-        blocks.push((properties.len(), block));
+    let image_count = images.len();
+    if image_count == 0 {
+        return Err(Error::format(path, "no <Image> element in XISF header"));
     }
-    properties.push(prop);
-    Ok(())
+    if image_index >= image_count {
+        return Err(Error::format(
+            path,
+            format!("requested image {image_index}, but the unit has {image_count} image(s)"),
+        ));
+    }
+    let image_ids = images.iter().map(|i| i.id.clone()).collect();
+    let selected = images.swap_remove(image_index);
+    let mut header = selected.into_header(path, image_count, image_ids)?;
+    for (owner, prop, block) in properties {
+        if owner.is_none_or(|o| o == image_index) {
+            if let Some(block) = block {
+                header
+                    .property_blocks
+                    .push((header.properties.len(), block));
+            }
+            header.properties.push(prop);
+        }
+    }
+    Ok(header)
 }
 
 /// The `<Data>` child of an `embedded` property: its block attributes and
@@ -879,83 +1147,6 @@ fn attr_string(
         }
     }
     Ok(None)
-}
-
-fn parse_image_element(path: &Path, e: &quick_xml::events::BytesStart) -> Result<XisfHeader> {
-    let geometry = attr_string(path, e, b"geometry")?
-        .ok_or_else(|| Error::format(path, "<Image> missing geometry"))?;
-    let dims: Vec<u64> = geometry
-        .split(':')
-        .map(|p| p.parse().unwrap_or(0))
-        .collect();
-    let (width, height, channels) = match dims.as_slice() {
-        [w, h, c] if *w > 0 && *h > 0 && *c > 0 => (*w, *h, *c),
-        _ => {
-            return Err(Error::format(
-                path,
-                format!("unsupported geometry '{geometry}' (need W:H:C)"),
-            ));
-        }
-    };
-
-    let sample_format_s = attr_string(path, e, b"sampleFormat")?
-        .ok_or_else(|| Error::format(path, "<Image> missing sampleFormat"))?;
-    let sample_format = SampleFormat::parse(&sample_format_s)
-        .ok_or_else(|| Error::format(path, format!("unknown sampleFormat '{sample_format_s}'")))?;
-
-    let location = attr_string(path, e, b"location")?
-        .ok_or_else(|| Error::format(path, "<Image> missing location"))?;
-    let loc: Vec<&str> = location.split(':').collect();
-    let (data_offset, data_size) = match loc.as_slice() {
-        ["attachment", off, size] => (
-            off.parse::<u64>().map_err(|_| {
-                Error::format(path, format!("bad attachment offset in '{location}'"))
-            })?,
-            size.parse::<u64>()
-                .map_err(|_| Error::format(path, format!("bad attachment size in '{location}'")))?,
-        ),
-        _ => {
-            return Err(Error::format(
-                path,
-                format!("unsupported image location '{location}' (only attachment supported)"),
-            ));
-        }
-    };
-
-    if let Some(compression) = attr_string(path, e, b"compression")? {
-        return Err(Error::format(
-            path,
-            format!("compressed XISF not yet supported (compression='{compression}')"),
-        ));
-    }
-    if let Some(storage) = attr_string(path, e, b"pixelStorage")?
-        && storage != "Planar"
-    {
-        return Err(Error::format(
-            path,
-            format!("unsupported pixelStorage '{storage}'"),
-        ));
-    }
-    if let Some(order) = attr_string(path, e, b"byteOrder")?
-        && order != "little"
-    {
-        return Err(Error::format(
-            path,
-            format!("unsupported byteOrder '{order}'"),
-        ));
-    }
-
-    Ok(XisfHeader {
-        width,
-        height,
-        channels,
-        sample_format,
-        data_offset,
-        data_size,
-        fits_keywords: Vec::new(),
-        properties: Vec::new(),
-        property_blocks: Vec::new(),
-    })
 }
 
 fn parse_fits_keyword(path: &Path, e: &quick_xml::events::BytesStart) -> Result<FitsKeyword> {
@@ -1581,6 +1772,7 @@ mod tests {
             assert!(e.contains("checksum mismatch"), "{e}");
             let opts = XisfOpenOptions {
                 verify_checksums: false,
+                ..Default::default()
             };
             let img = XisfImage::open_with(&p, &opts).unwrap();
             let v = &prop(
@@ -1744,6 +1936,220 @@ mod tests {
                 Some(&[][..])
             );
             std::fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    mod images {
+        //! `<Image>` attributes and multi-image units.
+        use super::super::*;
+        use crate::testsupport::{ImageSpec, XisfBuilder, tiny_image};
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d =
+                std::env::temp_dir().join(format!("mpp-xisf-images-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn image(w: u64, h: u64, keyword: &str) -> ImageSpec {
+            ImageSpec {
+                geometry: (w, h, 1),
+                data: vec![0u8; (w * h * 4) as usize],
+                children: format!(r#"<FITSKeyword name="OBJECT" value="'{keyword}'" comment=""/>"#),
+                ..tiny_image()
+            }
+        }
+
+        fn header(p: &Path, image_index: usize) -> Result<XisfHeader> {
+            parse_header(p, &std::fs::read(p).unwrap(), true, image_index)
+        }
+
+        #[test]
+        fn second_image_is_selectable() {
+            let d = tmp("multi");
+            let p = d.join("a.xisf");
+            let mut second = image(5, 3, "second");
+            second.attrs.push_str(r#" id="beta""#);
+            XisfBuilder {
+                images: vec![image(4, 2, "first"), second],
+                ..Default::default()
+            }
+            .write(&p);
+            let h0 = header(&p, 0).unwrap();
+            assert_eq!((h0.width, h0.height, h0.image_count), (4, 2, 2));
+            assert_eq!(h0.image_ids, vec![None, Some("beta".to_string())]);
+            assert_eq!(h0.fits_keywords[0].value, "'first'");
+            let h1 = header(&p, 1).unwrap();
+            assert_eq!((h1.width, h1.height), (5, 3));
+            assert_eq!(h1.image_id.as_deref(), Some("beta"));
+            assert_eq!(
+                h1.fits_keywords.len(),
+                1,
+                "only the selected image's keywords"
+            );
+            assert_eq!(h1.fits_keywords[0].value, "'second'");
+            let opts = XisfOpenOptions {
+                image_index: 1,
+                ..Default::default()
+            };
+            let img = XisfImage::open_with(&p, &opts).unwrap();
+            assert_eq!((img.width(), img.height()), (5, 3));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn image_index_out_of_range_is_an_error() {
+            let d = tmp("range");
+            let p = d.join("a.xisf");
+            XisfBuilder {
+                images: vec![tiny_image()],
+                ..Default::default()
+            }
+            .write(&p);
+            let e = header(&p, 1).unwrap_err().to_string();
+            assert!(e.contains("image 1") && e.contains("1 image"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn image_properties_belong_to_their_image() {
+            let d = tmp("props");
+            let p = d.join("a.xisf");
+            let mut a = image(2, 2, "a");
+            a.children
+                .push_str(r#"<Property id="Owner" type="String">a</Property>"#);
+            let mut b = image(2, 2, "b");
+            b.children
+                .push_str(r#"<Property id="Owner" type="String">b</Property>"#);
+            XisfBuilder {
+                images: vec![a, b],
+                root_xml: r#"<Property id="FileLevel" type="Int32" value="1"/>"#.into(),
+                ..Default::default()
+            }
+            .write(&p);
+            let h = header(&p, 1).unwrap();
+            let ids: Vec<(&str, &PropertyValue)> = h
+                .properties
+                .iter()
+                .map(|p| (p.id.as_str(), &p.value))
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    ("Owner", &PropertyValue::Str("b".into())),
+                    ("FileLevel", &PropertyValue::I64(1))
+                ]
+            );
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn thumbnail_is_ignored() {
+            let d = tmp("thumb");
+            let p = d.join("a.xisf");
+            let mut img = image(2, 2, "main");
+            img.children.push_str(concat!(
+                r#"<Thumbnail geometry="1:1:1" sampleFormat="UInt8" location="attachment:0:1">"#,
+                r#"<FITSKeyword name="OBJECT" value="'thumb'" comment=""/>"#,
+                r#"<Property id="ThumbProp" type="Int32" value="3"/>"#,
+                r#"</Thumbnail>"#
+            ));
+            XisfBuilder {
+                images: vec![img],
+                ..Default::default()
+            }
+            .write(&p);
+            let h = header(&p, 0).unwrap();
+            assert_eq!(h.image_count, 1);
+            assert_eq!(h.fits_keywords.len(), 1);
+            assert!(h.properties.iter().all(|p| p.id != "ThumbProp"));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn image_attributes_parse() {
+            let d = tmp("attrs");
+            let p = d.join("a.xisf");
+            XisfBuilder {
+                images: vec![ImageSpec {
+                    geometry: (2, 2, 3),
+                    sample_format: "UInt16",
+                    data: vec![0u8; 24],
+                    attrs: r#" bounds="100:60000" colorSpace="RGB" pixelStorage="Normal" byteOrder="big" offset="12.5" imageType="Light" orientation="90""#.into(),
+                    ..tiny_image()
+                }],
+                ..Default::default()
+            }
+            .write(&p);
+            let h = header(&p, 0).unwrap();
+            assert_eq!(h.sample_format, SampleFormat::UInt16);
+            assert_eq!(h.bounds, Some((100.0, 60000.0)));
+            assert_eq!(h.effective_bounds(), (100.0, 60000.0));
+            assert_eq!(h.color_space, ColorSpace::Rgb);
+            assert_eq!(h.pixel_storage, PixelStorage::Normal);
+            assert_eq!(h.block.byte_order, ByteOrder::Big);
+            assert_eq!(h.offset, 12.5);
+            assert_eq!((h.data_offset % 4096, h.data_size), (0, 24));
+            for (attr, want) in [
+                (r#" colorSpace="HSV""#, "colorSpace"),
+                (r#" pixelStorage="Tiled""#, "pixelStorage"),
+                (r#" bounds="1""#, "bounds"),
+                (r#" offset="x""#, "offset"),
+            ] {
+                XisfBuilder {
+                    images: vec![ImageSpec {
+                        attrs: attr.into(),
+                        ..tiny_image()
+                    }],
+                    ..Default::default()
+                }
+                .write(&p);
+                let e = header(&p, 0).unwrap_err().to_string();
+                assert!(e.contains(want), "{attr}: {e}");
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn missing_bounds_default_by_sample_format() {
+            let d = tmp("bounds");
+            let p = d.join("a.xisf");
+            for (fmt, bytes, want) in [
+                ("Float32", 4, (0.0, 1.0)),
+                ("Float64", 8, (0.0, 1.0)),
+                ("UInt8", 1, (0.0, 255.0)),
+                ("UInt16", 2, (0.0, 65535.0)),
+                ("UInt32", 4, (0.0, 4294967295.0)),
+            ] {
+                XisfBuilder {
+                    images: vec![ImageSpec {
+                        sample_format: fmt,
+                        data: vec![0u8; 4 * bytes],
+                        attrs: String::new(),
+                        ..tiny_image()
+                    }],
+                    ..Default::default()
+                }
+                .write(&p);
+                let h = header(&p, 0).unwrap();
+                assert_eq!(h.bounds, None, "{fmt}");
+                assert_eq!(h.effective_bounds(), want, "{fmt}");
+                assert_eq!(h.color_space, ColorSpace::Gray, "default color space");
+                assert_eq!(h.pixel_storage, PixelStorage::Planar, "default storage");
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn wide_and_complex_sample_formats_parse() {
+            for (s, f, n) in [
+                ("UInt64", SampleFormat::UInt64, 8),
+                ("Complex32", SampleFormat::Complex32, 8),
+                ("Complex64", SampleFormat::Complex64, 16),
+            ] {
+                assert_eq!(SampleFormat::parse(s), Some(f));
+                assert_eq!(f.bytes_per_sample(), n);
+            }
         }
     }
 }

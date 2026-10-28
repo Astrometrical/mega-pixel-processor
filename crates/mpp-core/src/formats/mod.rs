@@ -307,17 +307,20 @@ impl PropertyValue {
     }
 }
 
-/// Sample formats we recognize in headers. Only `Float32` is readable for now —
-/// MosaicByCoordinates output is always Float32/Float64, and Float32 is the
-/// overwhelmingly common case.
+/// XISF `sampleFormat` values. Every value parses; the pixel decoders read
+/// UInt8/16/32 and Float32/64 and refuse UInt64 and the complex formats by
+/// name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)] // variants are the XISF sampleFormat names verbatim
 pub enum SampleFormat {
     UInt8,
     UInt16,
     UInt32,
+    UInt64,
     Float32,
     Float64,
+    Complex32,
+    Complex64,
 }
 
 impl SampleFormat {
@@ -327,19 +330,24 @@ impl SampleFormat {
             "UInt8" => Self::UInt8,
             "UInt16" => Self::UInt16,
             "UInt32" => Self::UInt32,
+            "UInt64" => Self::UInt64,
             "Float32" => Self::Float32,
             "Float64" => Self::Float64,
+            "Complex32" => Self::Complex32,
+            "Complex64" => Self::Complex64,
             _ => return None,
         })
     }
 
-    /// Size of one sample of this format, in bytes.
+    /// Size of one sample of this format, in bytes (a complex sample is
+    /// its real and imaginary parts together).
     pub fn bytes_per_sample(self) -> usize {
         match self {
             Self::UInt8 => 1,
             Self::UInt16 => 2,
             Self::UInt32 | Self::Float32 => 4,
-            Self::Float64 => 8,
+            Self::UInt64 | Self::Float64 | Self::Complex32 => 8,
+            Self::Complex64 => 16,
         }
     }
 }
