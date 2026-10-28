@@ -1,6 +1,9 @@
 //! Test-only builders for synthetic input files (tests never depend on
 //! real image data — see CLAUDE.md).
 
+// Some builders serve only the feature-gated convert/publish tests.
+#![cfg_attr(not(feature = "convert"), allow(dead_code))]
+
 use std::path::Path;
 
 /// Base64-encode f64s little-endian, mirroring PixInsight's

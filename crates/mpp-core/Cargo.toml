@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
@@ -15,5 +16,21 @@ quick-xml.workspace = true
 serde.workspace = true
 # float_roundtrip: f64 values (solutions, headers) survive JSON exactly.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
-tiff.workspace = true
+tiff = { workspace = true, optional = true }
+
+[features]
+# Everything on by default for the mpp CLI and PixInsight worker. Format
+# consumers (mmm) take `default-features = false`: XISF/FITS reading and
+# writing, the Header model, astrometry and WCS, with no TIFF or vips code.
+default = ["tiff", "convert", "publish"]
+# TIFF/BigTIFF reader and writer (and the ordered work pipeline behind them).
+tiff = ["dep:tiff"]
+# One-call conversion orchestration (`convert`).
+convert = ["tiff"]
+# DZI / mainstream-format publishing via the `vips` CLI, and the viewer page.
+publish = ["convert"]
+
+[[example]]
+name = "tiff_bench"
+required-features = ["tiff"]
 

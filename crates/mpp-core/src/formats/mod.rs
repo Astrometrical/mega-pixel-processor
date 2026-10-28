@@ -10,8 +10,11 @@ use crate::header::Header;
 use crate::{Error, Result};
 
 pub mod fits;
+#[cfg(feature = "tiff")]
 pub mod tiff;
+#[cfg(feature = "tiff")]
 pub mod tiff_read;
+#[cfg(feature = "tiff")]
 pub mod tiff_write;
 pub mod xisf;
 

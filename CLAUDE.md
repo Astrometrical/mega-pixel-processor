@@ -21,6 +21,7 @@ branding, `mpp` the binary.
 ```sh
 cargo test                 # unit + integration tests (no big files needed)
 cargo build --release      # required for real-data runs (multi-GB images)
+cargo test -p mpp-core --no-default-features   # lean core (no TIFF/vips) that mmm uses
 ```
 
 Rust via rustup (`source ~/.cargo/env` if PATH lacks cargo).
