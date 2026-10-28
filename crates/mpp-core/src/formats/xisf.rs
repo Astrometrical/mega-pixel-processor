@@ -604,7 +604,7 @@ fn decode_inline(location: &str, text: &str) -> Option<Vec<u8>> {
 
 /// Minimal standard-alphabet base64 decoder (payloads here are tens of bytes;
 /// not worth a dependency). Ignores whitespace and padding.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
