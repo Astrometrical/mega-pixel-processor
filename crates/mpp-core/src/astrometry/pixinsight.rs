@@ -50,6 +50,47 @@ fn version(props: &[XisfProperty]) -> Result<String, String> {
     Ok(v.to_string())
 }
 
+/// Layer 1 alone, as a FITS-convention [`LinearWcs`](crate::wcs::LinearWcs):
+/// deliberately lenient — any projection with a FITS code, native frame
+/// unchecked — so a solution whose higher layers are unusable still yields
+/// its linear WCS (e.g. for an output header).
+pub(crate) fn linear_layer(props: &[XisfProperty]) -> Result<crate::wcs::LinearWcs, String> {
+    version(props)?;
+    let proj = require(props, "ProjectionSystem")?
+        .as_str()
+        .ok_or("ProjectionSystem is not a string")?;
+    let code = crate::wcs::projection_code(proj)
+        .ok_or_else(|| format!("unrecognized ProjectionSystem '{proj}'"))?;
+    let crval = require(props, "ReferenceCelestialCoordinates")?
+        .as_f64_vec()
+        .ok_or("ReferenceCelestialCoordinates is not a vector")?;
+    let refimg = require(props, "ReferenceImageCoordinates")?
+        .as_f64_vec()
+        .ok_or("ReferenceImageCoordinates is not a vector")?;
+    let (rows, cols, m) = require(props, "LinearTransformationMatrix")?
+        .as_f64_mat()
+        .ok_or("LinearTransformationMatrix is not a matrix")?;
+    if crval.len() != 2 || refimg.len() != 2 || (rows, cols) != (2, 2) || m.len() != 4 {
+        return Err("layer 1 vector/matrix dimensions are inconsistent".into());
+    }
+    if crval.iter().chain(refimg).chain(m).any(|v| !v.is_finite()) {
+        return Err("layer 1 carries non-finite values".into());
+    }
+    Ok(crate::wcs::LinearWcs {
+        crval: [crval[0], crval[1]],
+        // PixInsight image coords (centres at k + 0.5, 0-based) -> FITS
+        // (centres at integers, 1-based): +0.5 on both axes.
+        crpix: [refimg[0] + 0.5, refimg[1] + 0.5],
+        cd: [[m[0], m[1]], [m[2], m[3]]],
+        ctype: [
+            format!("{:-<5}{code}", "RA"),
+            format!("{:-<5}{code}", "DEC"),
+        ],
+        radesys: string(props, &format!("{STD_PREFIX}CelestialReferenceSystem"))
+            .unwrap_or_else(|| "ICRS".into()),
+    })
+}
+
 /// Layer 1, plus the native frame, into a solution with no higher layers.
 fn decode_layer1(props: &[XisfProperty]) -> Result<PiSolution, String> {
     let version = version(props)?;

@@ -120,6 +120,21 @@ impl WcsSolution {
     }
 }
 
+/// The linear solution (layer 1) of a PixInsight block in `props`, alone:
+/// the standard block's or, failing that, the legacy one's. Lenient on
+/// purpose — any projection with a FITS code — so a solution whose higher
+/// layers [`AstrometricSolution::from_header`] refuses still yields its
+/// linear WCS. `Ok(None)` when `props` carry no solution.
+pub fn linear_layer(
+    props: &[XisfProperty],
+) -> std::result::Result<Option<crate::wcs::LinearWcs>, String> {
+    if pixinsight::has_standard_block(props) {
+        pixinsight::linear_layer(props).map(Some)
+    } else {
+        Ok(crate::wcs::from_xisf_properties(props))
+    }
+}
+
 impl AstrometricSolution {
     /// Decode the solution carried by `header`.
     ///
@@ -696,6 +711,24 @@ pub(crate) mod testprops {
 mod tests {
     use super::testprops::{header, prop};
     use super::*;
+
+    #[test]
+    fn linear_layer_survives_a_broken_higher_layer() {
+        use super::pixinsight::fixtures::{layer1, layer2};
+        let cd = [[-4.4e-4, 1e-5], [1e-5, 4.4e-4]];
+        let mut props = layer1([84.2, -3.24], [32.0, 24.0], cd);
+        // Layer 2 contradicting layer 1 (identity: not a pixel->degrees map).
+        let ident = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        layer2(&mut props, ident, ident);
+        assert!(AstrometricSolution::from_header(&header(props.clone(), Some((64, 48)))).is_err());
+        let lin = linear_layer(&props).unwrap().expect("layer 1 decodes");
+        assert_eq!(lin.crval, [84.2, -3.24]);
+        assert_eq!(lin.crpix, [32.5, 24.5]);
+        assert_eq!(lin.cd, cd);
+        assert_eq!(lin.ctype, ["RA---TAN".to_string(), "DEC--TAN".to_string()]);
+        assert_eq!(lin.radesys, "ICRS");
+        assert_eq!(linear_layer(&[]).unwrap(), None);
+    }
 
     /// Sample an analytic mapping on the PixInsight node layout.
     pub(crate) fn grid_from_fn(
