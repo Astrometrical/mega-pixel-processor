@@ -117,6 +117,20 @@ impl FitsWriter {
                 "FITS output dimensions must be nonzero",
             ));
         }
+        let data_size = w
+            .checked_mul(h)
+            .and_then(|n| n.checked_mul(ch))
+            .and_then(|n| n.checked_mul(4))
+            .filter(|n| {
+                n.checked_add(BLOCK * 2 + (self.keywords.len() as u64 + 8) * CARD as u64)
+                    .is_some()
+            })
+            .ok_or_else(|| {
+                Error::format(
+                    &self.path,
+                    format!("FITS output dimensions overflow ({w}x{h}x{ch})"),
+                )
+            })?;
         self.dims = (w, h, ch);
 
         let mut cards: Vec<[u8; CARD]> = vec![
@@ -149,7 +163,6 @@ impl FitsWriter {
 
         // Pre-size the file to the padded data end: the trailing FITS padding
         // is all zeros, and unwritten holes read back as zeros too.
-        let data_size = w * h * ch * 4;
         let total = self.data_start + data_size.div_ceil(BLOCK) * BLOCK;
         self.file.set_len(total).map_err(|e| self.io(e))?;
         Ok(())
@@ -493,6 +506,15 @@ mod tests {
                 "channel {c}"
             );
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn overflowing_dimensions_are_refused() {
+        let dir = tmpdir("overflow");
+        let path = dir.join("huge.fits");
+        let mut sink = FitsWriter::create(&path, vec![]).unwrap();
+        let e = sink.begin(1 << 32, 1 << 32, 3).unwrap_err().to_string();
+        assert!(e.contains("overflow"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -277,7 +277,22 @@ impl FitsImage {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::io(path, e))?;
         let header = parse_header(path, &mmap)?;
         let bps = (header.bitpix.unsigned_abs() / 8) as u64;
-        let need = header.data_offset + header.width * header.height * header.channels * bps;
+        let need = header
+            .width
+            .checked_mul(header.height)
+            .and_then(|n| n.checked_mul(header.channels))
+            .and_then(|n| n.checked_mul(bps))
+            .and_then(|n| n.checked_add(header.data_offset))
+            .filter(|_| (header.width * bps) <= isize::MAX as u64)
+            .ok_or_else(|| {
+                Error::format(
+                    path,
+                    format!(
+                        "image dimensions overflow ({}x{}x{} at BITPIX {})",
+                        header.width, header.height, header.channels, header.bitpix
+                    ),
+                )
+            })?;
         if need > mmap.len() as u64 {
             return Err(Error::format(
                 path,
@@ -800,6 +815,29 @@ mod tests {
             Some("M42")
         );
         assert!(read_header(&path).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn overflowing_dimensions_are_refused() {
+        let dir = tmpdir("overflow");
+        let mut h = String::new();
+        for c in [
+            "SIMPLE  =                    T",
+            "BITPIX  =                  -32",
+            "NAXIS   =                    2",
+            "NAXIS1  =           4294967296",
+            "NAXIS2  =           4294967296",
+            "END",
+        ] {
+            h.push_str(&format!("{c:<80}"));
+        }
+        while !h.len().is_multiple_of(BLOCK) {
+            h.push(' ');
+        }
+        let path = dir.join("huge.fits");
+        std::fs::write(&path, h.into_bytes()).unwrap();
+        let e = FitsImage::open(&path).unwrap_err().to_string();
+        assert!(e.contains("overflow"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
