@@ -101,6 +101,34 @@ pub fn read_header(path: &Path) -> Result<Header> {
     }
 }
 
+/// Stored row order of a FITS image, from its `ROWORDER` card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOrder {
+    /// `ROWORDER = 'TOP-DOWN'`: the first stored row is the top image row
+    /// (the internal convention of the readers); rows and WCS cards are used verbatim.
+    TopDown,
+    /// Standard FITS (`ROWORDER` absent or `'BOTTOM-UP'`): the first stored
+    /// row is the bottom image row; rows are flipped on read and the WCS is
+    /// reflected into the top-down frame.
+    BottomUp,
+}
+
+/// Numeric value of the card `name` (case-insensitive), accepting Fortran
+/// `D` exponents; `None` when absent or not a number.
+pub fn card_number(cards: &[FitsKeyword], name: &str) -> Option<f64> {
+    let v = cards.iter().find(|k| k.name.eq_ignore_ascii_case(name))?;
+    v.value.trim().replace(['D', 'd'], "E").parse().ok()
+}
+
+/// String value of the card `name`: quotes stripped, `''` unescaped,
+/// trailing spaces trimmed; `None` when absent or not a quoted string.
+pub fn card_string(cards: &[FitsKeyword], name: &str) -> Option<String> {
+    let v = cards.iter().find(|k| k.name.eq_ignore_ascii_case(name))?;
+    let t = v.value.trim();
+    let inner = t.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner.replace("''", "'").trim_end().to_string())
+}
+
 /// A FITS header keyword carried through from input to output.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FitsKeyword {
