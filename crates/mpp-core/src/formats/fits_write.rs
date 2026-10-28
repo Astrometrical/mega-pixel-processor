@@ -76,17 +76,27 @@ fn card(name: &str, value: &str, comment: &str) -> [u8; CARD] {
 ///   as the name padded to 8 columns followed by the text from column 9, with
 ///   no `= ` value indicator; the text is the value, or the comment when the
 ///   value is empty (XISF `<FITSKeyword>` elements carry it either way);
+/// - `CONTINUE` long-string cards are written as `CONTINUE`, two blanks and
+///   the quoted fragment from column 11;
 /// - an unquoted real value with a lowercase exponent (`2.0496e+03`, as
 ///   PixInsight writes them) gets an uppercase `E`, as FITS §4.2.4 requires.
 fn keyword_card(k: &FitsKeyword) -> [u8; CARD] {
     let name = k.name.trim();
-    if matches!(name, "COMMENT" | "HISTORY" | "") {
+    // Long-string continuation (FITS 4.0 §4.2.1.2): `CONTINUE`, two blanks,
+    // then the quoted fragment from column 11; the reader keeps that text
+    // as the comment.
+    let is_continue = name == "CONTINUE";
+    if is_continue || matches!(name, "COMMENT" | "HISTORY" | "") {
         let text = if k.value.trim().is_empty() {
             k.comment.trim()
         } else {
             k.value.trim()
         };
-        let s = format!("{name:<8}{text}");
+        let s = if is_continue {
+            format!("CONTINUE  {text}")
+        } else {
+            format!("{name:<8}{text}")
+        };
         let mut out = [b' '; CARD];
         for (o, b) in out.iter_mut().zip(s.bytes()) {
             *o = if (0x20..=0x7e).contains(&b) { b } else { b' ' };
@@ -515,6 +525,43 @@ mod tests {
         let mut sink = FitsWriter::create(&path, vec![]).unwrap();
         let e = sink.begin(1 << 32, 1 << 32, 3).unwrap_err().to_string();
         assert!(e.contains("overflow"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn continue_cards_round_trip_from_the_reader() {
+        let dir = tmpdir("continue");
+        let src = dir.join("src.fits");
+        let mut h = String::new();
+        for c in [
+            "SIMPLE  =                    T",
+            "BITPIX  =                  -32",
+            "NAXIS   =                    2",
+            "NAXIS1  =                    1",
+            "NAXIS2  =                    1",
+            "OBJECT  = 'abcdefghij&'",
+            "CONTINUE  'klmno'",
+            "END",
+        ] {
+            h.push_str(&format!("{c:<80}"));
+        }
+        while !h.len().is_multiple_of(BLOCK as usize) {
+            h.push(' ');
+        }
+        let mut bytes = h.into_bytes();
+        bytes.extend_from_slice(&[0u8; BLOCK as usize]);
+        std::fs::write(&src, bytes).unwrap();
+        let kws = crate::formats::fits::read_header(&src).unwrap().keywords;
+        let out = dir.join("out.fits");
+        let mut sink = FitsWriter::create(&out, keywords_for_output(&kws, (0, 0))).unwrap();
+        sink.begin(1, 1, 1).unwrap();
+        sink.write_band(0, &[0.5]).unwrap();
+        sink.finish().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let c = card(&bytes[..2880], "CONTINUE").unwrap();
+        assert!(c.starts_with("CONTINUE  'klmno'"), "{c:?}");
+        let back = crate::formats::fits::read_header(&out).unwrap();
+        let k = back.keyword("CONTINUE").unwrap();
+        assert_eq!(k.comment, "'klmno'", "reads back as the source did");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
