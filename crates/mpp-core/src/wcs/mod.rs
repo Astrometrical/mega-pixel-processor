@@ -65,6 +65,18 @@ impl LinearWcs {
         let dy = (self.cd[0][0] * eta - self.cd[1][0] * xi) / det;
         (self.crpix[0] + dx, self.crpix[1] + dy)
     }
+
+    /// The same solution expressed for the vertically mirrored row order
+    /// (`H` rows): `CRPIX2' = H + 1 − CRPIX2`, second matrix column negated.
+    /// Converts a standard bottom-up FITS WCS into the top-down frame and
+    /// back (it is its own inverse). See the FITS-input design spec.
+    pub fn reflect_rows(&self, height: u64) -> LinearWcs {
+        let mut r = self.clone();
+        r.crpix[1] = height as f64 + 1.0 - self.crpix[1];
+        r.cd[0][1] = -self.cd[0][1];
+        r.cd[1][1] = -self.cd[1][1];
+        r
+    }
 }
 
 /// Gnomonic (TAN) native plane (ξ, η) → celestial (RA, Dec) about `crval`,
@@ -83,7 +95,7 @@ pub(crate) fn tan_deproject(crval: [f64; 2], xi_deg: f64, eta_deg: f64) -> (f64,
 /// Celestial → TAN native plane about `crval`, degrees. The third value is the
 /// projection denominator (cosine of the angular distance to the tangent
 /// point): ≤ 0 means the point is 90° or more away and (ξ, η) are meaningless.
-fn tan_project(crval: [f64; 2], ra: f64, dec: f64) -> (f64, f64, f64) {
+pub(crate) fn tan_project(crval: [f64; 2], ra: f64, dec: f64) -> (f64, f64, f64) {
     let (a0, d0) = (crval[0].to_radians(), crval[1].to_radians());
     let (a, d) = (ra.to_radians(), dec.to_radians());
     let cos_da = (a - a0).cos();

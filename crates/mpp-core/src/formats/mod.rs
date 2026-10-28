@@ -106,7 +106,7 @@ pub fn read_header(path: &Path) -> Result<Header> {
 }
 
 /// Stored row order of a FITS image, from its `ROWORDER` card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RowOrder {
     /// `ROWORDER = 'TOP-DOWN'`: the first stored row is the top image row
     /// (the internal convention of the readers); rows and WCS cards are used verbatim.

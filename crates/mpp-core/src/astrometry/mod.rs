@@ -42,16 +42,18 @@ use crate::wcs::tan_deproject;
 use crate::{Error, Result};
 
 pub mod distortion;
+pub mod fits;
 mod legacy;
 mod pixinsight;
+pub mod sip;
 
 pub use distortion::{DistortionModel, Kernel, LocalTerm, ScalarSpline, VectorSpline};
 
 /// A plate solution in one of the forms mpp understands.
 ///
-/// `non_exhaustive`: when [`WcsSolution`] gains values, code outside this
-/// crate already has a fallback arm for it.
-// The size gap is to an uninhabited variant: there is nothing to box.
+/// `non_exhaustive`: further forms may be added; code outside this crate
+/// keeps a fallback arm.
+// One per image, never held in bulk: boxing would only add indirection.
 #[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,19 +61,64 @@ pub enum AstrometricSolution {
     /// PixInsight's solution: the 1.9.5 standard block, or a legacy (≤ 1.9.4)
     /// block decoded into the same form.
     PixInsight(PiSolution),
-    /// FITS WCS with SIP distortion. Reserved: not produced yet.
+    /// A FITS WCS: TAN, optionally with SIP distortion.
     Wcs(WcsSolution),
 }
 
-/// FITS WCS (with SIP) form of a solution: a placeholder for a later
-/// milestone, deliberately empty.
+/// A FITS WCS solution: the linear TAN solution and, when the header
+/// carries `A_ORDER`, SIP distortion — decoded by [`fits`] and [`sip`].
 ///
-/// It is an enum with no variants, so no value of it exists yet: matching
-/// on it needs no arm (`match w {}`), and the [`AstrometricSolution`] methods
-/// are total without a fallback. The variant still reserves its slot in the
-/// encoding (index 1 in postcard, `"Wcs"` in JSON).
+/// Image coordinates follow the module conventions (top-down rows): a
+/// bottom-up file's solution is reflected into that frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum WcsSolution {}
+pub struct WcsSolution {
+    /// The linear solution in the top-down frame (FITS 1-based `CRPIX`).
+    pub linear: crate::wcs::LinearWcs,
+    /// SIP distortion, when present (and validated over the image).
+    pub sip: Option<sip::SipSolution>,
+}
+
+impl WcsSolution {
+    /// Decode a FITS header's WCS cards for an image of `width`×`height`
+    /// stored in `row_order`. `Err` explains why the header is unusable
+    /// (unsupported projection, frame, units, or a SIP solution that fails
+    /// validation — never approximated by its linear part).
+    pub fn from_keywords(
+        cards: &[crate::formats::FitsKeyword],
+        width: u64,
+        height: u64,
+        row_order: crate::formats::RowOrder,
+    ) -> std::result::Result<WcsSolution, String> {
+        let file_linear = fits::linear_from_keywords(cards)?;
+        match sip::SipSolution::parse(cards, &file_linear, row_order, height)? {
+            None => Ok(WcsSolution {
+                linear: match row_order {
+                    crate::formats::RowOrder::TopDown => file_linear,
+                    crate::formats::RowOrder::BottomUp => file_linear.reflect_rows(height),
+                },
+                sip: None,
+            }),
+            Some(s) => {
+                s.validate(width, height)?;
+                Ok(WcsSolution {
+                    linear: s.linear().clone(),
+                    sip: Some(s),
+                })
+            }
+        }
+    }
+
+    /// Map an image coordinate (module conventions) to (RA, Dec), degrees.
+    pub fn pixel_to_sky(&self, x: f64, y: f64) -> (f64, f64) {
+        match &self.sip {
+            Some(s) => {
+                let (xi, eta) = s.image_to_native(x, y);
+                tan_deproject(self.linear.crval, xi, eta)
+            }
+            None => self.linear.pixel_to_sky(x + 0.5, y + 0.5),
+        }
+    }
+}
 
 impl AstrometricSolution {
     /// Decode the solution carried by `header`.
@@ -100,6 +147,19 @@ impl AstrometricSolution {
             pixinsight::decode(props, dims)
         } else if legacy::has_legacy_block(props) {
             legacy::decode(props, dims)
+        } else if header.keyword("CTYPE1").is_some() || header.keyword("CTYPE2").is_some() {
+            // No PixInsight block: a FITS WCS, in the header's own row order.
+            let (w, h) = dims.ok_or_else(|| {
+                Error::astrometry("FITS WCS without image dimensions (NAXIS1/NAXIS2)")
+            })?;
+            let row_order =
+                match crate::formats::card_string(&header.keywords, "ROWORDER").as_deref() {
+                    Some("TOP-DOWN") => crate::formats::RowOrder::TopDown,
+                    _ => crate::formats::RowOrder::BottomUp,
+                };
+            return WcsSolution::from_keywords(&header.keywords, w, h, row_order)
+                .map(|s| Some(AstrometricSolution::Wcs(s)))
+                .map_err(Error::astrometry);
         } else {
             return Ok(None);
         };
@@ -111,7 +171,7 @@ impl AstrometricSolution {
     pub fn reference_celestial(&self) -> (f64, f64) {
         match self {
             Self::PixInsight(s) => (s.reference_celestial[0], s.reference_celestial[1]),
-            Self::Wcs(w) => match *w {},
+            Self::Wcs(w) => (w.linear.crval[0], w.linear.crval[1]),
         }
     }
 
@@ -123,7 +183,10 @@ impl AstrometricSolution {
                 let m = s.linear;
                 (m[0][0] * m[1][1] - m[0][1] * m[1][0]).abs().sqrt() * 3600.0
             }
-            Self::Wcs(w) => match *w {},
+            Self::Wcs(w) => {
+                let m = w.linear.cd;
+                (m[0][0] * m[1][1] - m[0][1] * m[1][0]).abs().sqrt() * 3600.0
+            }
         }
     }
 
@@ -133,7 +196,7 @@ impl AstrometricSolution {
     pub fn pixel_to_sky(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             Self::PixInsight(s) => s.pixel_to_sky(x, y),
-            Self::Wcs(w) => match *w {},
+            Self::Wcs(w) => w.pixel_to_sky(x, y),
         }
     }
 }

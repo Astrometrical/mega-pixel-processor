@@ -210,7 +210,7 @@ pub(crate) mod tests {
     fn solve(props: Vec<XisfProperty>, dims: Option<(u64, u64)>) -> crate::Result<PiSolution> {
         match AstrometricSolution::from_header(&header(props, dims))?.expect("a solution") {
             AstrometricSolution::PixInsight(s) => Ok(s),
-            AstrometricSolution::Wcs(w) => match w {},
+            other => panic!("expected a PixInsight solution, got {other:?}"),
         }
     }
 
