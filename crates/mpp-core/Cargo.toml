@@ -17,6 +17,10 @@ serde.workspace = true
 # float_roundtrip: f64 values (solutions, headers) survive JSON exactly.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 tiff = { workspace = true, optional = true }
+# XISF block compression codecs (always on: the lean core reads compressed XISF).
+flate2.workspace = true
+lz4_flex.workspace = true
+zstd.workspace = true
 
 [features]
 # Everything on by default for the mpp CLI and PixInsight worker. Format

@@ -25,6 +25,10 @@ quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiff = "0.11"
+# XISF codecs: zlib (RFC 1950), LZ4 block format (also decodes LZ4HC), zstd frames.
+flate2 = "1.1"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
+zstd = "0.14"
 nix = { version = "0.29", features = ["mman", "fs"] }
 libc = "0.2"
 windows-sys = { version = "0.59", features = [
