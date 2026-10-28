@@ -29,9 +29,9 @@ zstd.workspace = true
 default = ["tiff", "convert", "publish"]
 # TIFF/BigTIFF reader and writer (and the ordered work pipeline behind them).
 tiff = ["dep:tiff"]
-# One-call conversion orchestration (`convert`).
+# One-call conversion orchestration (`convert`) and the `vips` CLI bridge.
 convert = ["tiff"]
-# DZI / mainstream-format publishing via the `vips` CLI, and the viewer page.
+# DZI / single-image publishing (`publish`) and the viewer page.
 publish = ["convert"]
 
 [[example]]

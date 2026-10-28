@@ -82,6 +82,7 @@ pub(crate) fn vips_copy(
     .map(|_| ())
 }
 
+#[cfg(feature = "publish")]
 /// Build a DZI (Deep Zoom) pyramid: `<out_base>.dzi` + `<out_base>_files/`.
 /// `suffix` is the vips tile suffix, e.g. `.jpg[Q=90]` or `.png`.
 pub(crate) fn vips_dzsave(
@@ -104,6 +105,7 @@ pub(crate) fn vips_dzsave(
     .map(|_| ())
 }
 
+#[cfg(feature = "publish")]
 /// Deterministic 16-bit → 8-bit: keep each sample's most significant byte.
 pub(crate) fn vips_msb(vips_bin: &Path, src: &Path, dest: &Path) -> Result<()> {
     run_vips(
@@ -114,6 +116,7 @@ pub(crate) fn vips_msb(vips_bin: &Path, src: &Path, dest: &Path) -> Result<()> {
     .map(|_| ())
 }
 
+#[cfg(feature = "publish")]
 /// Read one header field of a vips-readable image via `vipsheader -f`
 /// (e.g. "width", "height", "format"). `vipsheader` ships in the same
 /// package as `vips`, so its presence is implied by [`vips_available`].
@@ -149,6 +152,7 @@ pub(crate) fn vipsheader_field(src: &Path, field: &str) -> Result<String> {
     Ok(normalize_format_field(&raw))
 }
 
+#[cfg(feature = "publish")]
 /// Reduce libvips' `((VipsBandFormat) VIPS_FORMAT_xxx)` value-contents
 /// dump (as printed by `vipsheader -f format`) to the bare lowercase
 /// nickname, e.g. `((VipsBandFormat) VIPS_FORMAT_UCHAR)` -> `"uchar"`.
@@ -203,6 +207,7 @@ mod tests {
         let _ = vips_available();
     }
 
+    #[cfg(feature = "publish")]
     #[test]
     fn normalize_format_field_reduces_format_only() {
         assert_eq!(
@@ -221,6 +226,7 @@ mod tests {
         assert_eq!(normalize_format_field("31"), "31");
     }
 
+    #[cfg(feature = "publish")]
     #[test]
     fn dzsave_produces_pyramid() {
         let Some(vips) = vips_available() else {
@@ -253,6 +259,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(feature = "publish")]
     #[test]
     fn msb_takes_high_byte() {
         let Some(vips) = vips_available() else {
@@ -298,6 +305,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(feature = "publish")]
     #[test]
     fn vipsheader_reads_fields() {
         let Some(vips) = vips_available() else {

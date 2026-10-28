@@ -22,6 +22,8 @@ branding, `mpp` the binary.
 cargo test                 # unit + integration tests (no big files needed)
 cargo build --release      # required for real-data runs (multi-GB images)
 cargo test -p mpp-core --no-default-features   # lean core (no TIFF/vips) that mmm uses
+# every feature combination must also stay clippy-clean:
+# --no-default-features [--features tiff | convert | publish]
 ```
 
 Rust via rustup (`source ~/.cargo/env` if PATH lacks cargo).

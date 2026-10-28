@@ -22,13 +22,14 @@
 //!
 //! - `tiff` — `formats::tiff_read` / `formats::tiff_write`: the
 //!   TIFF/BigTIFF reader and strip-streaming writer.
-//! - `convert` (implies `tiff`) — `convert`: one-call conversion
-//!   orchestration used by the CLI.
-//! - `publish` (implies `convert`) — `vips` (discovery and spawning of the
-//!   official `vips` binary for mainstream-format export and DZI `dzsave`),
-//!   `viewer` (the static, self-hostable Astrometrical viewer page) and
-//!   `publish` (routes any supported input to a DZI tile pyramid or a
-//!   single full-resolution image, plus the viewer page and WCS sidecar).
+//! - `convert` (implies `tiff`) — `convert` (one-call conversion
+//!   orchestration used by the CLI) and `vips` (discovery and spawning of
+//!   the official `vips` binary, used by conversion to mainstream formats
+//!   and by DZI `dzsave` export).
+//! - `publish` (implies `convert`) — `viewer` (the static, self-hostable
+//!   Astrometrical viewer page) and `publish` (routes any supported input
+//!   to a DZI tile pyramid or a single full-resolution image, plus the
+//!   viewer page and WCS sidecar).
 
 #![warn(missing_docs)]
 
@@ -49,7 +50,7 @@ pub mod wcs;
 #[cfg(feature = "convert")]
 pub mod convert;
 
-#[cfg(feature = "publish")]
+#[cfg(feature = "convert")]
 pub mod vips;
 
 #[cfg(feature = "publish")]
