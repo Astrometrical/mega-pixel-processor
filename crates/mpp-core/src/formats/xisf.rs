@@ -539,6 +539,26 @@ impl XisfImage {
     }
 }
 
+impl std::fmt::Debug for XisfImage {
+    /// The file, geometry and pixel state; never the pixels or the mapping.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let h = &self.header;
+        f.debug_struct("XisfImage")
+            .field("path", &self.path)
+            .field("geometry", &(h.width, h.height, h.channels))
+            .field("sample_format", &h.sample_format)
+            .field(
+                "pixels",
+                &match self.pixels {
+                    Pixels::Mapped => "mapped",
+                    Pixels::Decoded(_) => "decoded",
+                    Pixels::Pending => "pending",
+                },
+            )
+            .finish()
+    }
+}
+
 impl super::PlanarRows<f32> for XisfImage {
     fn width(&self) -> u64 {
         self.width()
@@ -1906,8 +1926,7 @@ mod tests {
             let p = d.join("a.xisf");
             compressed_matrix(true).write(&p);
             let e = XisfImage::open(&p)
-                .err()
-                .expect("bad checksum must fail")
+                .expect_err("bad checksum must fail")
                 .to_string();
             assert!(e.contains("checksum mismatch"), "{e}");
             let e = read_header(&p).unwrap_err().to_string();
@@ -2652,7 +2671,7 @@ mod tests {
                     ..Default::default()
                 }
                 .write(&p);
-                let e = XisfImage::open(&p).err().expect("must refuse").to_string();
+                let e = XisfImage::open(&p).expect_err("must refuse").to_string();
                 assert!(e.contains(want), "{fmt}: {e}");
             }
             std::fs::remove_dir_all(&d).unwrap();
@@ -2673,7 +2692,7 @@ mod tests {
                 },
             )
             .write(&p);
-            let e = XisfImage::open(&p).err().expect("bad checksum").to_string();
+            let e = XisfImage::open(&p).expect_err("bad checksum").to_string();
             assert!(e.contains("checksum mismatch"), "{e}");
             let img = XisfImage::open_with(
                 &p,
@@ -2731,7 +2750,7 @@ mod tests {
                 .unwrap()
                 .set_len(len - 10)
                 .unwrap();
-            let e = XisfImage::open(&p).err().expect("truncated").to_string();
+            let e = XisfImage::open(&p).expect_err("truncated").to_string();
             assert!(e.contains("past end of file"), "{e}");
             std::fs::remove_dir_all(&d).unwrap();
         }
@@ -2761,7 +2780,7 @@ mod tests {
             bytes[8..12].copy_from_slice(&(xml.len() as u32).to_le_bytes());
             bytes[16..16 + xml.len()].copy_from_slice(xml.as_bytes());
             std::fs::write(&p, &bytes).unwrap();
-            let e = XisfImage::open(&p).err().expect("oversized").to_string();
+            let e = XisfImage::open(&p).expect_err("oversized").to_string();
             assert!(
                 e.contains("does not match geometry") || e.contains("expand"),
                 "{e}"
@@ -2858,8 +2877,7 @@ mod tests {
                 "read_header: {e}"
             );
             let e = XisfImage::open(p)
-                .err()
-                .expect("open must refuse")
+                .expect_err("open must refuse")
                 .to_string();
             assert!(e.contains("expand") || e.contains("overflow"), "open: {e}");
         }
@@ -2875,8 +2893,7 @@ mod tests {
                 "",
             );
             let e = XisfImage::open(&p)
-                .err()
-                .expect("open must refuse")
+                .expect_err("open must refuse")
                 .to_string();
             assert!(e.contains("expand"), "{e}");
             std::fs::remove_dir_all(&d).unwrap();
