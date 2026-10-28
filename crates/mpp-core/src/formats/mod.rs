@@ -36,31 +36,68 @@ pub trait PlanarRows<T> {
     fn row(&self, c: u64, y: u64) -> &[T];
 }
 
+/// File format identified from a file's first bytes by [`sniff_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFormat {
+    /// `XISF0100` signature (a monolithic XISF file).
+    Xisf,
+    /// A FITS `SIMPLE` primary-header card.
+    Fits,
+    /// A TIFF or BigTIFF byte-order mark (`II*\0`, `MM\0*`, `II+\0`, `MM\0+`).
+    Tiff,
+}
+
+/// Identify a file's format from its first 8 bytes — the XISF `XISF0100`
+/// signature, the FITS `SIMPLE` card's 8-byte keyword field (`SIMPLE`
+/// padded with spaces), or a TIFF/BigTIFF byte-order mark — never from the
+/// file extension.
+///
+/// A short read (file under 8 bytes, including empty) is tolerated: it
+/// cannot match a signature, so it falls straight through to the "none of
+/// these" error rather than propagating an I/O error. A file matching no
+/// signature errors naming exactly that, rather than being handed to a
+/// reader that would surface an unrelated format-specific complaint (e.g.
+/// "no END card") for what may not be that format at all.
+pub fn sniff_format(path: &Path) -> Result<FileFormat> {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    let mut f = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let mut n = 0;
+    while n < magic.len() {
+        match f.read(&mut magic[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::io(path, e)),
+        }
+    }
+    let magic = &magic[..n];
+    if magic == b"XISF0100" {
+        Ok(FileFormat::Xisf)
+    } else if magic == b"SIMPLE  " {
+        Ok(FileFormat::Fits)
+    } else if magic.len() >= 4 && matches!(&magic[..4], b"II*\0" | b"MM\0*" | b"II+\0" | b"MM\0+") {
+        Ok(FileFormat::Tiff)
+    } else {
+        Err(Error::format(
+            path,
+            "not an XISF, FITS or TIFF file (no XISF0100 signature, SIMPLE card or TIFF byte-order mark)",
+        ))
+    }
+}
+
 /// The header of the image file at `path`, without reading its pixels.
 ///
-/// Dispatches on the extension: XISF (`.xisf`) and FITS (`.fits`, `.fit`,
-/// `.fts`) headers are read by [`xisf::read_header`] and
-/// [`fits::read_header`]. TIFF files (`.tif`, `.tiff`, `.btf`, `.tf8`) carry
-/// neither FITS keywords nor XISF properties that mpp reads, so they yield an
-/// empty [`Header`]. Any other extension is an [`Error::Format`].
+/// Dispatches on the file's signature ([`sniff_format`]), never its
+/// extension: XISF and FITS headers are read by [`xisf::read_header`] and
+/// [`fits::read_header`]. TIFF files carry neither FITS keywords nor XISF
+/// properties that mpp reads, so they yield an empty [`Header`]. Anything
+/// else is an [`Error::Format`].
 pub fn read_header(path: &Path) -> Result<Header> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match ext.as_str() {
-        "xisf" => xisf::read_header(path),
-        "fits" | "fit" | "fts" => fits::read_header(path),
-        "tif" | "tiff" | "btf" | "tf8" => {
-            // Fail on a missing file as the other formats do.
-            std::fs::metadata(path).map_err(|e| Error::io(path, e))?;
-            Ok(Header::default())
-        }
-        _ => Err(Error::format(
-            path,
-            format!("no header reader for extension '{ext}' (XISF, FITS or TIFF expected)"),
-        )),
+    match sniff_format(path)? {
+        FileFormat::Xisf => xisf::read_header(path),
+        FileFormat::Fits => fits::read_header(path),
+        FileFormat::Tiff => Ok(Header::default()),
     }
 }
 
@@ -279,6 +316,68 @@ impl SampleFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mpp-formats-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sniff_detects_each_signature() {
+        let dir = tmpdir("sniff");
+        let cases: [(&[u8], FileFormat); 6] = [
+            (b"XISF0100\x10\0\0\0", FileFormat::Xisf),
+            (b"SIMPLE  =                    T", FileFormat::Fits),
+            (b"II*\0\x08\0\0\0", FileFormat::Tiff),
+            (b"MM\0*\0\0\0\x08", FileFormat::Tiff),
+            (b"II+\0\x08\0\0\0", FileFormat::Tiff),
+            (b"MM\0+\0\x08\0\0", FileFormat::Tiff),
+        ];
+        for (i, (bytes, want)) in cases.iter().enumerate() {
+            let p = dir.join(format!("f{i}.bin"));
+            std::fs::write(&p, bytes).unwrap();
+            assert_eq!(sniff_format(&p).unwrap(), *want, "case {i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sniff_rejects_short_and_junk_files() {
+        let dir = tmpdir("sniff-junk");
+        for (i, bytes) in [&b""[..], &b"II*"[..], &b"hello, world"[..]]
+            .iter()
+            .enumerate()
+        {
+            let p = dir.join(format!("j{i}.xisf"));
+            std::fs::write(&p, bytes).unwrap();
+            let e = sniff_format(&p).unwrap_err().to_string();
+            assert!(
+                e.contains("not an XISF, FITS or TIFF file"),
+                "case {i}: {e}"
+            );
+        }
+        assert!(matches!(
+            sniff_format(&dir.join("missing.fits")),
+            Err(Error::Io { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signature_beats_extension() {
+        let dir = tmpdir("sig-ext");
+        let p = dir.join("really-xisf.fits");
+        crate::testsupport::synth_xisf(&p, 4, 3, 1, true);
+        let h = read_header(&p).unwrap();
+        assert!(
+            h.property("PCL:AstrometricSolution:ReferenceCelestialCoordinates")
+                .is_some(),
+            "XISF properties expected from a .fits-named XISF file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn property_value_accessors() {
