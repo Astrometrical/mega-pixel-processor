@@ -195,3 +195,290 @@ pub(crate) fn synth_fits(
     }
     std::fs::write(path, bytes).map_err(|e| Error::io(path, e))
 }
+
+/// How a synthesized XISF block is serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// `location="attachment:…"` after the header.
+    Attached,
+    /// `location="inline:base64"`.
+    Inline,
+    /// `location="embedded"` with a child `<Data encoding="base64">`.
+    Embedded,
+}
+
+/// Encoding options for one synthesized block.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockSpec {
+    /// Where the block goes.
+    pub placement: Placement,
+    /// `(codec, shuffle item size, subblock size)` to compress with.
+    pub codec: Option<(crate::formats::xisf_codec::Codec, Option<usize>, usize)>,
+    /// Checksum algorithm name (`"sha-1"`, `"sha-256"`, …) to declare.
+    pub checksum: Option<&'static str>,
+    /// Corrupt the declared digest (flip its first byte).
+    pub bad_checksum: bool,
+}
+
+impl Default for BlockSpec {
+    fn default() -> Self {
+        BlockSpec {
+            placement: Placement::Attached,
+            codec: None,
+            checksum: None,
+            bad_checksum: false,
+        }
+    }
+}
+
+/// Hex digest of `data` under the XISF checksum algorithm `alg`.
+pub(crate) fn digest_hex(alg: &str, data: &[u8]) -> String {
+    use sha2::Digest;
+    let d: Vec<u8> = match alg {
+        "sha-1" | "sha1" => sha1::Sha1::digest(data).to_vec(),
+        "sha-256" | "sha256" => sha2::Sha256::digest(data).to_vec(),
+        "sha-512" | "sha512" => sha2::Sha512::digest(data).to_vec(),
+        "sha3-256" => sha3::Sha3_256::digest(data).to_vec(),
+        "sha3-512" => sha3::Sha3_512::digest(data).to_vec(),
+        other => panic!("digest_hex: unknown algorithm {other}"),
+    };
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A block's serialized form: the attributes to put on its element, the
+/// stored bytes (attached) or the text (inline/embedded).
+struct EncodedBlock {
+    /// `compression=…` / `subblocks=…` / `checksum=…` attributes (leading
+    /// space included); for embedded blocks these go on `<Data>`.
+    attrs: String,
+    stored: Vec<u8>,
+    placement: Placement,
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        for i in 0..4 {
+            s.push(if i <= chunk.len() {
+                ALPHA[(n >> (18 - 6 * i)) as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+    }
+    s
+}
+
+fn encode_block(data: &[u8], spec: &BlockSpec) -> EncodedBlock {
+    let (stored, mut attrs) = match spec.codec {
+        Some((codec, item, sub)) => {
+            let (stored, c) = crate::formats::xisf_codec::compress(codec, item, data, sub);
+            let mut a = format!(r#" compression="{}:{}"#, c.codec_id(), data.len());
+            if let Some(i) = item {
+                a.push_str(&format!(":{i}"));
+            }
+            a.push('"');
+            if c.subblocks.len() > 1 {
+                let list: Vec<String> = c
+                    .subblocks
+                    .iter()
+                    .map(|(x, y)| format!("{x},{y}"))
+                    .collect();
+                a.push_str(&format!(r#" subblocks="{}""#, list.join(":")));
+            }
+            (stored, a)
+        }
+        None => (data.to_vec(), String::new()),
+    };
+    if let Some(alg) = spec.checksum {
+        let mut hex = digest_hex(alg, &stored);
+        if spec.bad_checksum {
+            let flipped = if hex.starts_with('0') { '1' } else { '0' };
+            hex.replace_range(0..1, &flipped.to_string());
+        }
+        attrs.push_str(&format!(r#" checksum="{alg}:{hex}""#));
+    }
+    EncodedBlock {
+        attrs,
+        stored,
+        placement: spec.placement,
+    }
+}
+
+/// One `<Image>` of a synthesized unit.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageSpec {
+    /// `geometry` (width, height, channels).
+    pub geometry: (u64, u64, u64),
+    /// `sampleFormat` attribute value.
+    pub sample_format: &'static str,
+    /// Raw sample bytes exactly as they should be stored uncompressed
+    /// (already in the declared byte order and pixel storage).
+    pub data: Vec<u8>,
+    /// Extra `<Image>` attributes (leading space included), e.g.
+    /// ` bounds="0:1" pixelStorage="Normal" byteOrder="big"`.
+    pub attrs: String,
+    /// Child elements: `<FITSKeyword>`s, `<Property>`s, `<Thumbnail>`…
+    pub children: String,
+    /// Block encoding (placement must be `Attached` or `Embedded`).
+    pub block: BlockSpec,
+}
+
+/// A `<Property>` whose value is a data block (vector/matrix).
+#[derive(Debug, Clone)]
+pub(crate) struct PropSpec {
+    /// `id`.
+    pub id: &'static str,
+    /// `type`, e.g. `F64Matrix`.
+    pub type_: &'static str,
+    /// Shape attributes (leading space included), e.g. ` rows="2" columns="2"`.
+    pub shape: String,
+    /// Raw element bytes as stored uncompressed (declared byte order).
+    pub data: Vec<u8>,
+    /// Extra attributes, e.g. ` byteOrder="big"`.
+    pub attrs: String,
+    /// Block encoding.
+    pub block: BlockSpec,
+}
+
+/// Builder for synthetic monolithic XISF units, laid out as PixInsight does:
+/// uncompressed attached image blocks 4096-aligned, compressed blocks and
+/// property attachments packed after them unaligned.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct XisfBuilder {
+    /// Images, in order.
+    pub images: Vec<ImageSpec>,
+    /// File-level block properties.
+    pub properties: Vec<PropSpec>,
+    /// Raw XML appended inside the root element (scalar properties,
+    /// extension elements…).
+    pub root_xml: String,
+}
+
+impl XisfBuilder {
+    /// Serialize the unit to `path`.
+    pub fn write(&self, path: &Path) {
+        let images: Vec<EncodedBlock> = self
+            .images
+            .iter()
+            .map(|i| encode_block(&i.data, &i.block))
+            .collect();
+        let props: Vec<EncodedBlock> = self
+            .properties
+            .iter()
+            .map(|p| encode_block(&p.data, &p.block))
+            .collect();
+        let mut capacity = 4096u64;
+        loop {
+            // Lay out attachments after a header region of `capacity` bytes.
+            let mut cursor = capacity;
+            let mut place = |b: &EncodedBlock, align: bool| -> u64 {
+                if align {
+                    cursor = cursor.div_ceil(4096) * 4096;
+                }
+                let at = cursor;
+                cursor += b.stored.len() as u64;
+                at
+            };
+            let mut offsets = Vec::new();
+            for b in &images {
+                let aligned = b.attrs.is_empty() || !b.attrs.contains("compression");
+                offsets.push(place(b, aligned));
+            }
+            for b in &props {
+                offsets.push(place(b, false));
+            }
+            let mut xml = String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">"#,
+            );
+            let mut k = 0;
+            for (spec, b) in self.images.iter().zip(&images) {
+                let (w, h, c) = spec.geometry;
+                xml.push_str(&format!(
+                    r#"<Image geometry="{w}:{h}:{c}" sampleFormat="{}"{}"#,
+                    spec.sample_format, spec.attrs
+                ));
+                match b.placement {
+                    Placement::Attached => xml.push_str(&format!(
+                        r#" location="attachment:{}:{}"{}>"#,
+                        offsets[k],
+                        b.stored.len(),
+                        b.attrs
+                    )),
+                    Placement::Embedded => xml.push_str(&format!(
+                        r#" location="embedded"><Data encoding="base64"{}>{}</Data>"#,
+                        b.attrs,
+                        base64(&b.stored)
+                    )),
+                    Placement::Inline => panic!("an Image cannot be inline"),
+                }
+                xml.push_str(&spec.children);
+                xml.push_str("</Image>");
+                k += 1;
+            }
+            for (spec, b) in self.properties.iter().zip(&props) {
+                let head = format!(
+                    r#"<Property id="{}" type="{}"{}{}"#,
+                    spec.id, spec.type_, spec.shape, spec.attrs
+                );
+                match b.placement {
+                    Placement::Attached => xml.push_str(&format!(
+                        r#"{head} location="attachment:{}:{}"{}/>"#,
+                        offsets[k],
+                        b.stored.len(),
+                        b.attrs
+                    )),
+                    Placement::Inline => xml.push_str(&format!(
+                        r#"{head} location="inline:base64"{}>{}</Property>"#,
+                        b.attrs,
+                        base64(&b.stored)
+                    )),
+                    Placement::Embedded => xml.push_str(&format!(
+                        r#"{head} location="embedded"><Data encoding="base64"{}>{}</Data></Property>"#,
+                        b.attrs,
+                        base64(&b.stored)
+                    )),
+                }
+                k += 1;
+            }
+            xml.push_str(&self.root_xml);
+            xml.push_str("</xisf>");
+            if 16 + xml.len() as u64 > capacity {
+                capacity *= 2;
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(cursor as usize);
+            bytes.extend_from_slice(b"XISF0100");
+            bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&[0u8; 4]);
+            bytes.extend_from_slice(xml.as_bytes());
+            for (b, &off) in images.iter().chain(&props).zip(&offsets) {
+                if b.placement == Placement::Attached {
+                    bytes.resize(off as usize, 0);
+                    bytes.extend_from_slice(&b.stored);
+                }
+            }
+            std::fs::write(path, bytes).unwrap();
+            return;
+        }
+    }
+}
+
+/// A minimal one-image unit: `w`×`h`×1 Float32 zeros, uncompressed.
+pub(crate) fn tiny_image() -> ImageSpec {
+    ImageSpec {
+        geometry: (2, 2, 1),
+        sample_format: "Float32",
+        data: vec![0u8; 16],
+        attrs: r#" bounds="0:1" colorSpace="Gray""#.into(),
+        children: String::new(),
+        block: BlockSpec::default(),
+    }
+}

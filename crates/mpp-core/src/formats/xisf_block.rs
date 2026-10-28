@@ -46,8 +46,6 @@ pub struct DataBlock {
 /// The raw attribute values that describe a block, gathered by the XML
 /// walk. For `location="embedded"`, `text`, `text_encoding`, `compression`
 /// and `subblocks` come from the child `<Data>` element.
-// Wired into the XML walk by the next commit (property/image blocks).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BlockAttrs<'a> {
     pub location: &'a str,
@@ -61,7 +59,6 @@ pub(crate) struct BlockAttrs<'a> {
 
 impl DataBlock {
     /// Build a block from its attributes, validating every one.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn parse(a: &BlockAttrs) -> std::result::Result<DataBlock, String> {
         use super::xisf::{base64_decode, hex_decode};
         let loc = a.location.trim();
@@ -165,7 +162,25 @@ impl DataBlock {
         out: &mut [u8],
         scratch: Option<&mut [u8]>,
     ) -> std::result::Result<(), String> {
-        let stored = self.stored(file)?;
+        self.decode_stored_into(self.stored(file)?, verify, out, scratch)
+    }
+
+    /// [`Self::decode_into`] given the block's stored bytes directly (as
+    /// read by a streaming reader rather than sliced from a mapped file).
+    pub fn decode_stored_into(
+        &self,
+        stored: &[u8],
+        verify: bool,
+        out: &mut [u8],
+        scratch: Option<&mut [u8]>,
+    ) -> std::result::Result<(), String> {
+        if stored.len() as u64 != self.stored_len() {
+            return Err(format!(
+                "stored block is {} bytes, {} declared",
+                stored.len(),
+                self.stored_len()
+            ));
+        }
         if verify && let Some(c) = &self.checksum {
             c.verify(stored)?;
         }
@@ -186,6 +201,15 @@ impl DataBlock {
     /// [`Self::decode_into`] into a new buffer, for small (property)
     /// blocks.
     pub fn decode(&self, file: &[u8], verify: bool) -> std::result::Result<Vec<u8>, String> {
+        self.decode_stored(self.stored(file)?, verify)
+    }
+
+    /// [`Self::decode`] given the block's stored bytes directly.
+    pub fn decode_stored(
+        &self,
+        stored: &[u8],
+        verify: bool,
+    ) -> std::result::Result<Vec<u8>, String> {
         let n = usize::try_from(self.uncompressed_len())
             .map_err(|_| "block too large for this platform".to_string())?;
         let mut out = vec![0u8; n];
@@ -194,7 +218,7 @@ impl DataBlock {
             .as_ref()
             .is_some_and(|c| c.item_size.is_some());
         let mut scratch = shuffled.then(|| vec![0u8; n]);
-        self.decode_into(file, verify, &mut out, scratch.as_deref_mut())?;
+        self.decode_stored_into(stored, verify, &mut out, scratch.as_deref_mut())?;
         Ok(out)
     }
 }

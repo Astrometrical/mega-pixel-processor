@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use quick_xml::events::Event;
 
+use super::xisf_block::{BlockAttrs, BlockLocation, ByteOrder, DataBlock};
 use super::{FitsKeyword, PropertyValue, SampleFormat, XisfProperty};
 use crate::header::Header;
 use crate::{Error, Result};
@@ -42,6 +43,25 @@ pub struct XisfHeader {
     /// All `<Property>` elements in the header (image-level and file-level).
     /// Attachment-located f64 vectors/matrices are resolved by [`XisfImage::open`].
     pub properties: Vec<XisfProperty>,
+    /// Data blocks of attachment-located vector/matrix properties, by index
+    /// into `properties`, still to be read and decoded.
+    pub(crate) property_blocks: Vec<(usize, DataBlock)>,
+}
+
+/// Options for opening an XISF unit.
+#[derive(Debug, Clone)]
+pub struct XisfOpenOptions {
+    /// Verify declared data-block checksums before using a block (default
+    /// `true`). A mismatch is an error; turn this off only to salvage data.
+    pub verify_checksums: bool,
+}
+
+impl Default for XisfOpenOptions {
+    fn default() -> Self {
+        XisfOpenOptions {
+            verify_checksums: true,
+        }
+    }
 }
 
 /// A memory-mapped, read-only XISF image exposing planar f32 channel data.
@@ -58,20 +78,28 @@ impl XisfImage {
     /// supported subset (module docs): non-Float32 samples, compressed or
     /// non-planar storage, malformed headers.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, &XisfOpenOptions::default())
+    }
+
+    /// [`Self::open`] with explicit options.
+    pub fn open_with(path: &Path, opts: &XisfOpenOptions) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::io(path, e))?;
         // SAFETY: read-only map; we accept that truncation by another process
         // during a run is undefined, as is conventional for mmap-based readers.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::io(path, e))?;
-        let mut header = parse_header(path, &mmap)?;
+        let mut header = parse_header(path, &mmap, opts.verify_checksums)?;
 
         // Resolve attachment-located numeric vectors/matrices (small blocks —
         // e.g. astrometric solution data) so downstream code sees decoded values.
-        for prop in &mut header.properties {
-            if prop.location.is_some() && prop.value.needs_attachment_data() {
-                let value = attachment_slice(&mmap, path, prop)
-                    .and_then(|bytes| decode_attached_numbers(bytes, path, prop));
-                lenient(prop, value)?;
-            }
+        for (i, block) in std::mem::take(&mut header.property_blocks) {
+            let prop = &mut header.properties[i];
+            let value = block
+                .stored(&mmap)
+                .map_err(|e| Error::format(path, format!("property {}: {e}", prop.id)))
+                .and_then(|stored| {
+                    decode_property_block(path, prop, &block, stored, opts.verify_checksums)
+                });
+            lenient(prop, value)?;
         }
 
         header
@@ -197,6 +225,11 @@ impl super::PlanarRows<f32> for XisfImage {
 /// them, and a [`Header`] is meant to travel. [`XisfImage::open`] keeps them.
 /// The header's image size is the `<Image geometry>`.
 pub fn read_header(path: &Path) -> Result<Header> {
+    read_header_with(path, &XisfOpenOptions::default())
+}
+
+/// [`read_header`] with explicit options.
+pub fn read_header_with(path: &Path, opts: &XisfOpenOptions) -> Result<Header> {
     let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
     let io = |e| Error::io(path, e);
     let mut lead = [0u8; 16];
@@ -214,35 +247,39 @@ pub fn read_header(path: &Path) -> Result<Header> {
     let mut bytes = lead.to_vec();
     bytes.resize(16 + header_len, 0);
     file.read_exact(&mut bytes[16..]).map_err(io)?;
-    let mut header = parse_header(path, &bytes)?;
-    // PixInsight's private lookup-table cache of the solution: tens of MB that
-    // no decoder reads, and a Header travels between nodes.
+    let mut header = parse_header(path, &bytes, opts.verify_checksums)?;
+
+    for (i, block) in std::mem::take(&mut header.property_blocks) {
+        let prop = &mut header.properties[i];
+        // PixInsight's private lookup-table cache of the solution: tens of MB
+        // that no decoder reads (dropped below), so never read it either.
+        if prop.id.starts_with(GRID_CACHE_PREFIX) {
+            continue;
+        }
+        let Some((off, size)) = prop.location else {
+            continue;
+        };
+        let value = if off.checked_add(size).is_none_or(|end| end > file_len) {
+            Err(Error::format(
+                path,
+                format!("property {}: attachment out of bounds", prop.id),
+            ))
+        } else {
+            let mut data = vec![0u8; size as usize];
+            file.seek(SeekFrom::Start(off)).map_err(io)?;
+            file.read_exact(&mut data).map_err(io)?;
+            decode_property_block(path, prop, &block, &data, opts.verify_checksums)
+        };
+        lenient(prop, value)?;
+    }
+    // ...and a Header travels between nodes.
     header
         .properties
         .retain(|p| !p.id.starts_with(GRID_CACHE_PREFIX));
-
-    for prop in &mut header.properties {
-        if let Some((off, size)) = prop.location
-            && prop.value.needs_attachment_data()
-        {
-            let value = if off.checked_add(size).is_none_or(|end| end > file_len) {
-                Err(Error::format(
-                    path,
-                    format!("property {}: attachment out of bounds", prop.id),
-                ))
-            } else {
-                let mut data = vec![0u8; size as usize];
-                file.seek(SeekFrom::Start(off)).map_err(io)?;
-                file.read_exact(&mut data).map_err(io)?;
-                decode_attached_numbers(&data, path, prop)
-            };
-            lenient(prop, value)?;
-        }
-    }
     Ok(Header::from(&header))
 }
 
-fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
+fn parse_header(path: &Path, mmap: &[u8], verify: bool) -> Result<XisfHeader> {
     if mmap.len() < 16 || &mmap[0..8] != SIGNATURE {
         return Err(Error::format(
             path,
@@ -261,6 +298,7 @@ fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
     let mut header: Option<XisfHeader> = None;
     let mut in_image = false;
     let mut properties: Vec<XisfProperty> = Vec::new();
+    let mut property_blocks: Vec<(usize, DataBlock)> = Vec::new();
     // <Property> currently being read: (partial parse, accumulated text,
     // nesting depth of unrelated child elements to skip).
     let mut pending: Option<(PendingProperty, String, u32)> = None;
@@ -271,7 +309,10 @@ fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
             Ok(Event::Start(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
-                if let Some((_, _, depth)) = pending.as_mut() {
+                if let Some((partial, _, depth)) = pending.as_mut() {
+                    if *depth == 0 && name == b"Data" {
+                        partial.data = Some(EmbeddedData::parse(path, &e)?);
+                    }
                     *depth += 1; // nested element inside <Property> (e.g. <Data>)
                 } else if name == b"Property" {
                     pending = Some((parse_property_start(path, &e)?, String::new(), 0));
@@ -288,11 +329,21 @@ fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
             Ok(Event::Empty(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
-                if pending.is_some() {
-                    // self-closing child inside <Property>: nothing to track
+                if let Some((partial, _, depth)) = pending.as_mut() {
+                    // A self-closing <Data/> is an empty embedded block.
+                    if *depth == 0 && name == b"Data" {
+                        partial.data = Some(EmbeddedData::parse(path, &e)?);
+                    }
                 } else if name == b"Property" {
                     let partial = parse_property_start(path, &e)?;
-                    properties.push(finish_property(path, partial, "")?);
+                    push_property(
+                        &mut properties,
+                        &mut property_blocks,
+                        path,
+                        partial,
+                        "",
+                        verify,
+                    )?;
                 } else if name == b"Image" && header.is_none() {
                     header = Some(parse_image_element(path, &e)?);
                 } else if name == b"FITSKeyword"
@@ -303,16 +354,25 @@ fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
                 }
             }
             Ok(Event::Text(t)) => {
-                if let Some((_, text, 0)) = pending.as_mut() {
+                if let Some((partial, text, depth)) = pending.as_mut() {
                     let s = t
                         .unescape()
                         .map_err(|e| Error::format(path, format!("bad XML text: {e}")))?;
-                    text.push_str(&s);
+                    match (*depth, partial.data.as_mut()) {
+                        (0, _) => text.push_str(&s),
+                        (1, Some(data)) => data.text.push_str(&s),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::CData(t)) => {
-                if let Some((_, text, 0)) = pending.as_mut() {
-                    text.push_str(&String::from_utf8_lossy(&t));
+                if let Some((partial, text, depth)) = pending.as_mut() {
+                    let s = String::from_utf8_lossy(&t);
+                    match (*depth, partial.data.as_mut()) {
+                        (0, _) => text.push_str(&s),
+                        (1, Some(data)) => data.text.push_str(&s),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -321,7 +381,14 @@ fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
                         *depth -= 1;
                     } else {
                         let (partial, text, _) = pending.take().unwrap();
-                        properties.push(finish_property(path, partial, &text)?);
+                        push_property(
+                            &mut properties,
+                            &mut property_blocks,
+                            path,
+                            partial,
+                            &text,
+                            verify,
+                        )?;
                     }
                 } else if e.local_name().as_ref() == b"Image" {
                     in_image = false;
@@ -337,7 +404,46 @@ fn parse_header(path: &Path, mmap: &[u8]) -> Result<XisfHeader> {
     let mut header =
         header.ok_or_else(|| Error::format(path, "no <Image> element in XISF header"))?;
     header.properties = properties;
+    header.property_blocks = property_blocks;
     Ok(header)
+}
+
+/// Finish a `<Property>` and append it, remembering its data block when the
+/// data is attached (resolved later from the file).
+fn push_property(
+    properties: &mut Vec<XisfProperty>,
+    blocks: &mut Vec<(usize, DataBlock)>,
+    path: &Path,
+    partial: PendingProperty,
+    text: &str,
+    verify: bool,
+) -> Result<()> {
+    let (prop, block) = finish_property(path, partial, text, verify)?;
+    if let Some(block) = block {
+        blocks.push((properties.len(), block));
+    }
+    properties.push(prop);
+    Ok(())
+}
+
+/// The `<Data>` child of an `embedded` property: its block attributes and
+/// encoded text.
+struct EmbeddedData {
+    encoding: Option<String>,
+    compression: Option<String>,
+    subblocks: Option<String>,
+    text: String,
+}
+
+impl EmbeddedData {
+    fn parse(path: &Path, e: &quick_xml::events::BytesStart) -> Result<EmbeddedData> {
+        Ok(EmbeddedData {
+            encoding: attr_string(path, e, b"encoding")?,
+            compression: attr_string(path, e, b"compression")?,
+            subblocks: attr_string(path, e, b"subblocks")?,
+            text: String::new(),
+        })
+    }
 }
 
 /// `<Property>` attributes captured before its element text is known.
@@ -349,6 +455,11 @@ struct PendingProperty {
     length: Option<u64>,
     rows: Option<u32>,
     cols: Option<u32>,
+    byte_order: Option<String>,
+    compression: Option<String>,
+    subblocks: Option<String>,
+    checksum: Option<String>,
+    data: Option<EmbeddedData>,
 }
 
 fn parse_property_start(path: &Path, e: &quick_xml::events::BytesStart) -> Result<PendingProperty> {
@@ -363,6 +474,11 @@ fn parse_property_start(path: &Path, e: &quick_xml::events::BytesStart) -> Resul
         length: parse_num(attr_string(path, e, b"length")?),
         rows: parse_num(attr_string(path, e, b"rows")?),
         cols: parse_num(attr_string(path, e, b"columns")?),
+        byte_order: attr_string(path, e, b"byteOrder")?,
+        compression: attr_string(path, e, b"compression")?,
+        subblocks: attr_string(path, e, b"subblocks")?,
+        checksum: attr_string(path, e, b"checksum")?,
+        data: None,
     })
 }
 
@@ -442,16 +558,24 @@ fn decode_numbers(kind: NumKind, bytes: &[u8]) -> Vec<f64> {
 ///
 /// Types we do not decode become [`PropertyValue::Unread`] (or `Str` when a
 /// plain `value` attribute is present).
-fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfProperty> {
+fn finish_property(
+    path: &Path,
+    p: PendingProperty,
+    text: &str,
+    verify: bool,
+) -> Result<(XisfProperty, Option<DataBlock>)> {
     let id = p.id.clone();
     let type_ = p.type_.clone();
-    match finish_property_strict(path, p, text) {
-        Err(_) if is_lenient_array(&type_) => Ok(XisfProperty {
-            id,
-            type_,
-            value: PropertyValue::Unread,
-            location: None,
-        }),
+    match finish_property_strict(path, p, text, verify) {
+        Err(_) if is_lenient_array(&type_) => Ok((
+            XisfProperty {
+                id,
+                type_,
+                value: PropertyValue::Unread,
+                location: None,
+            },
+            None,
+        )),
         r => r,
     }
 }
@@ -478,15 +602,20 @@ fn lenient(prop: &mut XisfProperty, value: Result<PropertyValue>) -> Result<()> 
 }
 
 /// [`finish_property`] without the leniency for non-f64 arrays.
-fn finish_property_strict(path: &Path, p: PendingProperty, text: &str) -> Result<XisfProperty> {
+fn finish_property_strict(
+    path: &Path,
+    p: PendingProperty,
+    text: &str,
+    verify: bool,
+) -> Result<(XisfProperty, Option<DataBlock>)> {
     let err = |msg: String| Error::format(path, msg);
+    // Leading/trailing white space around a scalar is irrelevant (spec 7).
     let scalar = |p: &PendingProperty| -> String {
-        p.value_attr
-            .clone()
-            .unwrap_or_else(|| text.trim().to_string())
+        p.value_attr.as_deref().unwrap_or(text).trim().to_string()
     };
 
     let mut location = None;
+    let mut attached = None;
     let value = match p.type_.as_str() {
         "Float32" | "Float64" => PropertyValue::F64(
             scalar(&p)
@@ -523,50 +652,59 @@ fn finish_property_strict(path: &Path, p: PendingProperty, text: &str) -> Result
                     .ok_or_else(|| err(format!("property {}: missing rows/columns", p.id)))?;
                 (r as usize) * (c as usize)
             };
-            let data: Vec<f64> = match p.location.as_deref() {
-                Some(loc) if loc.starts_with("inline:") => {
-                    let bytes = decode_inline(loc, text).ok_or_else(|| {
-                        err(format!("property {}: bad inline data ({loc})", p.id))
-                    })?;
-                    if bytes.len() != n * width {
+            let (block_location, text_encoding, compression, subblocks, block_text) =
+                match (p.location.as_deref(), &p.data) {
+                    (Some("embedded"), Some(d)) => (
+                        "embedded",
+                        d.encoding.as_deref(),
+                        d.compression.as_deref(),
+                        d.subblocks.as_deref(),
+                        Some(d.text.as_str()),
+                    ),
+                    (Some(loc), _) => (
+                        loc,
+                        None,
+                        p.compression.as_deref(),
+                        p.subblocks.as_deref(),
+                        Some(text),
+                    ),
+                    (None, _) => {
                         return Err(err(format!(
-                            "property {}: inline data is {} bytes, expected {}",
-                            p.id,
-                            bytes.len(),
-                            n * width
+                            "property {}: vector/matrix without a location",
+                            p.id
                         )));
                     }
-                    decode_numbers(kind, &bytes)
+                };
+            let block = DataBlock::parse(&BlockAttrs {
+                location: block_location,
+                byte_order: p.byte_order.as_deref(),
+                compression,
+                subblocks,
+                checksum: p.checksum.as_deref(),
+                text: block_text,
+                text_encoding,
+            })
+            .map_err(|e| err(format!("property {}: {e}", p.id)))?;
+            let expected = (n as u64).checked_mul(width as u64);
+            if expected != Some(block.uncompressed_len()) {
+                return Err(err(format!(
+                    "property {}: data block is {} bytes, expected {}",
+                    p.id,
+                    block.uncompressed_len(),
+                    n * width
+                )));
+            }
+            let data: Vec<f64> = match &block.location {
+                BlockLocation::Inline(_) => {
+                    let bytes = block
+                        .decode(&[], verify)
+                        .map_err(|e| err(format!("property {}: {e}", p.id)))?;
+                    decode_numbers_ordered(kind, width, block.byte_order, bytes)
                 }
-                Some(loc) if loc.starts_with("attachment:") => {
-                    let mut it = loc.splitn(3, ':').skip(1);
-                    let off: u64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                        err(format!(
-                            "property {}: bad attachment location '{loc}'",
-                            p.id
-                        ))
-                    })?;
-                    let size: u64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                        err(format!(
-                            "property {}: bad attachment location '{loc}'",
-                            p.id
-                        ))
-                    })?;
-                    if size != (n * width) as u64 {
-                        return Err(err(format!(
-                            "property {}: attachment is {size} bytes, expected {}",
-                            p.id,
-                            n * width
-                        )));
-                    }
-                    location = Some((off, size));
+                BlockLocation::Attachment { offset, size } => {
+                    location = Some((*offset, *size));
+                    attached = Some(block);
                     Vec::new() // resolved from the file by the caller
-                }
-                other => {
-                    return Err(err(format!(
-                        "property {}: unsupported vector/matrix location {other:?}",
-                        p.id
-                    )));
                 }
             };
             if !is_matrix {
@@ -585,21 +723,56 @@ fn finish_property_strict(path: &Path, p: PendingProperty, text: &str) -> Result
         },
     };
 
-    Ok(XisfProperty {
-        id: p.id,
-        type_: p.type_,
-        value,
-        location,
-    })
+    Ok((
+        XisfProperty {
+            id: p.id,
+            type_: p.type_,
+            value,
+            location,
+        },
+        attached,
+    ))
 }
 
-/// Decode `inline:base64` / `inline:hex` payload text to raw bytes.
-fn decode_inline(location: &str, text: &str) -> Option<Vec<u8>> {
-    match location {
-        "inline:base64" => base64_decode(text),
-        "inline:hex" => hex_decode(text),
-        _ => None,
+/// Decode elements of `kind` (`width` bytes each) stored in `order`.
+fn decode_numbers_ordered(
+    kind: NumKind,
+    width: usize,
+    order: ByteOrder,
+    mut bytes: Vec<u8>,
+) -> Vec<f64> {
+    if order == ByteOrder::Big {
+        for c in bytes.chunks_exact_mut(width) {
+            c.reverse();
+        }
     }
+    decode_numbers(kind, &bytes)
+}
+
+/// Decode an attached vector/matrix property's block from its stored bytes
+/// (checksum, decompression, byte order) into the property's value.
+fn decode_property_block(
+    path: &Path,
+    prop: &XisfProperty,
+    block: &DataBlock,
+    stored: &[u8],
+    verify: bool,
+) -> Result<PropertyValue> {
+    let mut bytes = block
+        .decode_stored(stored, verify)
+        .map_err(|e| Error::format(path, format!("property {}: {e}", prop.id)))?;
+    if block.byte_order == ByteOrder::Big {
+        let (_, width, _) = numeric_array_type(&prop.type_).ok_or_else(|| {
+            Error::format(
+                path,
+                format!("property {}: not a numeric vector/matrix", prop.id),
+            )
+        })?;
+        for c in bytes.chunks_exact_mut(width) {
+            c.reverse();
+        }
+    }
+    decode_attached_numbers(&bytes, path, prop)
 }
 
 /// Minimal standard-alphabet base64 decoder (payloads here are tens of bytes;
@@ -650,23 +823,6 @@ pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
             .map(|&[hi, lo]| (hi << 4) | lo)
             .collect(),
     )
-}
-
-/// The bytes of an attachment-located property within the mapped file.
-fn attachment_slice<'a>(file: &'a [u8], path: &Path, prop: &XisfProperty) -> Result<&'a [u8]> {
-    let (off, size) = prop
-        .location
-        .ok_or_else(|| Error::format(path, format!("property {} has no attachment", prop.id)))?;
-    let end = off
-        .checked_add(size)
-        .filter(|&e| e <= file.len() as u64)
-        .ok_or_else(|| {
-            Error::format(
-                path,
-                format!("property {}: attachment out of bounds", prop.id),
-            )
-        })?;
-    Ok(&file[off as usize..end as usize])
 }
 
 /// Typed decoder for an attachment-located numeric vector/matrix property:
@@ -798,6 +954,7 @@ fn parse_image_element(path: &Path, e: &quick_xml::events::BytesStart) -> Result
         data_size,
         fits_keywords: Vec::new(),
         properties: Vec::new(),
+        property_blocks: Vec::new(),
     })
 }
 
@@ -812,6 +969,12 @@ fn parse_fits_keyword(path: &Path, e: &quick_xml::events::BytesStart) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`finish_property`] for the unit tests: verify checksums, drop the
+    /// attached-block side channel.
+    fn finish(path: &Path, p: PendingProperty, text: &str) -> Result<XisfProperty> {
+        finish_property(path, p, text, true).map(|(prop, _)| prop)
+    }
 
     /// Build a minimal monolithic XISF file: 3x2 image, 2 channels, Float32.
     fn synth_xisf(dir: &Path) -> PathBuf {
@@ -1118,6 +1281,11 @@ mod tests {
             length,
             rows,
             cols,
+            byte_order: None,
+            compression: None,
+            subblocks: None,
+            checksum: None,
+            data: None,
         }
     }
 
@@ -1127,7 +1295,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let p = finish_property(
+        let p = finish(
             Path::new("x"),
             pending(
                 "AstrometricSolution:DistortionModel:ImageToProjection:Local:X:NodeOffsets",
@@ -1150,7 +1318,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let p = finish_property(
+        let p = finish(
             Path::new("x"),
             pending(
                 "m",
@@ -1177,7 +1345,7 @@ mod tests {
     fn i32vector_attachment_size_uses_element_width() {
         // 4 elements × 4 bytes = 16 bytes; an 8-byte-per-element assumption
         // would reject it.
-        let p = finish_property(
+        let p = finish(
             Path::new("x"),
             pending(
                 "v",
@@ -1201,15 +1369,15 @@ mod tests {
                 None,
             )
         };
-        assert!(finish_property_strict(Path::new("x"), wrong(), "").is_err());
+        assert!(finish_property_strict(Path::new("x"), wrong(), "", true).is_err());
         // A malformed non-f64 array reads as Unread rather than failing.
-        let p = finish_property(Path::new("x"), wrong(), "").unwrap();
+        let p = finish(Path::new("x"), wrong(), "").unwrap();
         assert_eq!((p.value, p.location), (PropertyValue::Unread, None));
     }
 
     #[test]
     fn multiline_string_property_keeps_newline() {
-        let p = finish_property(
+        let p = finish(
             Path::new("x"),
             pending(
                 "AstrometricSolution:DistortionModel:ImageToProjection:Terms",
@@ -1316,5 +1484,266 @@ mod tests {
         );
         assert!(XisfImage::open(&bad).is_err(), "F64 behaviour unchanged");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    mod blocks {
+        //! Property data blocks: compression, checksums, embedded, byte order.
+        use super::super::*;
+        use crate::formats::xisf_codec::Codec;
+        use crate::testsupport::{BlockSpec, Placement, PropSpec, XisfBuilder, tiny_image};
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d =
+                std::env::temp_dir().join(format!("mpp-xisf-blocks-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn f64s(v: &[f64]) -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_le_bytes()).collect()
+        }
+
+        fn matrix() -> Vec<f64> {
+            (0..600).map(|i| (i / 3) as f64 * 0.25 - 7.0).collect()
+        }
+
+        fn unit(prop: PropSpec) -> XisfBuilder {
+            XisfBuilder {
+                images: vec![tiny_image()],
+                properties: vec![prop],
+                root_xml: String::new(),
+            }
+        }
+
+        fn compressed_matrix(bad_checksum: bool) -> XisfBuilder {
+            unit(PropSpec {
+                id: "AstrometricSolution:ControlPoints:Celestial",
+                type_: "F64Matrix",
+                shape: r#" rows="300" columns="2""#.into(),
+                data: f64s(&matrix()),
+                attrs: String::new(),
+                block: BlockSpec {
+                    placement: Placement::Attached,
+                    codec: Some((Codec::Zstd, Some(8), 1 << 20)),
+                    checksum: Some("sha-256"),
+                    bad_checksum,
+                },
+            })
+        }
+
+        fn prop<'a>(props: &'a [XisfProperty], id: &str) -> &'a XisfProperty {
+            props
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("no {id}"))
+        }
+
+        #[test]
+        fn compressed_property_block_decodes() {
+            let d = tmp("cmp");
+            let p = d.join("a.xisf");
+            compressed_matrix(false).write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            let v = &prop(
+                &img.header().properties,
+                "AstrometricSolution:ControlPoints:Celestial",
+            )
+            .value;
+            assert_eq!(v.as_f64_mat(), Some((300, 2, &matrix()[..])));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn read_header_decodes_compressed_properties() {
+            let d = tmp("cmp-hdr");
+            let p = d.join("a.xisf");
+            compressed_matrix(false).write(&p);
+            let h = read_header(&p).unwrap();
+            let v = &h
+                .property("AstrometricSolution:ControlPoints:Celestial")
+                .unwrap()
+                .value;
+            assert_eq!(v.as_f64_mat(), Some((300, 2, &matrix()[..])));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn property_checksum_mismatch_is_an_error_unless_disabled() {
+            let d = tmp("cksum");
+            let p = d.join("a.xisf");
+            compressed_matrix(true).write(&p);
+            let e = XisfImage::open(&p)
+                .err()
+                .expect("bad checksum must fail")
+                .to_string();
+            assert!(e.contains("checksum mismatch"), "{e}");
+            let e = read_header(&p).unwrap_err().to_string();
+            assert!(e.contains("checksum mismatch"), "{e}");
+            let opts = XisfOpenOptions {
+                verify_checksums: false,
+            };
+            let img = XisfImage::open_with(&p, &opts).unwrap();
+            let v = &prop(
+                &img.header().properties,
+                "AstrometricSolution:ControlPoints:Celestial",
+            )
+            .value;
+            assert_eq!(v.as_f64_mat(), Some((300, 2, &matrix()[..])));
+            assert!(read_header_with(&p, &opts).is_ok());
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn embedded_property_block_decodes() {
+            let d = tmp("emb");
+            let p = d.join("a.xisf");
+            let v = vec![1.5, -2.25, 1e-300, 4.0];
+            unit(PropSpec {
+                id: "Test:Embedded",
+                type_: "F64Vector",
+                shape: r#" length="4""#.into(),
+                data: f64s(&v),
+                attrs: String::new(),
+                block: BlockSpec {
+                    placement: Placement::Embedded,
+                    codec: Some((Codec::Zlib, None, 1 << 20)),
+                    checksum: None,
+                    bad_checksum: false,
+                },
+            })
+            .write(&p);
+            for props in [
+                XisfImage::open(&p).unwrap().header().properties.clone(),
+                read_header(&p).unwrap().properties,
+            ] {
+                assert_eq!(
+                    prop(&props, "Test:Embedded").value.as_f64_vec(),
+                    Some(&v[..])
+                );
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn big_endian_property_vector_decodes() {
+            let d = tmp("be");
+            let p = d.join("a.xisf");
+            let v = [3.0f64, -0.125, 7.5];
+            let be: Vec<u8> = v.iter().flat_map(|x| x.to_be_bytes()).collect();
+            unit(PropSpec {
+                id: "Test:BigEndian",
+                type_: "F64Vector",
+                shape: r#" length="3""#.into(),
+                data: be,
+                attrs: r#" byteOrder="big""#.into(),
+                block: BlockSpec {
+                    placement: Placement::Inline,
+                    ..Default::default()
+                },
+            })
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            assert_eq!(
+                prop(&img.header().properties, "Test:BigEndian")
+                    .value
+                    .as_f64_vec(),
+                Some(&v[..])
+            );
+            let i32s: Vec<u8> = [7i32, -9].iter().flat_map(|x| x.to_be_bytes()).collect();
+            unit(PropSpec {
+                id: "Test:I32",
+                type_: "I32Vector",
+                shape: r#" length="2""#.into(),
+                data: i32s,
+                attrs: r#" byteOrder="big""#.into(),
+                block: BlockSpec::default(),
+            })
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            assert_eq!(
+                prop(&img.header().properties, "Test:I32")
+                    .value
+                    .as_f64_vec(),
+                Some(&[7.0, -9.0][..])
+            );
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn scalar_text_forms() {
+            let d = tmp("text");
+            let p = d.join("a.xisf");
+            let mut root = String::new();
+            for (i, v) in ["true", "false", "1", "0", " true "].iter().enumerate() {
+                root.push_str(&format!(
+                    r#"<Property id="B{i}" type="Boolean" value="{v}"/>"#
+                ));
+            }
+            for (i, v) in ["NaN", "+Inf", "-Inf", "nan", "-nan", "inf", "-inf", " 2.5 "]
+                .iter()
+                .enumerate()
+            {
+                root.push_str(&format!(
+                    r#"<Property id="F{i}" type="Float64" value="{v}"/>"#
+                ));
+            }
+            root.push_str(r#"<Property id="I" type="Int32" value=" 42 "/>"#);
+            root.push_str(r#"<Property id="S" type="String">  keep inner  </Property>"#);
+            XisfBuilder {
+                images: vec![tiny_image()],
+                properties: vec![],
+                root_xml: root,
+            }
+            .write(&p);
+            let props = XisfImage::open(&p).unwrap().header().properties.clone();
+            let get = |id: &str| prop(&props, id).value.clone();
+            let bools: Vec<_> = (0..5).map(|i| get(&format!("B{i}"))).collect();
+            assert_eq!(
+                bools,
+                [1, 0, 1, 0, 1].map(PropertyValue::I64).to_vec(),
+                "Boolean true/false/1/0"
+            );
+            let f = |i: usize| get(&format!("F{i}")).as_f64().unwrap();
+            assert!(f(0).is_nan() && f(3).is_nan() && f(4).is_nan());
+            assert_eq!(
+                (f(1), f(2), f(5), f(6), f(7)),
+                (
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    2.5
+                )
+            );
+            assert_eq!(get("I"), PropertyValue::I64(42));
+            assert_eq!(get("S"), PropertyValue::Str("keep inner".into()));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn empty_vector_inline_block() {
+            let d = tmp("empty");
+            let p = d.join("a.xisf");
+            unit(PropSpec {
+                id: "Test:Empty",
+                type_: "F64Vector",
+                shape: r#" length="0""#.into(),
+                data: vec![],
+                attrs: String::new(),
+                block: BlockSpec {
+                    placement: Placement::Inline,
+                    ..Default::default()
+                },
+            })
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            assert_eq!(
+                prop(&img.header().properties, "Test:Empty")
+                    .value
+                    .as_f64_vec(),
+                Some(&[][..])
+            );
+            std::fs::remove_dir_all(&d).unwrap();
+        }
     }
 }
