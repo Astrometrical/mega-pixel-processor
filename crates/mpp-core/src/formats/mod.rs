@@ -20,6 +20,7 @@ pub mod tiff_write;
 pub mod xisf;
 pub mod xisf_block;
 pub mod xisf_codec;
+pub(crate) mod xisf_pixels;
 
 /// A planar image source the streaming writers can drain row by row.
 ///

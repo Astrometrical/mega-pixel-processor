@@ -278,18 +278,38 @@ impl Default for XisfOpenOptions {
 }
 
 /// A memory-mapped, read-only XISF image exposing planar f32 channel data.
+///
+/// An uncompressed, attached, planar, little-endian Float32 image in the
+/// default `0:1` range is served zero-copy from the mapping
+/// ([`Self::is_mapped`]). Any other image a baseline decoder reads is
+/// decoded on request: [`Self::decode_into`] into a caller buffer (e.g. a
+/// mapped cache file), or [`Self::load`] into memory, after which the
+/// channel/row accessors work as for a mapped image.
 pub struct XisfImage {
     path: PathBuf,
     mmap: Mmap,
     header: XisfHeader,
+    pixels: Pixels,
+    verify_checksums: bool,
+}
+
+/// Where an [`XisfImage`]'s planar f32 samples are.
+enum Pixels {
+    /// In the file mapping, at `header.data_offset`.
+    Mapped,
+    /// Decoded into memory by [`XisfImage::load`].
+    Decoded(Vec<f32>),
+    /// Not decoded yet.
+    Pending,
 }
 
 impl XisfImage {
     /// Open and validate a monolithic XISF file, resolving attachment-located
-    /// f64 vector/matrix properties (e.g. astrometric solution data) so
-    /// downstream code sees decoded values. Errors on anything outside the
-    /// supported subset (module docs): non-Float32 samples, compressed or
-    /// non-planar storage, malformed headers.
+    /// vector/matrix properties (e.g. astrometric solution data) so
+    /// downstream code sees decoded values. Pixels are not decoded here (see
+    /// the type docs); a mapped image's block checksum is verified now.
+    /// Errors on malformed headers and on images no decoder here reads
+    /// (UInt64 or complex samples, CIE L*a*b*, distributed units).
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with(path, &XisfOpenOptions::default())
     }
@@ -315,65 +335,68 @@ impl XisfImage {
             lenient(prop, value)?;
         }
 
-        header
-            .data_offset
-            .checked_add(header.data_size)
-            .filter(|&end| end <= mmap.len() as u64)
-            .ok_or_else(|| Error::format(path, "data block extends past end of file"))?;
-        let expected = header.width
-            * header.height
-            * header.channels
-            * header.sample_format.bytes_per_sample() as u64;
-        if header.data_size != expected {
+        if let BlockLocation::Attachment { offset, size } = header.block.location {
+            offset
+                .checked_add(size)
+                .filter(|&end| end <= mmap.len() as u64)
+                .ok_or_else(|| Error::format(path, "data block extends past end of file"))?;
+        }
+        if let Some(why) = super::xisf_pixels::unsupported(&header) {
+            return Err(Error::format(path, why));
+        }
+        // The declared (uncompressed) size must be exactly the geometry's,
+        // checked before anything is allocated from it.
+        let expected = header
+            .width
+            .checked_mul(header.height)
+            .and_then(|n| n.checked_mul(header.channels))
+            .and_then(|n| n.checked_mul(header.sample_format.bytes_per_sample() as u64));
+        if expected != Some(header.block.uncompressed_len()) {
             return Err(Error::format(
                 path,
                 format!(
-                    "data block size {} does not match geometry {}x{}x{} ({} bytes expected)",
-                    header.data_size, header.width, header.height, header.channels, expected
-                ),
-            ));
-        }
-
-        // Decoding of compressed, embedded, interleaved and big-endian
-        // pixel blocks lands with the pixel decoder; until then only the
-        // zero-copy layout opens.
-        if let Some(c) = &header.block.compression {
-            return Err(Error::format(
-                path,
-                format!(
-                    "compressed image blocks ({}) are not readable yet",
-                    c.codec_id()
-                ),
-            ));
-        }
-        if !matches!(header.block.location, BlockLocation::Attachment { .. })
-            || header.pixel_storage != PixelStorage::Planar
-            || header.block.byte_order != ByteOrder::Little
-        {
-            return Err(Error::format(
-                path,
-                "only attached, planar, little-endian image blocks are readable yet",
-            ));
-        }
-        if header.sample_format != SampleFormat::Float32 {
-            return Err(Error::format(
-                path,
-                format!(
-                    "unsupported sample format {:?} (only Float32 for now)",
+                    "data block size {} does not match geometry {}x{}x{} {:?}",
+                    header.block.uncompressed_len(),
+                    header.width,
+                    header.height,
+                    header.channels,
                     header.sample_format
                 ),
             ));
         }
-        if header.data_offset % 4 != 0 {
-            // PixInsight aligns attachments to 4096 bytes; anything unaligned
-            // would break the zero-copy f32 view.
-            return Err(Error::format(path, "attachment offset not 4-byte aligned"));
-        }
+
+        let mapped = header.block.compression.is_none()
+            && matches!(header.block.location, BlockLocation::Attachment { .. })
+            && header.pixel_storage == PixelStorage::Planar
+            && header.block.byte_order == ByteOrder::Little
+            && header.sample_format == SampleFormat::Float32
+            && header.effective_bounds() == (0.0, 1.0)
+            && header.offset == 0.0
+            // PixInsight aligns attachments to 4096 bytes; an unaligned one
+            // cannot back a zero-copy f32 view, so it is decoded instead.
+            && header.data_offset % 4 == 0;
+        let pixels = if mapped {
+            if opts.verify_checksums
+                && let Some(c) = &header.block.checksum
+            {
+                let stored = header
+                    .block
+                    .stored(&mmap)
+                    .map_err(|e| Error::format(path, e))?;
+                c.verify(stored)
+                    .map_err(|e| Error::format(path, format!("image block: {e}")))?;
+            }
+            Pixels::Mapped
+        } else {
+            Pixels::Pending
+        };
 
         Ok(Self {
             path: path.to_path_buf(),
             mmap,
             header,
+            pixels,
+            verify_checksums: opts.verify_checksums,
         })
     }
 
@@ -402,15 +425,93 @@ impl XisfImage {
         self.header.channels
     }
 
-    /// Zero-copy view of one full channel plane (row-major, top-down).
+    /// Whether the pixels are served zero-copy from the file mapping.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.pixels, Pixels::Mapped)
+    }
+
+    /// Decode the whole image into `out` (`width·height·channels` samples,
+    /// planar, normalized to `[0, 1]`): verify the block checksum (unless
+    /// disabled at open), decompress, honour byte order, storage model,
+    /// sample format, `bounds` and `offset`. Works for every image, mapped
+    /// or not.
+    pub fn decode_into(&self, out: &mut [f32]) -> Result<()> {
+        let h = &self.header;
+        let n = (h.width * h.height * h.channels) as usize;
+        if out.len() != n {
+            return Err(Error::invalid(format!(
+                "decode buffer holds {} samples, the image has {n}",
+                out.len()
+            )));
+        }
+        match &self.pixels {
+            Pixels::Mapped => {
+                let plane = (h.width * h.height) as usize;
+                for c in 0..h.channels {
+                    let c = c as usize;
+                    out[c * plane..(c + 1) * plane].copy_from_slice(self.channel(c as u64));
+                }
+                return Ok(());
+            }
+            Pixels::Decoded(v) => {
+                out.copy_from_slice(v);
+                return Ok(());
+            }
+            Pixels::Pending => {}
+        }
+        let len = usize::try_from(h.block.uncompressed_len())
+            .map_err(|_| Error::format(&self.path, "image block too large for this platform"))?;
+        let mut raw = vec![0u8; len];
+        let shuffled = h
+            .block
+            .compression
+            .as_ref()
+            .is_some_and(|c| c.item_size.is_some());
+        let mut scratch = shuffled.then(|| vec![0u8; len]);
+        h.block
+            .decode_into(
+                &self.mmap,
+                self.verify_checksums,
+                &mut raw,
+                scratch.as_deref_mut(),
+            )
+            .map_err(|e| Error::format(&self.path, format!("image block: {e}")))?;
+        drop(scratch);
+        super::xisf_pixels::to_planar_f32(h, &mut raw, out)
+            .map_err(|e| Error::format(&self.path, e))
+    }
+
+    /// Decode the pixels into memory if they are not mapped (a no-op when
+    /// they are), so [`Self::channel`], [`Self::row`] and
+    /// [`super::PlanarRows`] work.
+    pub fn load(&mut self) -> Result<()> {
+        if matches!(self.pixels, Pixels::Pending) {
+            let h = &self.header;
+            let mut v = vec![0f32; (h.width * h.height * h.channels) as usize];
+            self.decode_into(&mut v)?;
+            self.pixels = Pixels::Decoded(v);
+        }
+        Ok(())
+    }
+
+    /// One full channel plane (row-major, top-down): zero-copy when mapped.
+    ///
+    /// # Panics
+    /// If the pixels are neither mapped nor loaded ([`Self::load`]).
     pub fn channel(&self, c: u64) -> &[f32] {
         assert!(c < self.header.channels, "channel {c} out of range");
         let plane = (self.header.width * self.header.height) as usize;
-        let start = self.header.data_offset as usize + c as usize * plane * 4;
-        bytemuck::cast_slice(&self.mmap[start..start + plane * 4])
+        match &self.pixels {
+            Pixels::Mapped => {
+                let start = self.header.data_offset as usize + c as usize * plane * 4;
+                bytemuck::cast_slice(&self.mmap[start..start + plane * 4])
+            }
+            Pixels::Decoded(v) => &v[c as usize * plane..(c as usize + 1) * plane],
+            Pixels::Pending => panic!("XISF pixels not loaded: call load() or decode_into()"),
+        }
     }
 
-    /// Zero-copy view of one row of one channel.
+    /// One row of one channel (see [`Self::channel`]).
     pub fn row(&self, c: u64, y: u64) -> &[f32] {
         assert!(y < self.header.height, "row {y} out of range");
         let w = self.header.width as usize;
@@ -1396,7 +1497,7 @@ mod tests {
 
     #[test]
     fn read_header_accepts_any_sample_format() {
-        // A UInt16 image that `XisfImage::open` refuses: the header still reads.
+        // A UInt16 image: not mapped (it needs decoding), and the header reads.
         let dir = std::env::temp_dir().join(format!("mpp-xisf-u16-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let xml = concat!(
@@ -1415,7 +1516,7 @@ mod tests {
         bytes.resize(1032, 0);
         let path = dir.join("u16.xisf");
         std::fs::write(&path, bytes).unwrap();
-        assert!(XisfImage::open(&path).is_err());
+        assert!(!XisfImage::open(&path).unwrap().is_mapped());
         let h = read_header(&path).unwrap();
         assert_eq!(h.keywords.len(), 1);
         assert_eq!(
@@ -2150,6 +2251,443 @@ mod tests {
                 assert_eq!(SampleFormat::parse(s), Some(f));
                 assert_eq!(f.bytes_per_sample(), n);
             }
+        }
+    }
+
+    mod pixels {
+        //! Pixel decoding: every codec, sample format, byte order and
+        //! storage model, against the zero-copy reference.
+        use super::super::*;
+        use crate::formats::xisf_codec::Codec;
+        use crate::testsupport::{BlockSpec, ImageSpec, Placement, XisfBuilder, tiny_image};
+
+        const W: u64 = 33;
+        const H: u64 = 17;
+        const C: u64 = 3;
+        const N: usize = (W * H * C) as usize;
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d =
+                std::env::temp_dir().join(format!("mpp-xisf-pixels-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        /// Planar reference values in [0, 1]: quantized ramps (compressible
+        /// by every codec), plus a NaN that must survive bit-exactly.
+        fn reference() -> Vec<f32> {
+            let mut v: Vec<f32> = (0..N).map(|i| ((i / 5) % 64) as f32 / 64.0).collect();
+            v[7] = f32::NAN;
+            v
+        }
+
+        fn f32_bytes(v: &[f32], big: bool) -> Vec<u8> {
+            v.iter()
+                .flat_map(|x| {
+                    if big {
+                        x.to_be_bytes()
+                    } else {
+                        x.to_le_bytes()
+                    }
+                })
+                .collect()
+        }
+
+        fn rgb(data: Vec<u8>, fmt: &'static str, attrs: &str, block: BlockSpec) -> XisfBuilder {
+            XisfBuilder {
+                images: vec![ImageSpec {
+                    geometry: (W, H, C),
+                    sample_format: fmt,
+                    data,
+                    attrs: format!(r#" colorSpace="RGB"{attrs}"#),
+                    children: String::new(),
+                    block,
+                }],
+                ..Default::default()
+            }
+        }
+
+        fn decode(p: &Path) -> Vec<f32> {
+            let img = XisfImage::open(p).unwrap();
+            let mut out = vec![0f32; N];
+            img.decode_into(&mut out).unwrap();
+            out
+        }
+
+        fn bits(v: &[f32]) -> Vec<u32> {
+            v.iter().map(|x| x.to_bits()).collect()
+        }
+
+        fn close(a: &[f32], b: &[f32], tol: f32) {
+            assert_eq!(a.len(), b.len());
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (x - y).abs() <= tol || (x.is_nan() && y.is_nan()),
+                    "sample {i}: {x} vs {y}"
+                );
+            }
+        }
+
+        #[test]
+        fn uncompressed_float32_stays_mapped() {
+            let d = tmp("mapped");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec::default(),
+            )
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            assert!(img.is_mapped());
+            assert_eq!(
+                bits(img.channel(1)),
+                bits(&reference()[(W * H) as usize..2 * (W * H) as usize])
+            );
+            assert_eq!(bits(&decode(&p)), bits(&reference()));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn every_codec_decodes_bit_identical_to_uncompressed() {
+            let d = tmp("codecs");
+            let p = d.join("a.xisf");
+            let data = f32_bytes(&reference(), false);
+            for codec in [Codec::Zlib, Codec::Lz4, Codec::Lz4Hc, Codec::Zstd] {
+                for sh in [None, Some(4)] {
+                    for sub in [data.len(), data.len() / 3 + 1] {
+                        rgb(
+                            data.clone(),
+                            "Float32",
+                            r#" bounds="0:1""#,
+                            BlockSpec {
+                                codec: Some((codec, sh, sub)),
+                                checksum: Some("sha-1"),
+                                ..Default::default()
+                            },
+                        )
+                        .write(&p);
+                        let img = XisfImage::open(&p).unwrap();
+                        assert!(!img.is_mapped(), "{codec:?}");
+                        assert_eq!(
+                            bits(&decode(&p)),
+                            bits(&reference()),
+                            "{codec:?} {sh:?} {sub}"
+                        );
+                    }
+                }
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn integer_formats_normalize() {
+            let d = tmp("ints");
+            let p = d.join("a.xisf");
+            let raw: Vec<u64> = (0..N as u64).map(|i| (i * 7) % 200).collect();
+            for (fmt, width, max) in [
+                ("UInt8", 1usize, 255.0f64),
+                ("UInt16", 2, 65535.0),
+                ("UInt32", 4, 4294967295.0),
+            ] {
+                let bytes: Vec<u8> = raw
+                    .iter()
+                    .flat_map(|&v| v.to_le_bytes()[..width].to_vec())
+                    .collect();
+                for (attrs, lo, hi) in [("", 0.0, max), (r#" bounds="10:200""#, 10.0, 200.0)] {
+                    rgb(
+                        bytes.clone(),
+                        fmt,
+                        attrs,
+                        BlockSpec {
+                            codec: Some((Codec::Zstd, (width > 1).then_some(width), 1 << 20)),
+                            ..Default::default()
+                        },
+                    )
+                    .write(&p);
+                    let want: Vec<f32> = raw
+                        .iter()
+                        .map(|&v| ((v as f64 - lo) / (hi - lo)) as f32)
+                        .collect();
+                    close(&decode(&p), &want, 1e-6);
+                }
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn float64_and_nonunit_bounds_rescale() {
+            let d = tmp("floats");
+            let p = d.join("a.xisf");
+            let r = reference();
+            let f64s: Vec<u8> = r.iter().flat_map(|&x| (x as f64).to_le_bytes()).collect();
+            rgb(f64s, "Float64", r#" bounds="0:1""#, BlockSpec::default()).write(&p);
+            assert_eq!(bits(&decode(&p)), bits(&r), "Float64 0:1 narrows exactly");
+            let scaled: Vec<f32> = r.iter().map(|x| x * 65535.0).collect();
+            rgb(
+                f32_bytes(&scaled, false),
+                "Float32",
+                r#" bounds="0:65535""#,
+                BlockSpec::default(),
+            )
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            assert!(!img.is_mapped(), "non-unit bounds cannot be served raw");
+            close(&decode(&p), &r, 1e-6);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn big_endian_and_normal_storage_decode() {
+            let d = tmp("layout");
+            let p = d.join("a.xisf");
+            let r = reference();
+            let wh = (W * H) as usize;
+            let interleaved: Vec<f32> = (0..N)
+                .map(|k| r[(k % C as usize) * wh + k / C as usize])
+                .collect();
+            for (big, normal) in [(true, false), (false, true), (true, true)] {
+                let src = if normal { &interleaved } else { &r };
+                let mut attrs = String::from(r#" bounds="0:1""#);
+                if big {
+                    attrs.push_str(r#" byteOrder="big""#);
+                }
+                if normal {
+                    attrs.push_str(r#" pixelStorage="Normal""#);
+                }
+                rgb(
+                    f32_bytes(src, big),
+                    "Float32",
+                    &attrs,
+                    BlockSpec {
+                        codec: Some((Codec::Lz4, Some(4), 1 << 20)),
+                        ..Default::default()
+                    },
+                )
+                .write(&p);
+                assert_eq!(bits(&decode(&p)), bits(&r), "big={big} normal={normal}");
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn embedded_image_block_decodes() {
+            let d = tmp("embedded");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    placement: Placement::Embedded,
+                    codec: Some((Codec::Zlib, None, 1 << 20)),
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            assert_eq!(bits(&decode(&p)), bits(&reference()));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn offset_is_subtracted() {
+            let d = tmp("offset");
+            let p = d.join("a.xisf");
+            let r: Vec<f32> = reference()
+                .iter()
+                .map(|x| if x.is_nan() { 0.0 } else { *x })
+                .collect();
+            let shifted: Vec<f32> = r.iter().map(|x| x + 0.25).collect();
+            rgb(
+                f32_bytes(&shifted, false),
+                "Float32",
+                r#" bounds="0:1" offset="0.25""#,
+                BlockSpec::default(),
+            )
+            .write(&p);
+            close(&decode(&p), &r, 1e-6);
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn uint64_complex_and_cielab_are_refused_by_name() {
+            let d = tmp("refuse");
+            let p = d.join("a.xisf");
+            for (fmt, bps, attrs, want) in [
+                ("UInt64", 8, "", "UInt64"),
+                ("Complex32", 8, "", "Complex32"),
+                ("Complex64", 16, "", "Complex64"),
+                ("Float32", 4, r#" colorSpace="CIELab""#, "CIELab"),
+            ] {
+                XisfBuilder {
+                    images: vec![ImageSpec {
+                        geometry: (2, 2, 1),
+                        sample_format: fmt,
+                        data: vec![0u8; 4 * bps],
+                        attrs: attrs.into(),
+                        ..tiny_image()
+                    }],
+                    ..Default::default()
+                }
+                .write(&p);
+                let e = XisfImage::open(&p).err().expect("must refuse").to_string();
+                assert!(e.contains(want), "{fmt}: {e}");
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn mapped_path_still_verifies_checksum() {
+            let d = tmp("mapped-cksum");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    checksum: Some("sha-512"),
+                    bad_checksum: true,
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let e = XisfImage::open(&p).err().expect("bad checksum").to_string();
+            assert!(e.contains("checksum mismatch"), "{e}");
+            let img = XisfImage::open_with(
+                &p,
+                &XisfOpenOptions {
+                    verify_checksums: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(img.is_mapped());
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn compressed_checksum_mismatch_fails_decode() {
+            let d = tmp("cmp-cksum");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    codec: Some((Codec::Zstd, Some(4), 1 << 20)),
+                    checksum: Some("sha-256"),
+                    bad_checksum: true,
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            let mut out = vec![0f32; N];
+            let e = img.decode_into(&mut out).unwrap_err().to_string();
+            assert!(e.contains("checksum mismatch"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn truncated_compressed_image_is_refused() {
+            let d = tmp("trunc");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    codec: Some((Codec::Zstd, None, 1 << 20)),
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let len = std::fs::metadata(&p).unwrap().len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_len(len - 10)
+                .unwrap();
+            let e = XisfImage::open(&p).err().expect("truncated").to_string();
+            assert!(e.contains("past end of file"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn declared_size_must_match_geometry() {
+            let d = tmp("size");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    codec: Some((Codec::Zstd, None, 1 << 20)),
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            // Rewrite the declared uncompressed size to 2^62 (the header
+            // region has room; only the length field changes).
+            let mut bytes = std::fs::read(&p).unwrap();
+            let hlen = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let xml = String::from_utf8(bytes[16..16 + hlen].to_vec()).unwrap();
+            let from = format!(r#"compression="zstd:{}""#, N * 4);
+            assert!(xml.contains(&from));
+            let xml = xml.replace(&from, r#"compression="zstd:4611686018427387904""#);
+            bytes[8..12].copy_from_slice(&(xml.len() as u32).to_le_bytes());
+            bytes[16..16 + xml.len()].copy_from_slice(xml.as_bytes());
+            std::fs::write(&p, &bytes).unwrap();
+            let e = XisfImage::open(&p).err().expect("oversized").to_string();
+            assert!(e.contains("does not match geometry"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn load_then_planar_rows_matches_decode_into() {
+            let d = tmp("load");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    codec: Some((Codec::Lz4Hc, Some(4), 1000)),
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let mut img = XisfImage::open(&p).unwrap();
+            img.load().unwrap();
+            let mut rows = Vec::new();
+            for c in 0..C {
+                for y in 0..H {
+                    rows.extend_from_slice(crate::formats::PlanarRows::row(&img, c, y));
+                }
+            }
+            assert_eq!(bits(&rows), bits(&decode(&p)));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        #[should_panic(expected = "XISF pixels not loaded")]
+        fn channel_before_load_panics_with_guidance() {
+            let d = tmp("pending");
+            let p = d.join("a.xisf");
+            rgb(
+                f32_bytes(&reference(), false),
+                "Float32",
+                r#" bounds="0:1""#,
+                BlockSpec {
+                    codec: Some((Codec::Zstd, None, 1 << 20)),
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            let _ = img.channel(0);
         }
     }
 }

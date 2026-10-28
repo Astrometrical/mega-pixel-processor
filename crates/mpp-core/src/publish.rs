@@ -220,7 +220,9 @@ pub fn publish(input: &Path, outdir: &Path, opts: &PublishOptions) -> Result<Pub
 
     let (src8, w, h, wcs, _guard): (PathBuf, u64, u64, Option<LinearWcs>, Option<TempFileGuard>) =
         if in_ext == "xisf" {
-            let img = XisfImage::open(input)?;
+            let mut img = XisfImage::open(input)?;
+            // A compressed (or otherwise non-mappable) XISF is decoded into memory.
+            img.load()?;
             img.advise_sequential();
             let wcs = crate::wcs::from_xisf_properties(&img.header().properties);
             let tmp = unique_temp(outdir, &stem, "tif");

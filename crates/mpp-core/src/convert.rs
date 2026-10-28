@@ -226,7 +226,9 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         ));
     }
 
-    let img = XisfImage::open(input)?;
+    let mut img = XisfImage::open(input)?;
+    // A compressed (or otherwise non-mappable) XISF is decoded into memory.
+    img.load()?;
     if let Some(limit) = format.max_dimension()
         && (img.width() > limit || img.height() > limit)
     {
