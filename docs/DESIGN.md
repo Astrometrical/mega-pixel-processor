@@ -92,6 +92,17 @@ being better, not on being the only place the files work.
   idea: `mmm-core` will eventually depend on `mpp-core` for file-format
   support. FITS: vips has cfitsio support, but our own reader/writer
   may serve WCS fidelity better — evaluate during phase 1.
+  **Decided (2026-10-28), formats home:** mpp-core is the single home of
+  XISF and FITS handling for every Astrometrical tool. mmm's FITS pixel
+  reader (`formats::fits::FitsImage`) and streaming writer
+  (`formats::fits_write::FitsWriter`, standard real/commentary cards) and
+  its signature detection (`formats::sniff_format`) moved here; XISF
+  revision 2 compliance (compression, checksums, more sample formats)
+  lands here next, and mmm consumes mpp-core with
+  `default-features = false` (the `tiff`, `convert` and `publish` features
+  gate everything mmm does not need). Roadmap: mmm
+  `docs/superpowers/plans/2026-10-28-formats-to-mpp-xisf-rev2.md`. This
+  settles the FITS read/write evaluation: our own code, not cfitsio.
 - **WCS sidecar**: one canonical JSON schema used by every container that
   can't carry the solution natively, and consumed by the DZI viewer. Design
   the schema once, early in phase 1.
@@ -110,10 +121,10 @@ through `mpp-core`:
 
 - **`header::Header`**: the ordered FITS keywords and XISF properties of a
   file, reusing `FitsKeyword` and `XisfProperty`. Readers:
-  `formats::read_header` (by extension), `formats::xisf::read_header`
+  `formats::read_header` (by file signature), `formats::xisf::read_header`
   (header and property attachments only, any sample format) and
-  `formats::fits::read_header` (primary-HDU cards; mpp still has no FITS
-  pixel reader). An open `XisfImage` converts with `Header::from`.
+  `formats::fits::read_header` (primary-HDU cards; the pixel reader is
+  `formats::fits::FitsImage`). An open `XisfImage` converts with `Header::from`.
   Existing reader signatures are unchanged.
 - **`Header::image_size`**: `Option<(u32, u32)>`, the XISF `<Image geometry>`
   (authoritative, whatever the `NAXIS` keywords say) or FITS
@@ -203,7 +214,7 @@ distortion grids) do not bump it. Source of truth:
 ## Phases
 
 1. **CLI** (phase 1, completed 2026-08-21): convert + sidecar + DZI/HTML.
-   Remaining loose ends: FITS read/write evaluation, real-data Photoshop
+   Remaining loose ends: real-data Photoshop
    smoke test (manual). Smoke test that matters: a >4 GB BigTIFF opens in
    Photoshop (PS ≥ 26.2 saves BigTIFF; opening support is older).
 2. **PixInsight file-format module, write path (phase 2, complete):**
