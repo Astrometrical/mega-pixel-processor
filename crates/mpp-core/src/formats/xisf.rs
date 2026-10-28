@@ -649,9 +649,11 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool, image_index: usize) -> R
     let mut image_data_open = false;
     // Depth inside a <Thumbnail> subtree, all of which is skipped.
     let mut skip = 0u32;
-    // Every property with its owning image (None: file level) and attached
-    // block, in document order.
-    let mut properties: Vec<(Option<usize>, XisfProperty, Option<DataBlock>)> = Vec::new();
+    // Every property, unparsed, with its owning image (None: file level),
+    // in document order. Only the file-level ones and the selected image's
+    // are decoded, after the walk: another image's bad block must not stop
+    // this one from opening, nor cost its decode.
+    let mut properties: Vec<(Option<usize>, PendingProperty, String)> = Vec::new();
     // <Property> currently being read: (partial parse, accumulated text,
     // nesting depth of unrelated child elements to skip).
     let mut pending: Option<(PendingProperty, String, u32)> = None;
@@ -705,8 +707,7 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool, image_index: usize) -> R
                     match name {
                         b"Property" => {
                             let partial = parse_property_start(path, &e)?;
-                            let (prop, block) = finish_property(path, partial, "", verify)?;
-                            properties.push((current, prop, block));
+                            properties.push((current, partial, String::new()));
                         }
                         b"Image" => images.push(ImageElement::parse(path, &e)?),
                         b"Data" if current.is_some() => {
@@ -763,8 +764,7 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool, image_index: usize) -> R
                         *depth -= 1;
                     } else {
                         let (partial, text, _) = pending.take().unwrap();
-                        let (prop, block) = finish_property(path, partial, &text, verify)?;
-                        properties.push((current, prop, block));
+                        properties.push((current, partial, text));
                     }
                 } else {
                     match e.local_name().as_ref() {
@@ -794,8 +794,9 @@ fn parse_header(path: &Path, mmap: &[u8], verify: bool, image_index: usize) -> R
     let image_ids = images.iter().map(|i| i.id.clone()).collect();
     let selected = images.swap_remove(image_index);
     let mut header = selected.into_header(path, image_count, image_ids)?;
-    for (owner, prop, block) in properties {
+    for (owner, partial, text) in properties {
         if owner.is_none_or(|o| o == image_index) {
+            let (prop, block) = finish_property(path, partial, &text, verify)?;
             if let Some(block) = block {
                 header
                     .property_blocks
@@ -2236,6 +2237,30 @@ mod tests {
                     ("Owner", &PropertyValue::Str("b".into())),
                     ("FileLevel", &PropertyValue::I64(1))
                 ]
+            );
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn other_images_bad_properties_do_not_block_this_one() {
+            let d = tmp("isolation");
+            let p = d.join("a.xisf");
+            let mut bad = image(2, 2, "bad");
+            // 3 bytes where an F64Vector of length 2 needs 16.
+            bad.children.push_str(r#"<Property id="Bad" type="F64Vector" length="2" location="inline:base64">AQID</Property>"#);
+            XisfBuilder {
+                images: vec![image(2, 2, "good"), bad],
+                ..Default::default()
+            }
+            .write(&p);
+            let h = header(&p, 0).unwrap();
+            assert!(h.properties.iter().all(|p| p.id != "Bad"));
+            assert!(read_header(&p).is_ok());
+            assert!(XisfImage::open(&p).is_ok());
+            let e = header(&p, 1).unwrap_err().to_string();
+            assert!(
+                e.contains("Bad"),
+                "the selected image still reports it: {e}"
             );
             std::fs::remove_dir_all(&d).unwrap();
         }
