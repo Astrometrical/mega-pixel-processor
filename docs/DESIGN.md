@@ -162,6 +162,89 @@ through `mpp-core`:
   anything else is an `Error::Astrometry`, never a wrong mapping. The
   linear-only `wcs` module and the sidecar are unchanged.
 
+## XISF conformance (2026-10-28)
+
+The reader targets **baseline decoder** conformance (XISF 1.0 spec §7.2)
+at document version 1.02 (Revision 2, Oct 2026). Code: `formats::xisf`
+(XML walk, `XisfImage`, `read_header`), `formats::xisf_block` (data blocks
+and checksums), `formats::xisf_codec` (codecs, shuffling, subblocks) and
+`formats::xisf_pixels` (sample conversion).
+
+**Supported**
+- Monolithic units with multiple `<Image>`s, selected with
+  `XisfOpenOptions::image_index`. Each image's FITS keywords and
+  properties are its own; file-level properties are shared. `<Thumbnail>`
+  is skipped.
+- Data blocks at `attachment:`, `inline:base64|hex` and `embedded`
+  (`<Data>` child) locations, in either byte order.
+- All eight codecs: `zlib`, `lz4`, `lz4hc` and `zstd`, plus their `+sh`
+  variants.
+- Subblocks, decoded in parallel. Revision 2 rules apply:
+  - An equal-length subblock is raw.
+  - Every compressed subblock must yield exactly its declared length.
+- Checksums: `sha-1`, `sha-256`, `sha-512`, `sha3-256` and `sha3-512`,
+  over the stored bytes (the decoded binary for inline/embedded blocks),
+  verified before decompression.
+- Pixels: Planar and Normal storage, UInt8/16/32 and Float32/64,
+  normalized to [0,1] by `bounds` (or the format default), with `offset`
+  subtracted.
+- Properties: every scalar type and every numeric vector/matrix type.
+  - Strings may be inline, as in `value=` or element text, or a data block:
+    PixInsight writes String properties as blocks when checksums are on.
+  - Booleans accept `true`/`false`/`1`/`0`.
+  - All non-finite float text forms are accepted.
+  - Scalar white space is ignored.
+- Zero-copy: an uncompressed, attached, planar, little-endian Float32
+  `0:1` image is served from the mmap. Everything else decodes on request,
+  with `decode_into` (caller buffer) or `load` (in memory).
+
+**Refused by name**
+- `UInt64` and complex pixels.
+- The `CIELab` color space.
+- `url(…)`/`path(…)` locations (distributed units).
+- Unknown codecs and checksum algorithms.
+- A declared size that disagrees with the geometry. This is checked before
+  any allocation.
+
+**Policy**
+- **Checksum mismatch:** an error unless
+  `XisfOpenOptions::verify_checksums` is off.
+- **Equal-length subblocks:** the spec's legacy rule ("an equal-length
+  subblock may still be compressed: try decompressing it first") is
+  applied only to self-validating streams (zstd frame magic, zlib header +
+  Adler-32). LZ4 blocks carry no integrity check, and PixInsight 1.9.5
+  itself stores raw LZ4 subblocks, so an equal-length LZ4 subblock is
+  always copied.
+- **`orientation`:** ignored. It is display-only by spec, and processing
+  depends on the physical layout.
+
+**PixInsight 1.9.5 encoder facts** (builds 1702 and 1706 behave
+identically, XISF module 1.1.3):
+- Blocks are always little-endian and planar.
+- An uncompressed block is 4096-aligned; a compressed one is not aligned.
+- 8-bit `+sh` is written as the plain codec.
+- A block that does not shrink is written uncompressed, with no
+  `compression` attribute.
+- No subblock size is set, so subblocks appear only above a codec's input
+  limit (LZ4 ≈ 2.11 GB). Within such a block, incompressible subblocks are
+  stored raw.
+- Property blocks (astrometric solutions, the processing history) are
+  compressed and checksummed too.
+- WBPP masters are written compressed.
+
+**Verification:** synthesized unit tests (`testsupport::XisfBuilder`, a
+PixInsight-layout test encoder), plus the manual
+`examples/xisf_samples_check.rs` run against mmm's PixInsight-generated
+sample sets (`tools/pixinsight/gen_xisf_samples.js`). On 2026-10-28 it
+passed all 271 files from builds 1702 and 1706, including 2.35 GB
+multi-subblock images and a re-saved solved WBPP master.
+
+**Follow-ups:**
+- Decoding a shuffled block holds the raw block and a scratch buffer of
+  the same size, so peak memory is about 3× the image.
+- Decoded throughput is 160–400 MB/s. Unshuffle and sample conversion are
+  single-threaded; parallelize them if decode time matters.
+
 ## WCS sidecar schema (v1, decided 2026-08-20)
 
 Canonical JSON, written as `<output-stem>.wcs.json` beside any container
