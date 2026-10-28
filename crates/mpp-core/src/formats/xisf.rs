@@ -1003,6 +1003,25 @@ fn finish_property_strict(
             "0" | "false" => PropertyValue::I64(0),
             v => return Err(err(format!("property {}: bad boolean '{v}'", p.id))),
         },
+        // PixInsight serializes a String as a data block when block
+        // checksums are on (inline base64, or attached and compressed).
+        "String" | "TimePoint" if p.location.is_some() => {
+            let block =
+                property_block(&p, text).map_err(|e| err(format!("property {}: {e}", p.id)))?;
+            match &block.location {
+                BlockLocation::Inline(_) => {
+                    let bytes = block
+                        .decode(&[], verify)
+                        .map_err(|e| err(format!("property {}: {e}", p.id)))?;
+                    PropertyValue::Str(String::from_utf8_lossy(&bytes).into_owned())
+                }
+                BlockLocation::Attachment { offset, size } => {
+                    location = Some((*offset, *size));
+                    attached = Some(block);
+                    PropertyValue::Str(String::new()) // resolved by the caller
+                }
+            }
+        }
         "String" | "TimePoint" => PropertyValue::Str(
             p.value_attr
                 .clone()
@@ -1021,39 +1040,8 @@ fn finish_property_strict(
                     .ok_or_else(|| err(format!("property {}: missing rows/columns", p.id)))?;
                 (r as usize) * (c as usize)
             };
-            let (block_location, text_encoding, compression, subblocks, block_text) =
-                match (p.location.as_deref(), &p.data) {
-                    (Some("embedded"), Some(d)) => (
-                        "embedded",
-                        d.encoding.as_deref(),
-                        d.compression.as_deref(),
-                        d.subblocks.as_deref(),
-                        Some(d.text.as_str()),
-                    ),
-                    (Some(loc), _) => (
-                        loc,
-                        None,
-                        p.compression.as_deref(),
-                        p.subblocks.as_deref(),
-                        Some(text),
-                    ),
-                    (None, _) => {
-                        return Err(err(format!(
-                            "property {}: vector/matrix without a location",
-                            p.id
-                        )));
-                    }
-                };
-            let block = DataBlock::parse(&BlockAttrs {
-                location: block_location,
-                byte_order: p.byte_order.as_deref(),
-                compression,
-                subblocks,
-                checksum: p.checksum.as_deref(),
-                text: block_text,
-                text_encoding,
-            })
-            .map_err(|e| err(format!("property {}: {e}", p.id)))?;
+            let block =
+                property_block(&p, text).map_err(|e| err(format!("property {}: {e}", p.id)))?;
             let expected = (n as u64).checked_mul(width as u64);
             if expected != Some(block.uncompressed_len()) {
                 return Err(err(format!(
@@ -1103,6 +1091,38 @@ fn finish_property_strict(
     ))
 }
 
+/// The data block of a `<Property>` that has a `location` (inline,
+/// embedded with its `<Data>` child, or attached).
+fn property_block(p: &PendingProperty, text: &str) -> std::result::Result<DataBlock, String> {
+    let (location, text_encoding, compression, subblocks, block_text) =
+        match (p.location.as_deref(), &p.data) {
+            (Some("embedded"), Some(d)) => (
+                "embedded",
+                d.encoding.as_deref(),
+                d.compression.as_deref(),
+                d.subblocks.as_deref(),
+                Some(d.text.as_str()),
+            ),
+            (Some(loc), _) => (
+                loc,
+                None,
+                p.compression.as_deref(),
+                p.subblocks.as_deref(),
+                Some(text),
+            ),
+            (None, _) => return Err("data block without a location".into()),
+        };
+    DataBlock::parse(&BlockAttrs {
+        location,
+        byte_order: p.byte_order.as_deref(),
+        compression,
+        subblocks,
+        checksum: p.checksum.as_deref(),
+        text: block_text,
+        text_encoding,
+    })
+}
+
 /// Decode elements of `kind` (`width` bytes each) stored in `order`.
 fn decode_numbers_ordered(
     kind: NumKind,
@@ -1130,6 +1150,11 @@ fn decode_property_block(
     let mut bytes = block
         .decode_stored(stored, verify)
         .map_err(|e| Error::format(path, format!("property {}: {e}", prop.id)))?;
+    if matches!(prop.type_.as_str(), "String" | "TimePoint") {
+        return Ok(PropertyValue::Str(
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ));
+    }
     if block.byte_order == ByteOrder::Big {
         let (_, width, _) = numeric_array_type(&prop.type_).ok_or_else(|| {
             Error::format(
@@ -2010,6 +2035,62 @@ mod tests {
             );
             assert_eq!(get("I"), PropertyValue::I64(42));
             assert_eq!(get("S"), PropertyValue::Str("keep inner".into()));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn string_property_blocks_decode() {
+            // PixInsight writes String properties as data blocks when block
+            // checksums are on: inline base64 with a checksum, or attached
+            // and compressed (e.g. PixInsight:ProcessingHistory, zstd).
+            let d = tmp("strings");
+            let p = d.join("a.xisf");
+            let history = "<?xml version=\"1.0\"?><ProcessingHistory>é ".repeat(200);
+            XisfBuilder {
+                images: vec![tiny_image()],
+                properties: vec![
+                    PropSpec {
+                        id: "PCL:Signature:Preprocessing",
+                        type_: "String",
+                        shape: String::new(),
+                        data: b"process=WeightedBatchPreprocessing,version=2.8.9".to_vec(),
+                        attrs: String::new(),
+                        block: BlockSpec {
+                            placement: Placement::Inline,
+                            checksum: Some("sha-256"),
+                            ..Default::default()
+                        },
+                    },
+                    PropSpec {
+                        id: "PixInsight:ProcessingHistory",
+                        type_: "String",
+                        shape: String::new(),
+                        data: history.as_bytes().to_vec(),
+                        attrs: String::new(),
+                        block: BlockSpec {
+                            placement: Placement::Attached,
+                            codec: Some((Codec::Zstd, None, 1 << 20)),
+                            checksum: Some("sha-256"),
+                            bad_checksum: false,
+                        },
+                    },
+                ],
+                root_xml: String::new(),
+            }
+            .write(&p);
+            for props in [
+                XisfImage::open(&p).unwrap().header().properties.clone(),
+                read_header(&p).unwrap().properties,
+            ] {
+                assert_eq!(
+                    prop(&props, "PCL:Signature:Preprocessing").value,
+                    PropertyValue::Str("process=WeightedBatchPreprocessing,version=2.8.9".into())
+                );
+                assert_eq!(
+                    prop(&props, "PixInsight:ProcessingHistory").value,
+                    PropertyValue::Str(history.clone())
+                );
+            }
             std::fs::remove_dir_all(&d).unwrap();
         }
 
