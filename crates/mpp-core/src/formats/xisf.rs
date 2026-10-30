@@ -6,7 +6,9 @@
 //! [`super::xisf_codec`]) and checksummed (see [`super::xisf_block`]);
 //! planar or normal storage, either byte order, UInt8/16/32 and Float32/64
 //! samples. [`XisfImage`] serves the uncompressed planar little-endian
-//! Float32 layout zero-copy and decodes everything else on request.
+//! Float32 layout zero-copy and decodes everything else on request;
+//! [`NativePlanes`] reads the samples in their stored format instead,
+//! converting rows on read.
 //! Distributed units, UInt64/complex samples and CIE L*a*b* are refused by
 //! name. `docs/DESIGN.md` ("XISF conformance") has the details.
 //!
@@ -290,12 +292,99 @@ impl Default for XisfOpenOptions {
 /// decoded on request: [`Self::decode_into`] into a caller buffer (e.g. a
 /// mapped cache file), or [`Self::load`] into memory, after which the
 /// channel/row accessors work as for a mapped image.
+///
+/// [`NativePlanes`] reads the samples in their stored format instead, a
+/// band converted to f32 at a time: in place for any uncompressed planar
+/// little-endian image ([`Self::native_planes`]), whatever its sample
+/// format, range or alignment, and otherwise from a buffer
+/// [`Self::decode_native_into`] fills, half the size of the f32 decode for
+/// UInt16.
 pub struct XisfImage {
     path: PathBuf,
     mmap: Mmap,
     header: XisfHeader,
     pixels: Pixels,
+    /// The stored block is already the native layout (uncompressed, planar,
+    /// little-endian), its checksum verified on open when verifying.
+    native: bool,
     verify_checksums: bool,
+}
+
+/// An image's samples in the native layout: planar, little-endian, in the
+/// stored sample format, `bounds` and `offset` not yet applied. Rows are
+/// converted to normalized f32 on read ([`Self::decode_rows`]) to exactly
+/// the values [`XisfImage::decode_into`] gives, and need no alignment.
+///
+/// From [`XisfImage::native_planes`] (the file's own bytes) or
+/// [`XisfImage::native_planes_in`] (a buffer
+/// [`XisfImage::decode_native_into`] filled, such as a mapped cache file).
+#[derive(Clone, Copy)]
+pub struct NativePlanes<'a> {
+    bytes: &'a [u8],
+    width: u64,
+    height: u64,
+    channels: u64,
+    norm: super::xisf_pixels::Normalise,
+}
+
+impl std::fmt::Debug for NativePlanes<'_> {
+    /// Geometry and format; never the samples.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePlanes")
+            .field("geometry", &(self.width, self.height, self.channels))
+            .field("sample_format", &self.norm.format())
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl<'a> NativePlanes<'a> {
+    /// The stored sample format.
+    pub fn sample_format(&self) -> SampleFormat {
+        self.norm.format()
+    }
+
+    /// The samples, `width·height·channels` of them, channel planes in
+    /// order, each sample little-endian.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Image width in pixels.
+    pub fn width(&self) -> u64 {
+        self.width
+    }
+
+    /// Image height in pixels.
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+
+    /// Number of channels.
+    pub fn channels(&self) -> u64 {
+        self.channels
+    }
+
+    /// Convert `n` rows of channel `c` starting at row `y0` into `out`
+    /// (`n * width` values, rows contiguous), normalized to `[0, 1]` by the
+    /// image's `bounds` and `offset` as [`XisfImage::decode_into`] does.
+    ///
+    /// # Panics
+    /// If `c` or the rows are out of range, or `out` is not `n * width`
+    /// long.
+    pub fn decode_rows(&self, c: u64, y0: u64, n: usize, out: &mut [f32]) {
+        assert!(c < self.channels, "channel {c} out of range");
+        assert!(
+            y0.checked_add(n as u64).is_some_and(|e| e <= self.height),
+            "rows out of range"
+        );
+        let w = self.width as usize;
+        assert_eq!(out.len(), n * w, "output buffer size");
+        let bps = self.norm.format().bytes_per_sample();
+        let start = ((c * self.height + y0) as usize * w) * bps;
+        self.norm
+            .convert_le(&self.bytes[start..start + n * w * bps], out);
+    }
 }
 
 /// Where an [`XisfImage`]'s planar f32 samples are.
@@ -370,27 +459,28 @@ impl XisfImage {
             ));
         }
 
-        let mapped = header.block.compression.is_none()
+        // The stored bytes are the native layout as they are: read in place
+        // (any format, range or alignment), so verified here.
+        let native =
+            header.block.compression.is_none() && super::xisf_pixels::is_native_layout(&header);
+        let mapped = native
             && matches!(header.block.location, BlockLocation::Attachment { .. })
-            && header.pixel_storage == PixelStorage::Planar
-            && header.block.byte_order == ByteOrder::Little
-            && header.sample_format == SampleFormat::Float32
-            && header.effective_bounds() == (0.0, 1.0)
-            && header.offset == 0.0
+            && super::xisf_pixels::is_identity_layout(&header)
             // PixInsight aligns attachments to 4096 bytes; an unaligned one
             // cannot back a zero-copy f32 view, so it is decoded instead.
             && header.data_offset % 4 == 0;
+        if native
+            && opts.verify_checksums
+            && let Some(c) = &header.block.checksum
+        {
+            let stored = header
+                .block
+                .stored(&mmap)
+                .map_err(|e| Error::format(path, e))?;
+            c.verify(stored)
+                .map_err(|e| Error::format(path, format!("image block: {e}")))?;
+        }
         let pixels = if mapped {
-            if opts.verify_checksums
-                && let Some(c) = &header.block.checksum
-            {
-                let stored = header
-                    .block
-                    .stored(&mmap)
-                    .map_err(|e| Error::format(path, e))?;
-                c.verify(stored)
-                    .map_err(|e| Error::format(path, format!("image block: {e}")))?;
-            }
             Pixels::Mapped
         } else {
             Pixels::Pending
@@ -401,6 +491,7 @@ impl XisfImage {
             mmap,
             header,
             pixels,
+            native,
             verify_checksums: opts.verify_checksums,
         })
     }
@@ -465,7 +556,8 @@ impl XisfImage {
             Pixels::Pending => {}
         }
         let err = |e: String| Error::format(&self.path, format!("image block: {e}"));
-        let verify = self.verify_checksums;
+        // A native block was verified on open.
+        let verify = self.verify_checksums && !self.native;
         let Some(c) = &h.block.compression else {
             // Uncompressed but not mappable: convert straight from the file.
             let stored = h.block.stored(&self.mmap).map_err(err)?;
@@ -495,6 +587,96 @@ impl XisfImage {
             .map_err(err)?;
         drop(scratch);
         super::xisf_pixels::to_planar_f32(h, &raw, out).map_err(err)
+    }
+
+    /// The samples in the native layout straight from the stored block, when
+    /// it is one: uncompressed, planar and little-endian, in any sample
+    /// format, range or alignment (its checksum was verified on open).
+    /// `None` when the block needs [`Self::decode_native_into`] first.
+    pub fn native_planes(&self) -> Option<NativePlanes<'_>> {
+        if !self.native {
+            return None;
+        }
+        let bytes = self.header.block.stored(&self.mmap).ok()?;
+        self.planes_over(bytes)
+    }
+
+    /// Size of the native layout in bytes: `width·height·channels` samples
+    /// of the stored format.
+    pub fn native_len(&self) -> u64 {
+        let h = &self.header;
+        h.width * h.height * h.channels * h.sample_format.bytes_per_sample() as u64
+    }
+
+    /// Decode the whole image into `out` ([`Self::native_len`] bytes) in the
+    /// native layout: verify the block checksum (unless disabled at open),
+    /// decompress, and rearrange to planar little-endian, leaving the sample
+    /// format and values as stored. Works for every image; read the result
+    /// with [`Self::native_planes_in`].
+    pub fn decode_native_into(&self, out: &mut [u8]) -> Result<()> {
+        let h = &self.header;
+        if out.len() as u64 != self.native_len() {
+            return Err(Error::invalid(format!(
+                "decode buffer holds {} bytes, the image's native layout {}",
+                out.len(),
+                self.native_len()
+            )));
+        }
+        let err = |e: String| Error::format(&self.path, format!("image block: {e}"));
+        let verify = self.verify_checksums && !self.native;
+        let Some(c) = &h.block.compression else {
+            let stored = h.block.stored(&self.mmap).map_err(err)?;
+            if verify && let Some(sum) = &h.block.checksum {
+                sum.verify(stored).map_err(err)?;
+            }
+            return super::xisf_pixels::to_native_planar(h, stored, out).map_err(err);
+        };
+        let len = out.len();
+        let mut scratch = match c.item_size {
+            Some(_) => Some(try_zeroed::<u8>(len).map_err(err)?),
+            None => None,
+        };
+        if super::xisf_pixels::is_native_layout(h) {
+            return h
+                .block
+                .decode_into(&self.mmap, verify, out, scratch.as_deref_mut())
+                .map_err(err);
+        }
+        let mut raw = try_zeroed::<u8>(len).map_err(err)?;
+        h.block
+            .decode_into(&self.mmap, verify, &mut raw, scratch.as_deref_mut())
+            .map_err(err)?;
+        drop(scratch);
+        super::xisf_pixels::to_native_planar(h, &raw, out).map_err(err)
+    }
+
+    /// [`NativePlanes`] over `bytes`, this image's native layout as
+    /// [`Self::decode_native_into`] wrote it.
+    ///
+    /// # Errors
+    /// When `bytes` is not [`Self::native_len`] long.
+    pub fn native_planes_in<'a>(&self, bytes: &'a [u8]) -> Result<NativePlanes<'a>> {
+        self.planes_over(bytes).ok_or_else(|| {
+            Error::format(
+                &self.path,
+                format!(
+                    "{} bytes are not this image's native layout ({} bytes)",
+                    bytes.len(),
+                    self.native_len()
+                ),
+            )
+        })
+    }
+
+    fn planes_over<'a>(&self, bytes: &'a [u8]) -> Option<NativePlanes<'a>> {
+        let h = &self.header;
+        (bytes.len() as u64 == self.native_len()).then(|| NativePlanes {
+            bytes,
+            width: h.width,
+            height: h.height,
+            channels: h.channels,
+            norm: super::xisf_pixels::Normalise::of(h),
+        })
     }
 
     /// Decode the pixels into memory if they are not mapped (a no-op when
@@ -2834,6 +3016,229 @@ mod tests {
             .write(&p);
             let img = XisfImage::open(&p).unwrap();
             let _ = img.channel(0);
+        }
+
+        /// Integer test values, all representable in a UInt8.
+        fn ints() -> Vec<u64> {
+            (0..N as u64).map(|i| (i * 7) % 200).collect()
+        }
+
+        /// `v` as `width`-byte samples in either byte order.
+        fn int_bytes(v: &[u64], width: usize, big: bool) -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| {
+                    let le = x.to_le_bytes();
+                    let mut b = le[..width].to_vec();
+                    if big {
+                        b.reverse();
+                    }
+                    b
+                })
+                .collect()
+        }
+
+        /// Planar `v` (`C` planes of `W·H`) in normal (interleaved) order.
+        fn interleave<T: Copy>(v: &[T]) -> Vec<T> {
+            let wh = (W * H) as usize;
+            (0..N)
+                .map(|k| v[(k % C as usize) * wh + k / C as usize])
+                .collect()
+        }
+
+        /// Every channel of `planes` converted: channel 0 in one call,
+        /// the others a row at a time, so band offsets are exercised too.
+        fn converted(planes: &NativePlanes<'_>) -> Vec<f32> {
+            let (w, h) = (planes.width() as usize, planes.height() as usize);
+            let mut out = vec![0f32; N];
+            planes.decode_rows(0, 0, h, &mut out[..w * h]);
+            for c in 1..planes.channels() {
+                for y in 0..planes.height() {
+                    let at = (c * planes.height() + y) as usize * w;
+                    planes.decode_rows(c, y, 1, &mut out[at..at + w]);
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn uncompressed_planar_little_endian_is_native_in_place() {
+            let d = tmp("native-in-place");
+            let p = d.join("a.xisf");
+            let (raw, r) = (ints(), reference());
+            let scaled: Vec<f32> = r.iter().map(|x| x * 65535.0).collect();
+            let f64s: Vec<u8> = r.iter().flat_map(|&x| (x as f64).to_le_bytes()).collect();
+            for (fmt, data, attrs) in [
+                ("UInt8", int_bytes(&raw, 1, false), ""),
+                ("UInt16", int_bytes(&raw, 2, false), ""),
+                ("UInt16", int_bytes(&raw, 2, false), r#" bounds="10:200""#),
+                ("UInt32", int_bytes(&raw, 4, false), ""),
+                ("Float32", f32_bytes(&r, false), r#" bounds="0:1""#),
+                ("Float32", f32_bytes(&scaled, false), r#" bounds="0:65535""#),
+                ("Float64", f64s, r#" bounds="0:1""#),
+            ] {
+                rgb(data.clone(), fmt, attrs, BlockSpec::default()).write(&p);
+                let img = XisfImage::open(&p).unwrap();
+                let planes = img.native_planes().expect("served in place");
+                assert_eq!(Some(planes.sample_format()), SampleFormat::parse(fmt));
+                assert_eq!(planes.bytes(), &data[..], "{fmt}{attrs}: the stored bytes");
+                assert_eq!(img.native_len(), data.len() as u64);
+                assert_eq!(bits(&converted(&planes)), bits(&decode(&p)), "{fmt}{attrs}");
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn native_planes_need_no_alignment() {
+            // An attachment one byte off its 4096 alignment: no typed view
+            // could borrow it, but a conversion reads it in place.
+            let d = tmp("native-unaligned");
+            let p = d.join("a.xisf");
+            for (fmt, data) in [
+                ("UInt16", int_bytes(&ints(), 2, false)),
+                ("Float32", f32_bytes(&reference(), false)),
+            ] {
+                rgb(data.clone(), fmt, r#" bounds="0:1""#, BlockSpec::default()).write(&p);
+                let mut bytes = std::fs::read(&p).unwrap();
+                let hlen = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+                let xml = String::from_utf8(bytes[16..16 + hlen].to_vec()).unwrap();
+                let from = format!("attachment:4096:{}", data.len());
+                assert!(xml.contains(&from), "{xml}");
+                let xml = xml.replace(&from, &format!("attachment:4097:{}", data.len()));
+                bytes[16..16 + hlen].copy_from_slice(xml.as_bytes());
+                bytes.insert(4096, 0);
+                std::fs::write(&p, &bytes).unwrap();
+                let img = XisfImage::open(&p).unwrap();
+                assert!(!img.is_mapped(), "{fmt}: unaligned is never zero-copy f32");
+                let planes = img.native_planes().expect("unaligned, still in place");
+                assert_eq!(planes.bytes(), &data[..]);
+                assert_eq!(bits(&converted(&planes)), bits(&decode(&p)), "{fmt}");
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn decode_native_keeps_the_sample_format() {
+            // Compressed, big-endian and interleaved blocks decode to the
+            // native layout (planar, little-endian, the stored format) and
+            // convert exactly as decode_into does.
+            let d = tmp("native-decode");
+            let p = d.join("a.xisf");
+            let raw = ints();
+            let r = reference();
+            let r_bits: Vec<u64> = r.iter().map(|x| x.to_bits() as u64).collect();
+            let zstd = |sh| BlockSpec {
+                codec: Some((Codec::Zstd, sh, 1000)),
+                checksum: Some("sha-1"),
+                ..Default::default()
+            };
+            for (fmt, width, vals, attrs) in [
+                ("UInt16", 2, &raw, ""),
+                ("UInt8", 1, &raw, ""),
+                ("Float32", 4, &r_bits, r#" bounds="0:1""#),
+            ] {
+                let native = int_bytes(vals, width, false);
+                for (big, normal, block) in [
+                    (false, false, zstd(Some(width))),
+                    (false, false, zstd(None)),
+                    (true, false, BlockSpec::default()),
+                    (false, true, BlockSpec::default()),
+                    (true, true, zstd(Some(width))),
+                ] {
+                    let stored = if normal {
+                        int_bytes(&interleave(vals), width, big)
+                    } else {
+                        int_bytes(vals, width, big)
+                    };
+                    let mut a = attrs.to_string();
+                    if big {
+                        a.push_str(r#" byteOrder="big""#);
+                    }
+                    if normal {
+                        a.push_str(r#" pixelStorage="Normal""#);
+                    }
+                    rgb(stored, fmt, &a, block).write(&p);
+                    let img = XisfImage::open(&p).unwrap();
+                    assert!(img.native_planes().is_none(), "{fmt}{a}: needs a decode");
+                    assert_eq!(img.native_len(), native.len() as u64);
+                    let mut buf = vec![0u8; native.len()];
+                    img.decode_native_into(&mut buf).unwrap();
+                    assert!(buf == native, "{fmt}{a}: native bytes");
+                    let planes = img.native_planes_in(&buf).unwrap();
+                    assert_eq!(Some(planes.sample_format()), SampleFormat::parse(fmt));
+                    assert_eq!(bits(&converted(&planes)), bits(&decode(&p)), "{fmt}{a}");
+                }
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn native_planes_in_place_verify_the_checksum_on_open() {
+            let d = tmp("native-cksum");
+            let p = d.join("a.xisf");
+            rgb(
+                int_bytes(&ints(), 2, false),
+                "UInt16",
+                "",
+                BlockSpec {
+                    checksum: Some("sha-256"),
+                    bad_checksum: true,
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let e = XisfImage::open(&p).expect_err("bad checksum").to_string();
+            assert!(e.contains("checksum mismatch"), "{e}");
+            let img = XisfImage::open_with(
+                &p,
+                &XisfOpenOptions {
+                    verify_checksums: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(img.native_planes().is_some());
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        fn native_buffers_of_the_wrong_length_are_errors() {
+            let d = tmp("native-len");
+            let p = d.join("a.xisf");
+            rgb(
+                int_bytes(&ints(), 2, false),
+                "UInt16",
+                "",
+                BlockSpec {
+                    codec: Some((Codec::Zstd, Some(2), 1 << 20)),
+                    ..Default::default()
+                },
+            )
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            let mut short = vec![0u8; img.native_len() as usize - 2];
+            let e = img.decode_native_into(&mut short).unwrap_err().to_string();
+            assert!(e.contains("decode buffer"), "{e}");
+            let e = img.native_planes_in(&short).unwrap_err().to_string();
+            assert!(e.contains("native"), "{e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+
+        #[test]
+        #[should_panic(expected = "rows out of range")]
+        fn decode_rows_past_the_last_row_panics() {
+            let d = tmp("native-range");
+            let p = d.join("a.xisf");
+            rgb(
+                int_bytes(&ints(), 2, false),
+                "UInt16",
+                "",
+                BlockSpec::default(),
+            )
+            .write(&p);
+            let img = XisfImage::open(&p).unwrap();
+            let planes = img.native_planes().unwrap();
+            let mut out = vec![0f32; 2 * W as usize];
+            planes.decode_rows(0, H - 1, 2, &mut out);
         }
     }
 

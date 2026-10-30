@@ -197,6 +197,16 @@ and checksums), `formats::xisf_codec` (codecs, shuffling, subblocks) and
 - Zero-copy: an uncompressed, attached, planar, little-endian Float32
   `0:1` image is served from the mmap. Everything else decodes on request,
   with `decode_into` (caller buffer) or `load` (in memory).
+- Native samples (2026-10-30): `NativePlanes` reads the samples in their
+  stored format, planar and little-endian, and converts rows to normalized
+  f32 on read (`decode_rows`), to exactly the values `decode_into` gives.
+  - `native_planes` serves any uncompressed planar little-endian block in
+    place, whatever its sample format, `bounds`, `offset` or alignment.
+    Such a block's checksum is verified on open, as the zero-copy one's is.
+  - Any other block (compressed, big-endian or Normal storage) decodes
+    once with `decode_native_into` into a caller buffer of `native_len`
+    bytes, such as a cache file, read with `native_planes_in`. Its sample
+    format is kept, so a UInt16 image's buffer is half its f32 decode.
 
 **Refused by name**
 - `UInt64` and complex pixels.
